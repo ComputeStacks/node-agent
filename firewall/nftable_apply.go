@@ -174,21 +174,41 @@ func dnatElements(entries []dnatEntry) ([]nftables.SetElement, error) {
 	return out, nil
 }
 
-// dnatRule builds: <proto> dport @published_<proto> dnat to <proto> dport map @dnat_<proto>
+// dnatRule builds: fib daddr type local <proto> dport @published_<proto> dnat to <proto> dport map @dnat_<proto>
 //
 // Expression sequence:
 //
+//	fib daddr type -> reg1 ; cmp == local     (dest is a node-local address)
 //	meta l4proto == <proto>                       (only match this transport proto)
 //	payload TH+2 len 2 -> reg1   (the dport)
 //	lookup reg1 in @published_<proto>             (is it a live published port?)
 //	payload TH+2 len 2 -> reg1   (re-load dport as the map key)
 //	lookup reg1 in @dnat_<proto> -> reg1          (map writes ipv4 -> reg1, port -> reg9)
 //	nat dnat addr=reg1 proto=reg9
+//
+// The leading `fib daddr type local` gate mirrors Docker's own
+// `-m addrtype --dst-type LOCAL -j DOCKER`: it restricts the DNAT to packets
+// addressed to one of THIS node's local addresses (the published endpoint reached
+// via the node's WAN IP or a node-owned gateway IP). Without it, the rule DNATs
+// ANY forwarded/host-origin packet whose dport merely collides with a published
+// port, regardless of the address dialed -- so a container dialing a sibling
+// project's *private* bridge IP on a colliding port would be silently redirected
+// to the publisher. Gating on daddr-type-local makes "was DNAT'd" mean "dialed a
+// node-local published endpoint" by construction, independent of how nat ports
+// are allocated. This is load-bearing for the cross-project isolation RETURN in
+// firewall/isolation.go (rule 2 RETURNs DNAT'd bridge-to-bridge connections): the
+// gate is what keeps that from exposing direct private-bridge-IP access. External
+// ingress still DNATs (the node's own WAN IP is local); the host-origin OUTPUT
+// mirror still DNATs host->node_ip:port traffic (also local).
 func dnatRule(table *nftables.Table, chain *nftables.Chain, proto byte, published, dnat *nftables.Set) *nftables.Rule {
 	return &nftables.Rule{
 		Table: table,
 		Chain: chain,
 		Exprs: []expr.Any{
+			// fib daddr type -> reg1, gate on == RTN_LOCAL (dest is node-local).
+			// fib result is a host-order u32, so compare with native endianness.
+			&expr.Fib{Register: 1, FlagDADDR: true, ResultADDRTYPE: true},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)},
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
 			// dport -> reg1, gate on membership in the published set
