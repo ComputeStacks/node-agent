@@ -1,10 +1,14 @@
 package firewall
 
 import (
+	"bytes"
 	"os"
 	"testing"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
+	"golang.org/x/sys/unix"
 )
 
 // fakeConn records the objects an applyPlan call would program, so the apply
@@ -112,6 +116,43 @@ func TestApplyPlanEmptyIsFailClosed(t *testing.T) {
 	// Only the 4 DNAT rules; no published ports are open.
 	if len(f.rules) != 4 {
 		t.Errorf("rule count = %d, want 4 (DNAT only)", len(f.rules))
+	}
+}
+
+// TestDnatRuleHasLocalGate pins the `fib daddr type local` gate at the head of
+// every DNAT rule. The gate is what keeps the cross-project isolation RETURN
+// (isolation.go rule 2) from exposing direct private-bridge-IP access, and its
+// silent-failure mode is severe: a wrong-endian cmp, a reordered/dropped gate, or
+// the wrong addrtype constant would let the whole suite pass while every published
+// port either breaks (cmp never matches) or the private-IP hole reopens. Assert
+// the exact leading expressions so such an edit cannot pass unnoticed.
+func TestDnatRuleHasLocalGate(t *testing.T) {
+	plan := buildPlan(&NatRules{Rules: []NatRule{
+		{Proto: "tcp", Nat: 20000, Port: 80, Dest: "10.100.0.5"},
+		{Proto: "udp", Nat: 20001, Port: 53, Dest: "10.100.0.6"},
+	}})
+	f := newFakeConn()
+	if err := applyPlan(f, plan); err != nil {
+		t.Fatalf("applyPlan: %v", err)
+	}
+	if len(f.rules) == 0 {
+		t.Fatal("no rules rendered")
+	}
+
+	wantLocal := binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)
+	for i, r := range f.rules {
+		if len(r.Exprs) < 2 {
+			t.Fatalf("rule %d has %d exprs, want the fib+cmp gate first", i, len(r.Exprs))
+		}
+		fib, ok := r.Exprs[0].(*expr.Fib)
+		if !ok || !fib.FlagDADDR || !fib.ResultADDRTYPE {
+			t.Errorf("rule %d expr[0] = %#v, want *expr.Fib{FlagDADDR:true, ResultADDRTYPE:true}", i, r.Exprs[0])
+			continue
+		}
+		cmp, ok := r.Exprs[1].(*expr.Cmp)
+		if !ok || cmp.Op != expr.CmpOpEq || cmp.Register != fib.Register || !bytes.Equal(cmp.Data, wantLocal) {
+			t.Errorf("rule %d expr[1] = %#v, want *expr.Cmp eq reg %d == RTN_LOCAL (native-endian %v)", i, r.Exprs[1], fib.Register, wantLocal)
+		}
 	}
 }
 

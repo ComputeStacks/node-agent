@@ -214,7 +214,7 @@ func dnatRule(table *nftables.Table, chain *nftables.Chain, proto byte, publishe
 			// dport -> reg1, gate on membership in the published set
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 			&expr.Lookup{SourceRegister: 1, SetName: published.Name, SetID: published.ID},
-			// dport -> reg1 again as the map key; map writes ipv4(reg1) . port(reg2)
+			// dport -> reg1 again as the map key; map writes ipv4(reg1) . port(reg9)
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 			&expr.Lookup{SourceRegister: 1, DestRegister: 1, IsDestRegSet: true, SetName: dnat.Name, SetID: dnat.ID},
 			// proto_min is reg 9, NOT 2: the map lookup wrote its 8-byte concat value

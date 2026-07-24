@@ -141,8 +141,9 @@ func ensureProjectIsolation() {
 	// Post-condition: if the rules did not end up present and correctly ordered
 	// (failed insert, or a rule-rendering mismatch that would otherwise make us
 	// churn delete+re-insert every reconcile), surface it loudly.
-	if !isolationOrdered(chainRules(isoChain)) {
-		csFirewallLog().Error("cross-project isolation rules not present/ordered after apply", "docker-user", strings.Join(chainRules(isoChain), " | "))
+	final := chainRules(isoChain)
+	if !isolationOrdered(final) {
+		csFirewallLog().Error("cross-project isolation rules not present/ordered after apply", "docker-user", strings.Join(final, " | "))
 	}
 }
 
