@@ -45,7 +45,7 @@ func DeleteBackup(ctx context.Context, st *store.Store, task store.Task, project
 			projectEvent.PostEventUpdate("agent-55f82aabccdb8643", findRepoErr.Message)
 		}
 		backupLogger().Warn("Failed to find repository", "name", task.Volume, "archive", task.Archive, "function", "DeleteBackup", "error", findRepoErr.Message)
-		return errors.New("(" + findRepoErr.MsgID + ") " + findRepoErr.Message)
+		return errors.New(borgFailure(findRepoErr))
 	}
 
 	archive, findArchiveErr := repo.FindArchive(task.Archive)
@@ -54,8 +54,11 @@ func DeleteBackup(ctx context.Context, st *store.Store, task store.Task, project
 		backupLogger().Warn("Error deleting repository", "volume", vol.Name, "response", findArchiveErr.Message)
 		repo.StopContainer()
 		projectEvent.EventLog.Status = "failed"
-		projectEvent.PostEventUpdate("agent-e67edd61abe38301", findArchiveErr.ToYaml())
-		return errors.New("(" + findArchiveErr.MsgID + ") " + findArchiveErr.Message)
+		// The message, not ToYaml(): the rendered struct is mostly empty fields
+		// (levelname/msgid/name blank, time 0) for a message the agent synthesized,
+		// which is not a readable reason in result_json.
+		projectEvent.PostEventUpdate("agent-e67edd61abe38301", borgFailure(findArchiveErr))
+		return errors.New(borgFailure(findArchiveErr))
 	}
 
 	deleteResponse, deleteArchiveErr := archive.Delete()
@@ -64,8 +67,8 @@ func DeleteBackup(ctx context.Context, st *store.Store, task store.Task, project
 	if deleteArchiveErr != nil {
 		backupLogger().Warn("Error deleting archive", "volume", vol.Name, "archive", archive.Name, "response", deleteArchiveErr.Message)
 		projectEvent.EventLog.Status = "failed"
-		projectEvent.PostEventUpdate("agent-a7ae639c559b3088", deleteArchiveErr.ToYaml())
-		return errors.New("(" + deleteArchiveErr.MsgID + ") " + deleteArchiveErr.Message)
+		projectEvent.PostEventUpdate("agent-a7ae639c559b3088", borgFailure(deleteArchiveErr))
+		return errors.New(borgFailure(deleteArchiveErr))
 	}
 
 	var output []string

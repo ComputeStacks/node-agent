@@ -77,7 +77,7 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 		} else {
 			projectEvent.EventLog.Status = "failed"
 			projectEvent.PostEventUpdate("agent-c4087f229d50d4dc", findRepoMsg.ToYaml())
-			return errors.New("(" + findRepoMsg.MsgID + ") " + findRepoMsg.Message)
+			return errors.New(borgFailure(findRepoMsg))
 		}
 	}
 
