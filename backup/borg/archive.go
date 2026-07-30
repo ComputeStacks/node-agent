@@ -116,24 +116,37 @@ func (a *Archive) Info() (*ArchiveResponse, *LogMessage) {
 	}
 	var archiveResponse ArchiveResponse
 
-	cmd := []string{"borg --log-json"}
+	// --bypass-lock is required here, not an optimization. backups.borg.lock_wait
+	// defaults to 1 second (only lock_wait_create is longer) and a held exclusive
+	// lock makes `info` exit 2 with msgid LockTimeout — so now that a non-zero exit
+	// is honoured, without the bypass every export, delete and restore that overlaps
+	// a backup of the same volume would fail at this existence check. Exports are
+	// designed to coexist with backups: backup creation deliberately does not take
+	// the per-repo mutex, and the export itself reads with --bypass-lock. That only
+	// worked because the LockTimeout record unmarshals into ArchiveResponse as
+	// all-zero fields, so this function reported success and hid the timeout.
+	// `info ::archive --bypass-lock` under a held exclusive lock exits 0 with no
+	// record; `info` is read-only and the mutation that follows takes its own lock,
+	// so the bypass preserves today's concurrency rather than trading it away.
+	// --lock-wait stays, and this ordering (globals before the subcommand) is what
+	// was measured working.
+	cmd := []string{"borg --log-json --bypass-lock"}
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "info --error --json")
 	cmd = append(cmd, a.archivePath())
 
-	_, response, log := a.Repository.ExecWithLog(cmd)
+	res := a.Repository.RunBorg("borg info", cmd)
 
-	if log != (LogMessage{}) {
-		return nil, &log
+	if res.Failure != nil {
+		return nil, res.Failure
 	}
 
-	marshalErr := json.Unmarshal([]byte(response), &archiveResponse)
+	marshalErr := json.Unmarshal([]byte(res.Response), &archiveResponse)
 
 	if marshalErr != nil {
-		log.Message = marshalErr.Error()
 		sentry.CaptureException(marshalErr)
 		borgLogger().Error("Error unmarshaling json", "function", "Archive.Info", "error", marshalErr.Error())
-		return nil, &log
+		return nil, &LogMessage{Message: marshalErr.Error()}
 	}
 
 	return &archiveResponse, nil
