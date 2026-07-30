@@ -48,26 +48,12 @@ func compact(ctx context.Context, st *store.Store) {
 			continue
 		}
 		if vol.Backup {
-			// Skip a volume that has no repository yet. This sweep builds its
-			// borg.Repository directly rather than through FindRepository, so
-			// nothing here has established that the repository exists: compacting
-			// one that was never initialized exits 2 (measured on borg 1.4.4), and
-			// InitBackupContainer leaves a stray b-<volume> docker volume behind on
-			// the way. A repositories row is the cheapest available proof, and it
-			// costs no container to read.
-			//
-			// Not routed through FindRepository on purpose: Compact dispatches to
-			// compactNFS for the NFS backend, which deliberately builds no
-			// container, and FindRepository would force one.
-			//
-			// Accepted limitation: rows are written only by a successful Sync, so
-			// after a migration or a lost row an existing repository is skipped
-			// until its next successful backup or prune — normally one cycle.
-			if _, found, err := st.GetRepository(ctx, vol.Name); err != nil {
+			switch action, err := compactActionFor(ctx, st, vol.Name); action {
+			case compactSkipStoreError:
 				backupLogger().Warn("Compact: error loading repository", "volume", vol.Name, "error", err.Error())
 				sentry.CaptureException(err)
 				continue
-			} else if !found {
+			case compactSkipNoRepo:
 				backupLogger().Debug("Compact: skipping volume with no repository", "volume", vol.Name)
 				continue
 			}
@@ -84,6 +70,48 @@ func compact(ctx context.Context, st *store.Store) {
 				repo.StopContainer() // no-op for the NFS backend (no container)
 			}()
 		}
+	}
+}
+
+// compactAction is what the store says a compact sweep should do with one volume.
+type compactAction int
+
+const (
+	compactRun            compactAction = iota // a repositories row exists: compact it
+	compactSkipNoRepo                          // no row: there is no repository to compact
+	compactSkipStoreError                      // the store could not answer: skip this sweep only
+)
+
+// compactActionFor decides whether the sweep should compact a volume, returning the
+// store's error alongside compactSkipStoreError so the caller can report it.
+//
+// The sweep builds its borg.Repository directly rather than through FindRepository,
+// so nothing has established that the repository exists: compacting one that was
+// never initialized exits 2 (measured on borg 1.4.4), and InitBackupContainer leaves
+// a stray b-<volume> docker volume behind on the way. A repositories row is the
+// cheapest available proof, and it costs no container to read.
+//
+// Not routed through FindRepository on purpose: Compact dispatches to compactNFS for
+// the NFS backend, which deliberately builds no container, and FindRepository would
+// force one.
+//
+// The three outcomes are kept distinct because a store that could not answer is not
+// the same fact as a volume with no repository. Collapsing them would skip a healthy
+// volume's compaction silently, for as long as the store kept failing; kept apart, a
+// store error is reported and costs only the current sweep.
+//
+// Accepted limitation: rows are written only by a successful Sync, so after a
+// migration or a lost row an existing repository is skipped until its next successful
+// backup or prune — normally one cycle.
+func compactActionFor(ctx context.Context, st *store.Store, volume string) (compactAction, error) {
+	_, found, err := st.GetRepository(ctx, volume)
+	switch {
+	case err != nil:
+		return compactSkipStoreError, err
+	case !found:
+		return compactSkipNoRepo, nil
+	default:
+		return compactRun, nil
 	}
 }
 
