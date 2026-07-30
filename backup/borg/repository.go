@@ -131,13 +131,42 @@ func (r *Repository) Setup(vol *types.Volume, source *types.Volume) *LogMessage 
 	backupCmd = append(backupCmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	backupCmd = append(backupCmd, "init --error --encryption=repokey-blake2")
 
-	if _, _, log := r.ExecWithLog(backupCmd); log != (LogMessage{}) {
-		return &log
+	res := r.RunBorg("borg init", backupCmd)
+
+	if res.Failure != nil {
+		if !repositoryAlreadyExists(res.Failure) {
+			return res.Failure
+		}
+		borgLogger().Info("Repository was already initialized", "volume_name", r.Name, "msgid", res.Failure.MsgID)
 	}
 
 	// Register the (now-initialized) repository's observed state in control.db.
 	r.Sync()
 	return nil
+}
+
+// alreadyExistsMsgID is borg's verdict when init found a repository already at the
+// path: measured on borg 1.4.4 as exit 2 with this msgid.
+const alreadyExistsMsgID = "Repository.AlreadyExists"
+
+// repositoryAlreadyExists reports whether a `borg init` failure means the repository
+// the caller asked for is already there — which is exactly what Setup wanted, so it
+// counts as success and Setup goes on to Sync.
+//
+// The tolerance exists because two tasks can genuinely reach init for the same
+// never-initialized volume: backup creation deliberately takes no per-repo mutex (see
+// AcquireRepoLock) and the dispatcher runs queue.numworkers + 1 backup workers, so a
+// second task for the same volume can run concurrently and one of the two loses the
+// race. Without this the loser fails a backup that has nothing wrong with it.
+//
+// Matched on the msgid alone, never on the message text. Repository.PathAlreadyExists
+// ("There is already something at /mnt/borg/backup.") is a different measured msgid
+// meaning the path holds content that is not a repository; tolerating it would hand
+// the caller a phantom repository over a directory with junk in it, and every backup
+// against it would fail. Only borg's own verdict is trusted, so a synthesized failure —
+// which never carries a msgid — can never be tolerated either.
+func repositoryAlreadyExists(failure *LogMessage) bool {
+	return failure != nil && failure.MsgID == alreadyExistsMsgID
 }
 
 func (r *Repository) Info() (RepositoryResponse, *LogMessage) {

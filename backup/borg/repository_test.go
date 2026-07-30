@@ -17,6 +17,18 @@ func recordMessage(t *testing.T, raw string) string {
 	return record.Message
 }
 
+// fullRecord pulls a whole captured --log-json record out of the fixtures in
+// failure_record_test.go, so a decision made on a record's fields is tested against the
+// same record production would hand it.
+func fullRecord(t *testing.T, raw string) *LogMessage {
+	t.Helper()
+	record, ok := failureRecord(raw + "\r\n")
+	if !ok {
+		t.Fatalf("Received no record for %q, wanted borg's own", raw)
+	}
+	return &record
+}
+
 // emptyResponseMessage is what group 1's guard reports for a response with nothing in
 // it. Read from the parser rather than copied, so the wording cannot drift apart from
 // the thing this test says must not be mistaken for a missing repository.
@@ -124,4 +136,64 @@ func TestStampMissingRepository(t *testing.T) {
 // err != nil branch), but the helper must be safe on its own.
 func TestStampMissingRepositoryNil(t *testing.T) {
 	stampMissingRepository(nil)
+}
+
+// TestRepositoryAlreadyExists pins the one `borg init` failure Setup treats as success.
+// Both directions cost something real: rejecting Repository.AlreadyExists fails a backup
+// that lost a harmless init race, and accepting anything else — Repository.PathAlreadyExists
+// above all — returns a repository that is not there.
+func TestRepositoryAlreadyExists(t *testing.T) {
+	for _, i := range []struct {
+		name string
+		in   *LogMessage
+		want bool
+	}{
+		{
+			// The race this tolerance exists for: another task initialized the
+			// repository first, so the one the caller wanted does exist.
+			name: "borg's already-exists record",
+			in:   fullRecord(t, repoAlreadyExistsRecord),
+			want: true,
+		},
+		{
+			// A different measured condition: the path holds content that is not a
+			// repository. Tolerating it would report a phantom repository.
+			name: "path already holds non-repository content",
+			in:   fullRecord(t, pathAlreadyExistsRecord),
+			want: false,
+		},
+		{
+			name: "invalid repository",
+			in:   fullRecord(t, invalidRepositoryRecord),
+			want: false,
+		},
+		{
+			name: "lock timeout",
+			in:   fullRecord(t, lockTimeoutRecord),
+			want: false,
+		},
+		{
+			// Constructed to isolate the msgid: borg's own already-exists wording with
+			// no msgid on the record must NOT be tolerated, because the decision is
+			// borg's verdict and never our reading of its prose.
+			name: "already-exists wording without a msgid",
+			in:   &LogMessage{Message: recordMessage(t, repoAlreadyExistsRecord)},
+			want: false,
+		},
+		{
+			// What classify synthesizes when borg printed nothing usable. It carries no
+			// msgid precisely so it cannot reach a msgid-driven decision like this one.
+			name: "synthesized no-output reason",
+			in:   &LogMessage{Message: "borg init exited 2: no diagnostic output"},
+			want: false,
+		},
+		{name: "empty failure", in: &LogMessage{}, want: false},
+		{name: "nil failure", in: nil, want: false},
+	} {
+		t.Run(i.name, func(t *testing.T) {
+			if got := repositoryAlreadyExists(i.in); got != i.want {
+				t.Errorf("Received %v, wanted %v", got, i.want)
+			}
+		})
+	}
 }
