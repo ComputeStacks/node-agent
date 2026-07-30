@@ -98,7 +98,12 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 				projectEvent.EventLog.Status = "failed"
 			}
 
-			if vol.RestoreContinueOnError {
+			// BackupContinueOnError (backup_error_cont), never the restore flag: this
+			// is the backup path, and the decision is whether to still run the BACKUP
+			// hooks after a failed create. It matches the failed-preBackup branch
+			// below, and it is what the mysql/postgres strategies force to true in
+			// preBackup so their postBackup cleanup always runs.
+			if vol.BackupContinueOnError {
 				postBackup(&vol, projectEvent, repo)
 			}
 		} else {
