@@ -23,11 +23,17 @@ import (
 // are set aside for the duration of the restore, both as seen inside the backup
 // container.
 //
-// Known limitation, unchanged by this file and deliberately not addressed here:
-// snapshotPath is in the backup container's own filesystem, and that container is
-// created with AutoRemove, so the snapshot exists only while the container does. A
-// rollback is therefore only possible before repo.StopContainer(), which is where every
-// caller does it.
+// Known limitation, deliberately not addressed here: snapshotPath is in the backup
+// container's own filesystem rather than in the volume, and that container is created
+// with AutoRemove, so the snapshot exists only for as long as the container does. A
+// rollback is therefore possible only before repo.StopContainer().
+//
+// Restore's deferred StopContainer does keep every rollback call site inside that
+// window, but the window is the only thing standing between a failed restore and
+// permanent data loss: any path that leaves rollbackRestore without putting the
+// snapshot back has destroyed it, because the container goes away moments later and
+// takes the snapshot with it. That is why the put-back is the first thing
+// rollbackRestore does, ahead of every step that can fail.
 const (
 	dataPath     = "/mnt/data"
 	snapshotPath = "/root/.snapshot"
@@ -186,6 +192,28 @@ func postRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool
 
 func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool {
 
+	// The snapshot goes back first: once, for every strategy — including the default
+	// one, which had no rollback at all before and simply left the volume as the failed
+	// restore had left it — and before anything that can return early.
+	//
+	// The order is not a preference. Nothing below is a precondition for the put-back:
+	// it is two shell commands inside the backup container, independent of the service's
+	// own containers and of whatever the user's hook does. The reverse order was
+	// actively unsafe. The user hook below ran first and returned false on error, so for
+	// any volume with a PostRestore command configured the put-back was never reached,
+	// and the deferred repo.StopContainer() then took the only copy of the customer's
+	// data with the AutoRemove container.
+	if !rollbackRestoreSnapshot(event, repo) {
+		return false
+	}
+
+	// This hook cannot currently succeed on this path, and is kept only because removing
+	// it is a separate decision: every rollbackRestore call site is downstream of
+	// Restore's container stop loop, and ServiceExec resolves containers with
+	// FindByService(…, allowOff: false), which collects only containers whose state is
+	// "running". With none running it returns "no containers found" and this block
+	// reports a rollback failure. It no longer costs the snapshot, which is the part
+	// that mattered.
 	if len(vol.PostRestore) > 0 {
 		// A recovered panic leaves rollbackRestore's unnamed bool return at its zero
 		// value false, i.e. "rollback failed" — which is what the caller reports.
@@ -210,13 +238,8 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 
 	}
 
-	// The snapshot goes back first, once, for every strategy — including the default
-	// one, which had no rollback at all before and simply left the volume as the failed
-	// restore had left it. The strategy hooks then clean up after it.
-	if !rollbackRestoreSnapshot(event, repo) {
-		return false
-	}
-
+	// The strategy hooks clean up after the put-back, keeping only their
+	// strategy-specific work.
 	switch vol.Strategy {
 	case "mysql":
 		return rollbackRestoreMysql(event, repo)
