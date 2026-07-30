@@ -275,8 +275,10 @@ func (r *Repository) Prune() *LogMessage {
 	cmd = append(cmd, "--keep-monthly="+strconv.Itoa(r.Retention.Monthly))
 	cmd = append(cmd, "--keep-yearly="+strconv.Itoa(r.Retention.Annually))
 
-	if _, _, log := r.ExecWithLog(cmd); log != (LogMessage{}) {
-		return &log
+	res := r.RunBorg("borg prune", cmd)
+
+	if res.Failure != nil {
+		return res.Failure
 	}
 
 	r.Sync()
@@ -317,8 +319,10 @@ func (r *Repository) compactContainer() *LogMessage {
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "compact --error --verbose")
 
-	if _, _, log := r.ExecWithLog(cmd); log != (LogMessage{}) {
-		return &log
+	res := r.RunBorg("borg compact", cmd)
+
+	if res.Failure != nil {
+		return res.Failure
 	}
 
 	// Refresh Consul on-disk usage stats now that space has been reclaimed.

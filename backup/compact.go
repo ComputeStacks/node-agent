@@ -48,6 +48,30 @@ func compact(ctx context.Context, st *store.Store) {
 			continue
 		}
 		if vol.Backup {
+			// Skip a volume that has no repository yet. This sweep builds its
+			// borg.Repository directly rather than through FindRepository, so
+			// nothing here has established that the repository exists: compacting
+			// one that was never initialized exits 2 (measured on borg 1.4.4), and
+			// InitBackupContainer leaves a stray b-<volume> docker volume behind on
+			// the way. A repositories row is the cheapest available proof, and it
+			// costs no container to read.
+			//
+			// Not routed through FindRepository on purpose: Compact dispatches to
+			// compactNFS for the NFS backend, which deliberately builds no
+			// container, and FindRepository would force one.
+			//
+			// Accepted limitation: rows are written only by a successful Sync, so
+			// after a migration or a lost row an existing repository is skipped
+			// until its next successful backup or prune — normally one cycle.
+			if _, found, err := st.GetRepository(ctx, vol.Name); err != nil {
+				backupLogger().Warn("Compact: error loading repository", "volume", vol.Name, "error", err.Error())
+				sentry.CaptureException(err)
+				continue
+			} else if !found {
+				backupLogger().Debug("Compact: skipping volume with no repository", "volume", vol.Name)
+				continue
+			}
+
 			// Scoped closure so the lock releases each iteration (and on panic),
 			// and so one repo blocked behind an in-flight export doesn't stall
 			// the rest of the sweep.

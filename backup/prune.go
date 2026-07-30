@@ -42,8 +42,12 @@ func prune(ctx context.Context, st *store.Store) {
 					backupLogger().Warn("Prune Volume Error, error loading repo", "volume", vol.Name, "error", repoErr.Message)
 					return
 				}
-				if err := repo.Prune(); err != nil {
-					backupLogger().Warn("Prune Volume Error", "volume", vol.Name)
+				if pruneErr := repo.Prune(); pruneErr != nil {
+					// Carry the reason. Prune could not report one before — a
+					// non-zero `borg prune` exit did not reach here at all — so
+					// this line logged that something went wrong and dropped
+					// what it was.
+					backupLogger().Warn("Prune Volume Error", "volume", vol.Name, "error", borgFailure(pruneErr))
 				}
 				repo.Container.Stop()
 			}()
