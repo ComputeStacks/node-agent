@@ -167,6 +167,12 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 		borgLogger().Debug("Archive delete exited non-zero", "exitCode", exitCode, "response", response)
 		reason := failureReason(response)
 		if reason == "" {
+			// An exec-level failure (docker client error, container never came online)
+			// arrives with an empty response and the reason already in log.Message —
+			// keep it rather than claiming borg ran and said nothing.
+			reason = strings.TrimSpace(log.Message)
+		}
+		if reason == "" {
 			reason = "no diagnostic output from borg"
 		}
 		log.Message = "borg delete exited " + strconv.Itoa(exitCode) + ": " + reason
