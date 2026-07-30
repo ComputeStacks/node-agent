@@ -146,7 +146,12 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 		return results, &LogMessage{Message: "Missing backup container"}
 	}
 
-	cmd := []string{"borg --log-json --error"}
+	// No --error here: it suppresses the WARNING-level record that carries borg's own
+	// diagnosis of a failure (e.g. "Archive X not found (1/1).") while the --stats
+	// records bypass the level filter, so a failed delete reported nothing but the
+	// stats table. Dropping --error costs nothing on success — borg 1.4.4 emits the
+	// same eight INFO stats records either way.
+	cmd := []string{"borg --log-json"}
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "delete --stats --force")
 	cmd = append(cmd, a.archivePath())
@@ -156,7 +161,15 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 	exitCode, response, log := a.Repository.ExecWithLog(cmd)
 
 	if exitCode > 0 {
-		log.Message = "Did not exit correctly. Response: " + response
+		// The full response is kept at DEBUG so nothing is lost when troubleshooting;
+		// the reported message is borg's own diagnosis, never the --stats table (which
+		// says only "Deleted data: 0 B" and reads like the cause when it isn't).
+		borgLogger().Debug("Archive delete exited non-zero", "exitCode", exitCode, "response", response)
+		reason := failureReason(response)
+		if reason == "" {
+			reason = "no diagnostic output from borg"
+		}
+		log.Message = "borg delete exited " + strconv.Itoa(exitCode) + ": " + reason
 		return results, &log
 	}
 
