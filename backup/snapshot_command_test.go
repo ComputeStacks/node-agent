@@ -240,9 +240,35 @@ func TestSnapshotCommandUncreatableDestinationFails(t *testing.T) {
 	}
 }
 
-// The rollback direction, as rollbackRestoreSnapshot composes it: empty the volume, then
-// run the same helper with src and dst swapped. A marker file placed in the volume
-// before the restore must come back.
+// The same real failure, provable as root — which is how this suite is actually run: the
+// project's test command is `go test ./...` inside a golang container, as uid 0. The test
+// above skips there, because root ignores directory permissions, and that left every case
+// that does execute asserting a success scenario: appending `|| true` to the snapshot
+// command passed the entire file.
+//
+// A path component that is a regular file is a failure no uid can walk past. `mkdir -p`
+// gets ENOTDIR, the `&&` short-circuits, and nothing moves.
+func TestSnapshotCommandDestinationUnderFileFails(t *testing.T) {
+	src, _ := snapshotDirs(t)
+	writeFile(t, filepath.Join(src, "one.txt"), "one")
+
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	writeFile(t, blocker, "a regular file, not a directory")
+
+	code, out := runSh(t, snapshotCommand(src, filepath.Join(blocker, "snapshot")))
+
+	if code == 0 {
+		t.Fatalf("a destination beneath a regular file must fail, got exit 0: %s", out)
+	}
+	if got, want := names(t, src), []string{"one.txt"}; !equalNames(got, want) {
+		t.Errorf("source = %v, want %v — nothing should have moved", got, want)
+	}
+}
+
+// The rollback direction, through rollbackCommand — the same function rollbackRestoreSnapshot
+// runs, not a copy of the string it produces. Composing it here as well is what let the
+// production command drift: a lost `&&` or a changed path would have kept these tests
+// green. A marker file placed in the volume before the restore must come back.
 func TestSnapshotCommandRollbackRoundTrip(t *testing.T) {
 	data, snapshot := snapshotDirs(t)
 	writeFile(t, filepath.Join(data, "marker.txt"), "customer data")
@@ -253,8 +279,7 @@ func TestSnapshotCommandRollbackRoundTrip(t *testing.T) {
 	// Stand in for what a failed extract leaves behind.
 	writeFile(t, filepath.Join(data, "half-restored.txt"), "partial")
 
-	rollback := "rm -rf " + data + "/* && " + snapshotCommand(snapshot, data)
-	if code, out := runSh(t, rollback); code != 0 {
+	if code, out := runSh(t, rollbackCommand(snapshot, data)); code != 0 {
 		t.Fatalf("rollback: exit %d: %s", code, out)
 	}
 
@@ -282,8 +307,7 @@ func TestSnapshotCommandRollbackFromEmptySnapshot(t *testing.T) {
 	}
 	writeFile(t, filepath.Join(data, "half-restored.txt"), "partial")
 
-	rollback := "rm -rf " + data + "/* && " + snapshotCommand(snapshot, data)
-	if code, out := runSh(t, rollback); code != 0 {
+	if code, out := runSh(t, rollbackCommand(snapshot, data)); code != 0 {
 		t.Fatalf("rollback: exit %d: %s", code, out)
 	}
 

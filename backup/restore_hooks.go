@@ -68,6 +68,23 @@ func snapshotCommand(src, dst string) string {
 		` && if [ -e "$1" ] || [ -L "$1" ]; then mv "$@" ` + dst + `/; fi`
 }
 
+// rollbackCommand builds the shell command that puts the snapshot back: empty the volume
+// of whatever the failed restore left in it, then run the same move in the other
+// direction.
+//
+// It is a function rather than a string composed at its one call site so that the tests
+// exercise the command production actually runs. While rollbackRestoreSnapshot built it
+// inline and the rollback tests rebuilt the same string themselves, a lost `&&` or a
+// changed path in production would have left every one of those tests passing.
+//
+// `rm -rf dst/*` needs no guard of its own — `rm -f` exits 0 on an unexpanded glob — and
+// it cannot destroy anything unrecoverable: src is empty only when dst was empty when
+// the snapshot was taken, so what this removes is either nothing or what the failed
+// restore itself just wrote there.
+func rollbackCommand(src, dst string) string {
+	return "rm -rf " + dst + "/* && " + snapshotCommand(src, dst)
+}
+
 // takeRestoreSnapshot moves the volume's current contents aside so that a restore which
 // fails partway can be undone.
 //
@@ -87,15 +104,9 @@ func takeRestoreSnapshot(event *progress, repo *borg.Repository) bool {
 }
 
 // rollbackRestoreSnapshot puts the snapshot back, over whatever the failed restore left
-// behind.
-//
-// `rm -rf dataPath/*` needs no guard of its own — `rm -f` exits 0 on an unexpanded glob
-// — and it cannot destroy anything unrecoverable: the snapshot is empty only when
-// /mnt/data was empty when it was taken, so what this removes is either nothing or what
-// the restore itself just wrote there.
+// behind. See rollbackCommand for why the command it runs lives in its own function.
 func rollbackRestoreSnapshot(event *progress, repo *borg.Repository) bool {
-	cmd := "rm -rf " + dataPath + "/* && " + snapshotCommand(snapshotPath, dataPath)
-	res := repo.RunShell("restore rollback", []string{cmd})
+	res := repo.RunShell("restore rollback", []string{rollbackCommand(snapshotPath, dataPath)})
 	if res.Failure != nil {
 		backupLogger().Warn("Failed to roll back restore snapshot", "volume", repo.Name, "exitCode", res.ExitCode, "error", res.Failure.Message)
 		event.PostEventUpdate("agent-af1b0badd5d9b9f6", withOutput("Failed to move the snapshot back into the volume: "+res.Failure.Message, res.Response))
