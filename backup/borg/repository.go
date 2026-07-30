@@ -20,6 +20,7 @@ import (
 	"cs-agent/types"
 	"reflect"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/viper"
 
@@ -41,6 +42,7 @@ func FindRepository(st *store.Store, vol *types.Volume, source *types.Volume) (*
 	// Find Repo
 	repoResponse, err := r.Info()
 	if err != nil {
+		stampMissingRepository(err)
 		r.StopContainer()
 		return nil, err
 	}
@@ -51,6 +53,55 @@ func FindRepository(st *store.Store, vol *types.Volume, source *types.Volume) (*
 	}
 
 	return &r, nil
+}
+
+// missingRepositoryMsgID is the verdict FindRepository's callers act on: backup.Perform
+// and the SSH branch of restore.Perform both read it to decide whether to run
+// Repository.Setup (borg init) for a volume that has no repository yet.
+const missingRepositoryMsgID = "Repository.DoesNotExist"
+
+// stampMissingRepository supplies that msgid when borg reported the condition in words
+// but the record reached us without one.
+//
+// It is insurance only. Borg emits the msgid itself, spelled exactly as the callers
+// compare it, and 90 days of node journals show borg's own
+// "Repository /mnt/borg/backup does not exist." record and never a msgid-less
+// substitute. It is here because of what the msgid going missing would cost: a new
+// volume would never get a repository, silently and permanently, since every later
+// backup fails against an uninitialized one.
+//
+// Two guards, both load-bearing:
+//
+//   - Only when MsgID is empty, so borg's own verdict is never overwritten — in
+//     particular Repository.InvalidRepository must stay itself, because it means the
+//     path holds something that is not a repository.
+//   - Only does-not-exist wording (see looksLikeMissingRepository).
+//
+// Only MsgID is set. The message is left exactly as borg wrote it, since that text is
+// what the controller shows.
+func stampMissingRepository(failure *LogMessage) {
+	if failure == nil || failure.MsgID != "" {
+		return
+	}
+	if looksLikeMissingRepository(failure.Message) {
+		failure.MsgID = missingRepositoryMsgID
+	}
+}
+
+// looksLikeMissingRepository reports whether a message is borg saying the repository is
+// not there: "Repository /mnt/borg/backup does not exist.", or its ssh:// form on the
+// SSH backend.
+//
+// Deliberately narrow, because a false positive runs borg init. It must not match
+// "/mnt/borg/backup is not a valid repository. Check repo config." — a different
+// measured condition (msgid Repository.InvalidRepository) meaning the path has content
+// in it — nor the response parsers' own "Empty response from borg while reading
+// repository info", which is a fault on this host (an OOM kill, a signal) rather than a
+// verdict about the repository. Requiring the "Repository " prefix as well as the
+// phrase also keeps "Archive x does not exist" out.
+func looksLikeMissingRepository(message string) bool {
+	m := strings.ToLower(strings.TrimSpace(message))
+	return strings.HasPrefix(m, "repository ") && strings.Contains(m, "does not exist")
 }
 
 func (r *Repository) FindArchive(name string) (a *Archive, err *LogMessage) {
@@ -94,17 +145,38 @@ func (r *Repository) Info() (RepositoryResponse, *LogMessage) {
 		return RepositoryResponse{}, &LogMessage{Message: "Missing backup container"}
 	}
 
-	cmd := []string{"borg --log-json"}
+	// --bypass-lock fixes a pre-existing failure rather than trading anything away.
+	// backups.borg.lock_wait defaults to 1 second (only lock_wait_create is longer) and
+	// `borg create` holds the exclusive lock for the whole backup, while backup creation
+	// deliberately does not take the per-repo mutex — so reading a repository while it is
+	// being backed up hits a LockTimeout, which is rc 2 with a msgid that readRepoResponse
+	// already surfaces today. That is why exporting, deleting or restoring a volume during
+	// its own backup fails at this call, one step before Archive.Info.
+	//
+	// Measured on borg 1.4.4 with `--bypass-lock --lock-wait 1 info --error --json`:
+	// healthy repo rc 0; under a held exclusive lock rc 0 with no record (rc 2 with msgid
+	// LockTimeout without the bypass); missing repo still rc 2 with msgid
+	// Repository.DoesNotExist; an existing non-repo path still rc 2 with msgid
+	// Repository.InvalidRepository. So the auto-init signal is undisturbed. `info` is
+	// read-only and the callers that go on to mutate take their own lock afterwards.
+	//
+	// Repository.Contents deliberately does NOT get the bypass: it feeds Sync, and a
+	// bypassed read during a concurrent compact (which rewrites segments) could write a
+	// torn archive list into control.db.
+	//
+	// --lock-wait stays, and this ordering — globals before the subcommand — is what was
+	// measured working.
+	cmd := []string{"borg --log-json --bypass-lock"}
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "info --error --json")
 
-	_, response, logMsg := r.ExecWithLog(cmd)
+	res := r.RunBorg("borg info", cmd)
 
-	if logMsg != (LogMessage{}) {
-		return RepositoryResponse{}, &logMsg
+	if res.Failure != nil {
+		return RepositoryResponse{}, res.Failure
 	}
 
-	repoResponse, repoLog := readRepoResponse(response)
+	repoResponse, repoLog := readRepoResponse(res.Response)
 
 	if repoLog != nil {
 		return RepositoryResponse{}, repoLog
