@@ -122,13 +122,13 @@ func (r *Repository) Contents() (RepositoryContentResponse, *LogMessage) {
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "list --error --json")
 
-	_, response, logMsg := r.ExecWithLog(cmd)
+	res := r.RunBorg("borg list", cmd)
 
-	if logMsg != (LogMessage{}) {
-		return RepositoryContentResponse{}, &logMsg
+	if res.Failure != nil {
+		return RepositoryContentResponse{}, res.Failure
 	}
 
-	repoResponse, repoLog := readRepoContentResponse(response)
+	repoResponse, repoLog := readRepoContentResponse(res.Response)
 
 	if repoLog != nil {
 		return RepositoryContentResponse{}, repoLog

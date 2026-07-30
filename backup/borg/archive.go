@@ -36,9 +36,11 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 		return borgResponse, &LogMessage{Message: "Missing backup container"}
 	}
 
-	if !a.generateName() {
-		log.Message = "Unable to generate unique archive name"
-		return borgResponse, &log
+	// generateName reads the repository (borg list), so it can fail for borg's own
+	// reasons — a held lock, a missing repository — not only because no name could be
+	// composed. Report whichever it was.
+	if nameErr := a.generateName(); nameErr != nil {
+		return borgResponse, nameErr
 	}
 
 	backupCmd := []string{"cd /mnt/data && borg --log-json"}
@@ -216,13 +218,23 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 	return results, nil
 }
 
-func (a *Archive) generateName() bool {
+// generateName gives the archive a name that does not collide with one already in
+// the repository. It returns nil on success, otherwise the reason it could not.
+//
+// A bare bool was indistinguishable: a failed `borg list` and a genuinely
+// un-nameable archive both surfaced as "Unable to generate unique archive name",
+// hiding borg's own diagnosis of the first. The two synthesized reasons below carry
+// no MsgID, so they can never be mistaken for a verdict borg reported; only the
+// Contents() path returns borg's record.
+func (a *Archive) generateName() *LogMessage {
 	if a.Repository == nil {
-		return false
+		// Unreachable from Create, which checks this first; kept so the method is
+		// safe on its own.
+		return &LogMessage{Message: "Missing Repository"}
 	}
 	contents, contentsErr := a.Repository.Contents()
 	if contentsErr != nil {
-		return false
+		return contentsErr
 	}
 	rand.New(rand.NewSource(time.Now().UnixNano()))
 	randNum := rand.Intn(10000-10) + 10
@@ -232,7 +244,10 @@ func (a *Archive) generateName() bool {
 			break
 		}
 	}
-	return a.Name != ""
+	if a.Name == "" {
+		return &LogMessage{Message: "Unable to generate unique archive name"}
+	}
+	return nil
 }
 
 func (a *Archive) archivePath() string {
