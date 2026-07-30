@@ -72,6 +72,11 @@ func DeleteBackup(ctx context.Context, st *store.Store, task store.Task, project
 	for _, o := range deleteResponse {
 		output = append(output, o.Message)
 	}
-	projectEvent.PostEventUpdate("agent-8f8a9488ed4106f4", strings.Join(output, "\n"))
+	// Success: keep borg's full --stats table in result_json for the controller, but
+	// don't log it at INFO — the borg layer already logs a concise "Completed
+	// Archive Delete event" line (volume + archive), and the multi-line stats table
+	// reads like a truncated failure in the node log. The full response is only
+	// worth logging at INFO on failure (see deleteArchiveErr above).
+	projectEvent.Record(strings.Join(output, "\n"))
 	return nil
 }

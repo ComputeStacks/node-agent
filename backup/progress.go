@@ -10,9 +10,10 @@ import (
 // the old csevent HTTP push to the controller. Per the v3.0.0 contract the
 // controller learns a task's outcome from its changelog `result_json` (terminal
 // status + accumulated output), not a live per-step stream — so this just
-// accumulates: PostEventUpdate appends a line (and logs it), Set records a
-// structured success field (export url/size/…, a backup's last_backup), and
-// Result() renders the JSON the worker stores via UpdateTaskStatus.
+// accumulates: PostEventUpdate appends a line (and logs it at INFO), Record
+// appends a line (and logs it at DEBUG), Set records a structured success field
+// (export url/size/…, a backup's last_backup), and Result() renders the JSON the
+// worker stores via UpdateTaskStatus.
 //
 // It deliberately mirrors the old *csevent.ProjectEvent surface (PostEventUpdate,
 // CloseEvent, EventLog.Status) so the many handler/hook call sites are unchanged.
@@ -46,10 +47,12 @@ func (p *progress) PostEventUpdate(code, msg string) {
 	backupLogger().Info("task step", "code", code, "msg", msg)
 }
 
-// Record appends a step message to the task result WITHOUT logging it. Use for
+// Record appends a step message to the task result AND logs it at DEBUG. Use for
 // verbose success output (e.g. borg's per-archive stats) that the controller
 // reads from result_json but that would flood the node log at INFO on every
-// backup. The concise success line is logged separately by the borg layer.
+// backup. The concise success line is logged separately by the borg layer; the
+// DEBUG line keeps the full payload reachable on the node with log.level=debug
+// instead of only via result_json.
 func (p *progress) Record(msg string) {
 	if p == nil {
 		return
@@ -57,6 +60,7 @@ func (p *progress) Record(msg string) {
 	p.mu.Lock()
 	p.lines = append(p.lines, msg)
 	p.mu.Unlock()
+	backupLogger().Debug("task step", "msg", msg)
 }
 
 // CloseEvent is retained for call-site compatibility; the worker owns finalizing
