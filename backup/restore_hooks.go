@@ -135,15 +135,24 @@ func preRestore(vol *types.Volume, event *progress, repo *borg.Repository) (preR
 
 	}
 
-	// The strategy hooks run first and keep only their strategy-specific work: for
-	// mysql that is stopping the database containers. The snapshot then runs once, for
-	// every strategy, and this order is not interchangeable — snapshotPath is in the
-	// backup container's own filesystem, not the volume, so the move is a cross-device
-	// copy-and-delete rather than a rename. Copying a running database's data
-	// directory that way and then deleting the original would put a torn copy in the
-	// snapshot and nothing in the volume, which is why the database has to stop first.
+	// The strategy hooks run first and keep only their strategy-specific work: for every
+	// database strategy that is stopping the database containers. The snapshot then runs
+	// once, for every strategy, and this order is not interchangeable — snapshotPath is
+	// in the backup container's own filesystem, not the volume, so the move is a
+	// cross-device copy-and-delete rather than a rename. Copying a running database's
+	// data directory that way and then deleting the original would put a torn copy in
+	// the snapshot and nothing in the volume, which is why the database has to stop
+	// first. That makes a missing case here a data-integrity bug, not a missed
+	// optimisation.
+	//
+	// mariadb is a strategy the controller accepts alongside mysql, and it took the
+	// no-op default until now. It belongs here, with mysql, and nowhere else: it joins
+	// neither postRestore's switch nor rollbackRestore's, because postRestoreMysql
+	// rearranges a backups/ dump directory that only a mysql-strategy archive contains
+	// — preBackup has no mariadb case either, so nothing ever creates one. A plain
+	// extract and a plain snapshot put-back are what a mariadb archive needs.
 	switch vol.Strategy {
-	case "mysql":
+	case "mysql", "mariadb":
 		if !preRestoreMysql(vol, event, repo) {
 			return false
 		}

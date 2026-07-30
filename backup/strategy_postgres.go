@@ -43,8 +43,27 @@ func postBackupPostgres(event *progress, repo *borg.Repository) bool {
 	return true
 }
 
+// preRestorePostgres stops the database before the volume underneath it is disturbed.
+//
+// It used to return true and stop nothing, which was survivable only while nothing
+// touched the volume before Restore's own container stop loop. preRestore now takes the
+// /mnt/data snapshot, and preRestore runs ahead of that loop, so postgres was getting
+// its data directory moved out from under a running server. Not a rename either: the
+// snapshot lives in the backup container's filesystem rather than in the volume, so the
+// move is a per-file copy followed by an unlink — a torn copy in the snapshot and an
+// empty volume, with the database still writing.
+//
+// stopAllMysqlContainers is named after its first caller rather than after what it does:
+// FindAllByService on the volume's service, Stop() on each container, and a restart of
+// all of them if any refuses to stop. There is nothing mysql-specific in it. Renaming it
+// would touch the mysql hooks and their comments for no change in behaviour, so the name
+// stays and this comment carries the explanation.
+//
+// The containers stopped here are started again by Restore, which restarts the list it
+// captured before any of this ran, regardless of who stopped them — the mysql strategy
+// has always relied on that.
 func preRestorePostgres(vol *types.Volume, event *progress, repo *borg.Repository) (preRestorePostgresSuccess bool) {
-	return true
+	return stopAllMysqlContainers(vol, event)
 }
 
 func postRestorePostgres(event *progress, repo *borg.Repository) bool {
