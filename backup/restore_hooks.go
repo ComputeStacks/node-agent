@@ -19,6 +19,85 @@ import (
 	"strings"
 )
 
+// dataPath is the volume being restored and snapshotPath is where its current contents
+// are set aside for the duration of the restore, both as seen inside the backup
+// container.
+//
+// Known limitation, unchanged by this file and deliberately not addressed here:
+// snapshotPath is in the backup container's own filesystem, and that container is
+// created with AutoRemove, so the snapshot exists only while the container does. A
+// rollback is therefore only possible before repo.StopContainer(), which is where every
+// caller does it.
+const (
+	dataPath     = "/mnt/data"
+	snapshotPath = "/root/.snapshot"
+)
+
+// snapshotCommand builds a shell command that moves the contents of src into dst,
+// creating dst first. It is the single implementation of that move: preRestore uses it
+// to set the volume aside, rollbackRestore uses it with src and dst swapped to put the
+// volume back.
+//
+// `set --` and the test that follows are what make an empty src a success. A bare
+// `mv src/* dst/` exits non-zero when src is empty, because the glob does not expand
+// and mv is handed the literal string `src/*` — and restoring into an empty destination
+// is a first-class flow: cloning a volume restores into a brand-new one. Now that a
+// non-zero exit fails the restore, an empty source had to stop looking like a failure.
+//
+// `|| [ -L "$1" ]` is mandatory, not defensive. `[ -e ]` follows symlinks, so a
+// dangling symlink that happens to sort first — `current -> releases/gone`, an ordinary
+// shape for an application volume — would make a directory full of data read as empty.
+// The move would be skipped, the command would exit 0, and the extract would then run
+// over live data with nothing to roll back to: exactly the accident the guard exists to
+// prevent, wearing a success exit code.
+//
+// Glob semantics are otherwise unchanged on purpose. `set -- src/*` still skips
+// dotfiles, exactly as `mv src/*` did, so dotfiles are still neither snapshotted nor
+// put back by a rollback — a pre-existing gap that needs its own reasoning about `.`
+// and `..`, and changing it here would quietly change what a rollback restores.
+// Quoting "$@" is a free fix: filenames containing spaces now survive, where the old
+// unquoted glob broke them.
+func snapshotCommand(src, dst string) string {
+	return "mkdir -p " + dst + " && set -- " + src + "/*" +
+		` && if [ -e "$1" ] || [ -L "$1" ]; then mv "$@" ` + dst + `/; fi`
+}
+
+// takeRestoreSnapshot moves the volume's current contents aside so that a restore which
+// fails partway can be undone.
+//
+// It runs for every strategy, exactly once, and a failure halts the restore: a restore
+// whose rollback would not be available must not begin. That is the whole reason it
+// lives in preRestore rather than in the borg layer — preRestore is gated on success
+// before anything touches the archive, so by the time any rollback can be reached the
+// snapshot has already been taken.
+func takeRestoreSnapshot(event *progress, repo *borg.Repository) bool {
+	res := repo.RunShell("restore snapshot", []string{snapshotCommand(dataPath, snapshotPath)})
+	if res.Failure != nil {
+		backupLogger().Warn("Failed to snapshot existing data", "volume", repo.Name, "exitCode", res.ExitCode, "error", res.Failure.Message)
+		event.PostEventUpdate("agent-82c8d22caa01995d", withOutput("Failed to move the existing volume data aside, halting restore: "+res.Failure.Message, res.Response))
+		return false
+	}
+	return true
+}
+
+// rollbackRestoreSnapshot puts the snapshot back, over whatever the failed restore left
+// behind.
+//
+// `rm -rf dataPath/*` needs no guard of its own — `rm -f` exits 0 on an unexpanded glob
+// — and it cannot destroy anything unrecoverable: the snapshot is empty only when
+// /mnt/data was empty when it was taken, so what this removes is either nothing or what
+// the restore itself just wrote there.
+func rollbackRestoreSnapshot(event *progress, repo *borg.Repository) bool {
+	cmd := "rm -rf " + dataPath + "/* && " + snapshotCommand(snapshotPath, dataPath)
+	res := repo.RunShell("restore rollback", []string{cmd})
+	if res.Failure != nil {
+		backupLogger().Warn("Failed to roll back restore snapshot", "volume", repo.Name, "exitCode", res.ExitCode, "error", res.Failure.Message)
+		event.PostEventUpdate("agent-af1b0badd5d9b9f6", withOutput("Failed to move the snapshot back into the volume: "+res.Failure.Message, res.Response))
+		return false
+	}
+	return true
+}
+
 func preRestore(vol *types.Volume, event *progress, repo *borg.Repository) (preRestoreSuccess bool) {
 
 	if len(vol.PreRestore) > 2 {
@@ -50,15 +129,25 @@ func preRestore(vol *types.Volume, event *progress, repo *borg.Repository) (preR
 
 	}
 
+	// The strategy hooks run first and keep only their strategy-specific work: for
+	// mysql that is stopping the database containers. The snapshot then runs once, for
+	// every strategy, and this order is not interchangeable — snapshotPath is in the
+	// backup container's own filesystem, not the volume, so the move is a cross-device
+	// copy-and-delete rather than a rename. Copying a running database's data
+	// directory that way and then deleting the original would put a torn copy in the
+	// snapshot and nothing in the volume, which is why the database has to stop first.
 	switch vol.Strategy {
 	case "mysql":
-		return preRestoreMysql(vol, event, repo)
+		if !preRestoreMysql(vol, event, repo) {
+			return false
+		}
 	case "postgres":
-		return preRestorePostgres(vol, event, repo)
-	default:
-		return true
+		if !preRestorePostgres(vol, event, repo) {
+			return false
+		}
 	}
 
+	return takeRestoreSnapshot(event, repo)
 }
 
 func postRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool {
@@ -120,6 +209,14 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 		}
 
 	}
+
+	// The snapshot goes back first, once, for every strategy — including the default
+	// one, which had no rollback at all before and simply left the volume as the failed
+	// restore had left it. The strategy hooks then clean up after it.
+	if !rollbackRestoreSnapshot(event, repo) {
+		return false
+	}
+
 	switch vol.Strategy {
 	case "mysql":
 		return rollbackRestoreMysql(event, repo)

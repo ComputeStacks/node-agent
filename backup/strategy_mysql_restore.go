@@ -11,35 +11,14 @@ import (
 	"github.com/spf13/viper"
 )
 
+// preRestoreMysql stops the database before the volume underneath it is disturbed.
+//
+// It no longer snapshots /mnt/data. preRestore does that for every strategy, right
+// after this returns, so the snapshot is taken once by one owner instead of here and
+// again inside Archive.Restore — where the second attempt ran against the directory
+// this hook had already emptied, and reported the unexpanded glob as a failure.
 func preRestoreMysql(vol *types.Volume, event *progress, repo *borg.Repository) (preRestoreMysqlSuccess bool) {
-
-	if !stopAllMysqlContainers(vol, event) {
-		return false
-	}
-
-	// Delete existing data
-	var preRestoreCmd []string
-	var execCmd []string
-	preRestoreCmd = append(preRestoreCmd, "mkdir", "-p /root/.snapshot")
-	preRestoreCmd = append(preRestoreCmd, "&&", "mv", "/mnt/data/* /root/.snapshot/")
-
-	execCmd = append(execCmd, "sh", "-c", strings.Join(preRestoreCmd, " "))
-
-	exitCode, out, err := repo.Container.Exec(execCmd)
-
-	if err != nil {
-		backupLogger().Warn("Failed to snapshot existing data", "error", err.Error())
-		event.PostEventUpdate("agent-82c8d22caa01995d", withOutput(err.Error(), out))
-		return false
-	}
-
-	if exitCode > 0 {
-		backupLogger().Warn("Failed to run preRestoreMysql Job", "exitCode", exitCode, "commands", "backupCmd")
-		event.PostEventUpdate("agent-0590433e5ef199c9", withOutput("Save data command failed to run.", out))
-		return false
-	}
-
-	return true
+	return stopAllMysqlContainers(vol, event)
 }
 
 func postRestoreMysql(event *progress, repo *borg.Repository) bool {
@@ -69,14 +48,20 @@ func postRestoreMysql(event *progress, repo *borg.Repository) bool {
 
 }
 
+// rollbackRestoreMysql removes the SQL dump directory that a mysql-strategy backup
+// leaves in the volume.
+//
+// rollbackRestore has already emptied /mnt/data and moved the snapshot back by the time
+// this runs, so the `rm -rf /mnt/data/*` and the `mv` that used to be here are gone.
+// Running them here as well was the data-loss path: the borg layer's own rollback moved
+// the snapshot back into /mnt/data, and then this function's rm deleted it while its
+// unguarded mv failed against the now-empty snapshot, leaving the volume empty and the
+// snapshot empty in an AutoRemove container.
 func rollbackRestoreMysql(event *progress, repo *borg.Repository) bool {
 
-	// Clean MySQL directory and move files back
 	var rollbackCmd []string
 	var execCmd []string
-	rollbackCmd = append(rollbackCmd, "rm", "-rf /mnt/data/*")
-	rollbackCmd = append(rollbackCmd, "&&", "mv", "/root/.snapshot/* /mnt/data/")
-	rollbackCmd = append(rollbackCmd, "&&", "rm", "-rf /mnt/data/backups")
+	rollbackCmd = append(rollbackCmd, "rm", "-rf /mnt/data/backups")
 
 	execCmd = append(execCmd, "sh", "-c", strings.Join(rollbackCmd, " "))
 

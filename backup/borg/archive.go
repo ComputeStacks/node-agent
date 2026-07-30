@@ -97,24 +97,31 @@ func decodeArchiveMessage(response string) (ArchiveMessage, bool) {
 	return msg, true
 }
 
-/**
- * Restore an archive to a volume
- *
- * (DEPRECATED) You can optionally specify specific files (including their path) to restore. Otherwise, it will restore the entire directory.
- */
+// Restore extracts an archive over /mnt/data, restoring the whole of it unless
+// filePaths names specific files to pick out (DEPRECATED).
+//
+// It does NOT move the volume's existing contents aside, and it does not roll anything
+// back: the restore hooks own the snapshot and its rollback, in one place each.
+//
+// It used to do both, in parallel with the hooks doing the same thing, and the overlap
+// was unreachable rather than harmless. Two consequences, both fatal once a non-zero
+// exit is honoured:
+//
+//   - It re-ran the mysql strategy's snapshot command against a /mnt/data that the hook
+//     had already emptied, where the glob does not expand and mv exits non-zero with
+//     nothing wrong — failing every mysql restore.
+//   - When both rollbacks ran, this one moved the snapshot back into /mnt/data and then
+//     rollbackRestoreMysql's `rm -rf /mnt/data/*` deleted it, leaving nothing in either
+//     place. The backup container is AutoRemove, so there was nothing left to recover
+//     from.
+//
+// Removing it also fixes an asymmetry: the internal rollback only ever ran on the
+// docker-fault path, so a borg failure — the path that actually fires — rolled back
+// nothing at all. Every failure now returns non-nil to one caller, restore.Restore,
+// which calls rollbackRestore for all of them.
 func (a *Archive) Restore(filePaths []string) *LogMessage {
 	if reflect.ValueOf(a.Repository.Container).IsNil() {
 		return &LogMessage{Message: "Missing backup container"}
-	}
-
-	// Move current structure to snapshot
-	preRestore := []string{"mkdir", "-p /root/.snapshot"}
-	preRestore = append(preRestore, "&&", "mv", "/mnt/data/* /root/.snapshot/")
-
-	_, _, preRestoreLog := a.Repository.ExecWithLog(preRestore)
-
-	if preRestoreLog != (LogMessage{}) {
-		return &preRestoreLog
 	}
 
 	// Perform Restore
@@ -125,21 +132,18 @@ func (a *Archive) Restore(filePaths []string) *LogMessage {
 	for _, p := range filePaths {
 		cmd = append(cmd, p)
 	}
-	_, response, log := a.Repository.ExecWithLog(cmd)
 
-	borgLogger().Debug("Restore Response", "output", response)
+	res := a.Repository.RunBorg("borg extract", cmd)
 
-	if log != (LogMessage{}) {
+	borgLogger().Debug("Restore Response", "output", res.Response)
 
-		// Failed, so we roll back
-		rollbackCmd := []string{"rm", "-rf /mnt/data/*"}
-		rollbackCmd = append(rollbackCmd, "&&", "mv /root/.snapshot/* /mnt/data/")
-		if _, rollbackResponse, rollbackLog := a.Repository.ExecWithLog(rollbackCmd); rollbackLog != (LogMessage{}) {
-			borgLogger().Warn("Fatal error performing rollback on restore", "response", rollbackResponse, "error", rollbackLog.Message)
-		}
-		return &log
+	if res.Failure != nil {
+		return res.Failure
 	}
-	return readArchiveRestoreResponse(response)
+
+	// Belt and braces on a clean exit: extract is silent on success with --error, so
+	// anything here is a record borg emitted without failing.
+	return readArchiveRestoreResponse(res.Response)
 }
 
 func (a *Archive) Info() (*ArchiveResponse, *LogMessage) {
