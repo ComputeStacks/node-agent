@@ -160,7 +160,13 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 		return results, &log
 	}
 
-	if response == "" || (log != (LogMessage{})) {
+	// Gate on the borg error only. &log is never nil, so the old `response == "" ||`
+	// clause turned exit code 0 with no borg error but empty output into a non-nil
+	// pointer to a ZERO LogMessage — failing the task with the reason "() ", skipping
+	// Sync() and logging no completion line. An empty response with a clean exit is a
+	// successful delete: it falls through to the loop below, where the single ""
+	// element fails to unmarshal and is skipped, leaving results empty.
+	if log != (LogMessage{}) {
 		return results, &log
 	}
 
