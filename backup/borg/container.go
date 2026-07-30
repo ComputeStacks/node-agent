@@ -5,12 +5,10 @@ import (
 	"cs-agent/containermgr"
 	"cs-agent/sshremote"
 	"cs-agent/types"
-	"encoding/json"
 	"errors"
 	"math/rand"
 	"reflect"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/image"
@@ -18,7 +16,6 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	volumeTypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
-	"github.com/getsentry/sentry-go"
 	"github.com/spf13/viper"
 )
 
@@ -153,37 +150,6 @@ func (r *Repository) InitBackupContainer(vol *types.Volume, source *types.Volume
 	}
 
 	return true, nil
-}
-
-func (r *Repository) ExecWithLog(cmd []string) (exitCode int, response string, log LogMessage) {
-	if reflect.ValueOf(r.Container).IsNil() {
-		return 99, "", LogMessage{Message: "Missing backup container"}
-	}
-	execCmd := []string{"sh", "-c", strings.Join(cmd, " ")}
-	exitCode, response, err := r.Container.Exec(execCmd)
-
-	if err != nil {
-		borgLogger().Debug("ExecWithLog Error", "error", err.Error())
-		if response == "" {
-			log.Message = err.Error()
-			borgLogger().Error("Fatal ExecWithLog", "error", err.Error(), "repo", r.Name)
-			sentry.CaptureException(err)
-			return exitCode, response, log
-		}
-		if strings.Contains(response, "}\n{") {
-			response = strings.Split(response, "\n{")[0]
-		}
-		jsonErr := json.Unmarshal([]byte(response), &log)
-		if jsonErr != nil {
-			log.Message = jsonErr.Error()
-			return exitCode, response, log
-		}
-		borgLogger().Warn("Error", "msgid", log.MsgID, "message", log.Message)
-		return exitCode, response, log
-	}
-
-	return exitCode, response, log
-
 }
 
 /*

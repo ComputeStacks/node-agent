@@ -207,38 +207,23 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 
 	borgLogger().Debug("Raw Delete Command", "cmd", strings.Join(cmd, " "))
 
-	exitCode, response, log := a.Repository.ExecWithLog(cmd)
+	res := a.Repository.RunBorg("borg delete", cmd)
 
-	if exitCode > 0 {
-		// The full response is kept at DEBUG so nothing is lost when troubleshooting;
-		// the reported message is borg's own diagnosis, never the --stats table (which
-		// says only "Deleted data: 0 B" and reads like the cause when it isn't).
-		borgLogger().Debug("Archive delete exited non-zero", "exitCode", exitCode, "response", response)
-		reason := failureReason(response)
-		if reason == "" {
-			// An exec-level failure (docker client error, container never came online)
-			// arrives with an empty response and the reason already in log.Message —
-			// keep it rather than claiming borg ran and said nothing.
-			reason = strings.TrimSpace(log.Message)
-		}
-		if reason == "" {
-			reason = "no diagnostic output from borg"
-		}
-		log.Message = "borg delete exited " + strconv.Itoa(exitCode) + ": " + reason
-		return results, &log
+	// This site alone used to hand-roll the non-zero-exit check, because it could not
+	// rely on the old gate; that check was exactly the funnel's rule, so it collapses
+	// to this. The reason is borg's own diagnosis rather than the --stats table (which
+	// says only "Deleted data: 0 B" and reads like the cause when it isn't), the exit
+	// code is in res.ExitCode and the funnel's log line, and the full response is at
+	// DEBUG there.
+	if res.Failure != nil {
+		return results, res.Failure
 	}
 
-	// Gate on the borg error only. &log is never nil, so the old `response == "" ||`
-	// clause turned exit code 0 with no borg error but empty output into a non-nil
-	// pointer to a ZERO LogMessage — failing the task with the reason "() ", skipping
-	// Sync() and logging no completion line. An empty response with a clean exit is a
-	// successful delete: it falls through to the loop below, where the single ""
-	// element fails to unmarshal and is skipped, leaving results empty.
-	if log != (LogMessage{}) {
-		return results, &log
-	}
-
-	list := strings.Split(response, "\n")
+	// A clean exit is a successful delete even when nothing was printed: the lone ""
+	// element below fails to unmarshal and is skipped, leaving results empty. (The
+	// gate this replaces returned a pointer to a ZERO LogMessage in that case, failing
+	// the task with the reason "() " and skipping Sync.)
+	list := strings.Split(res.Response, "\n")
 	for _, d := range list {
 		var result LogMessage
 		if jErr := json.Unmarshal([]byte(d), &result); jErr != nil {
