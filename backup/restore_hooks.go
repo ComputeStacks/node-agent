@@ -98,12 +98,13 @@ func postRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool
 func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool {
 
 	if len(vol.PostRestore) > 0 {
-		defer func() bool {
+		// A recovered panic leaves rollbackRestore's unnamed bool return at its zero
+		// value false, i.e. "rollback failed" — which is what the caller reports.
+		// This closure's own return value was never consumed, so it has none.
+		defer func() {
 			if r := recover(); r != nil {
 				event.PostEventUpdate("agent-c290fcc106e4f78a", fmt.Sprintf("%#v", r))
-				return false
 			}
-			return true
 		}()
 		exitCode, out, err := containermgr.ServiceExec(strconv.Itoa(vol.ServiceID), vol.PostRestore)
 

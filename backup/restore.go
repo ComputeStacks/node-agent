@@ -161,8 +161,10 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 
 	if failedToStop {
 		projectEvent.EventLog.Status = "failed"
-		if !rollbackRestore(&destVol, projectEvent, repo) {
-			projectEvent.PostEventUpdate("agent-0b33976078a50679", "rollback restore complete successfully.")
+		if rollbackRestore(&destVol, projectEvent, repo) {
+			backupLogger().Info("Completed restore rollback", "volume", destVol.Name)
+		} else {
+			projectEvent.PostEventUpdate("agent-0b33976078a50679", "Restore rollback failed.")
 		}
 	} else {
 		switch vol.Strategy {
@@ -178,12 +180,18 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			projectEvent.PostEventUpdate("agent-6dfe4e7b471fdd4c", restoreErr.ToYaml())
 			projectEvent.EventLog.Status = "failed"
 			backupLogger().Warn("Failed to restore volume", "source_volume", vol.Name, "volume", destVol.Name, "archive", archive.Name, "error", restoreErr.Message)
-			rollbackRestore(&destVol, projectEvent, repo)
+			if rollbackRestore(&destVol, projectEvent, repo) {
+				backupLogger().Info("Completed restore rollback", "volume", destVol.Name)
+			} else {
+				projectEvent.PostEventUpdate("agent-0b33976078a50679", "Restore rollback failed.")
+			}
 		} else {
 			if !postRestore(&destVol, projectEvent, repo) {
 				projectEvent.PostEventUpdate("agent-12b99684cb30d029", "postRestore failed, executing rollback.")
-				if !rollbackRestore(&destVol, projectEvent, repo) {
-					projectEvent.PostEventUpdate("agent-b9f3171f4182ee92", "rollback restore complete successfully.")
+				if rollbackRestore(&destVol, projectEvent, repo) {
+					backupLogger().Info("Completed restore rollback", "volume", destVol.Name)
+				} else {
+					projectEvent.PostEventUpdate("agent-b9f3171f4182ee92", "Restore rollback failed.")
 				}
 			} else {
 				// Success: log a concise completion line (symmetric with the borg
