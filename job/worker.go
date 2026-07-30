@@ -54,6 +54,7 @@ func (d *Dispatcher) runTask(ctx context.Context, task store.Task) {
 		}
 	}()
 
+	start := time.Now()
 	jobEvent().Info("Processing task", "task", task.ID, "kind", task.Name)
 	run := d.runner
 	if run == nil {
@@ -83,6 +84,20 @@ func (d *Dispatcher) runTask(ctx context.Context, task store.Task) {
 	if uErr != nil {
 		jobEvent().Warn("failed to record task status", "task", task.ID, "error", uErr.Error())
 		return // leave completed=false so the guard marks it failed
+	}
+	// Terminal success line, so a task UUID can be traced start→finish in the node
+	// log (previously only abnormal exits logged anything). Gated on status because
+	// a failure already logged "task failed" above with the error text — an
+	// unconditional line here would double-log every failure. It sits AFTER the
+	// successful UpdateTaskStatus so the line means "finished AND recorded"; the
+	// early return on write failure above correctly emits no success line.
+	//
+	// hclog's standard formatter renders a time.Duration via %v (duration=15.023s).
+	// Under JSONFormat it would marshal as an integer nanosecond count instead;
+	// log/log.go sets no JSONFormat today, so this is fine as-is.
+	if status == store.TaskCompleted {
+		jobEvent().Info("task completed", "task", task.ID, "kind", task.Name,
+			"duration", time.Since(start).Round(time.Millisecond))
 	}
 	completed = true
 }
