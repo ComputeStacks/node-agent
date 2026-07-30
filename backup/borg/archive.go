@@ -50,21 +50,51 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 	backupCmd = append(backupCmd, a.archivePath())
 	backupCmd = append(backupCmd, ".")
 
-	_, response, log := a.Repository.ExecWithLog(backupCmd)
+	res := a.Repository.RunBorg("borg create", backupCmd)
 
-	if log != (LogMessage{}) {
-		return ArchiveMessage{}, &log
+	if res.Failure != nil {
+		return ArchiveMessage{}, res.Failure
 	}
+	// Before the decode, deliberately: Sync reports the repository's observed state
+	// (size + archive list) up into control.db, and it is owed for the archive borg
+	// just wrote whether or not its --json payload can be read back.
 	a.Repository.Sync()
-	marshalErr := json.Unmarshal([]byte(response), &borgResponse)
-	if marshalErr == nil {
+
+	borgResponse, decoded := decodeArchiveMessage(res.Response)
+	if decoded {
 		borgLogger().Info("Completed backup", "archive", borgResponse.Archive.ID, "duration", hclog.Fmt("%.5f", borgResponse.Archive.Duration))
 		return borgResponse, nil
-	} else {
-		borgLogger().Debug("Unmarshal Error on Borg Backup Response", "error", marshalErr.Error(), "raw", response)
 	}
+	// Still a success, and still a nil error: the exit code is what says whether borg
+	// wrote the archive, and it exited 0. The caller records the backup and advances
+	// last_backup, which is correct — what was broken was reporting success on a
+	// NON-zero exit, and the funnel above now prevents that.
 	borgLogger().Warn("Backup appears to have succeeded, but there was an error decoding the response data from borg.")
 	return ArchiveMessage{}, nil
+}
+
+// decodeArchiveMessage reads `borg create --json`'s payload out of the output of a run
+// that exited 0. ok is false when nothing usable came back.
+//
+// An archive id that decoded empty counts as "nothing usable", exactly like a response
+// that would not unmarshal at all. Go ignores unknown fields, so anything shaped
+// unlike the payload — a --log-json record, a stats line — unmarshals cleanly into an
+// all-zero ArchiveMessage; the old code took that for a decoded payload and logged
+// `Completed backup archive= duration=0.00000`, a completion line naming no archive and
+// claiming a zero duration. There is nothing for a caller to do with an ArchiveMessage
+// that has no id, so it takes the same "succeeded, but the response could not be
+// decoded" path.
+func decodeArchiveMessage(response string) (ArchiveMessage, bool) {
+	var msg ArchiveMessage
+	if err := json.Unmarshal([]byte(response), &msg); err != nil {
+		borgLogger().Debug("Unmarshal Error on Borg Backup Response", "error", err.Error(), "raw", response)
+		return ArchiveMessage{}, false
+	}
+	if msg.Archive.ID == "" {
+		borgLogger().Debug("Borg Backup Response carried no archive id", "raw", response)
+		return ArchiveMessage{}, false
+	}
+	return msg, true
 }
 
 /**
