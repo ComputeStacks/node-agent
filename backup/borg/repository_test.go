@@ -51,7 +51,7 @@ func TestLooksLikeMissingRepository(t *testing.T) {
 		want bool
 	}{
 		{name: "borg's does-not-exist wording", in: recordMessage(t, repoDoesNotExistRecord), want: true},
-		{name: "ssh backend path", in: "Repository ssh://borg@10.80.0.9:22/backups/b-vol/backup does not exist.", want: true},
+		{name: "ssh backend path", in: "Repository ssh://borg@backup.example.com:22/backups/b-vol/backup does not exist.", want: true},
 		{name: "invalid repository is a different condition", in: recordMessage(t, invalidRepositoryRecord), want: false},
 		{name: "path already has something at it", in: recordMessage(t, pathAlreadyExistsRecord), want: false},
 		{name: "a missing archive is not a missing repository", in: recordMessage(t, archiveDoesNotExistRecord), want: false},
