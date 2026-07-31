@@ -79,6 +79,69 @@ const createJSONPayload = `{
 // createJSONPayloadTTY reproduces the framing Container.Exec's TTY produces.
 var createJSONPayloadTTY = strings.ReplaceAll(createJSONPayload, "\n", "\r\n")
 
+// Real borg 1.4.4 plain-text output, captured against the image the node runs. None of
+// these responses contains a single --log-json record: argparse rejects an argument
+// before borg's json logging is in effect, and borg's pre-repository checks and its
+// --show-rc line are written as plain text, so failureRecord has nothing but lines to
+// choose between — the case this fixture set exists to pin.
+const (
+	// `borg --log-json create --error --json --compression zstd,99 ::x .`, rc 2. The
+	// usage banner comes FIRST and the reason LAST. The continuation lines start with
+	// "[", so looksLikeJSONFragment already discards them, leaving three usable lines:
+	// the banner's first line, "ARCHIVE [PATH ...]", and the error. Quoting the first of
+	// those is what put a usage banner in an operator's result_json.
+	argparseCompressionOutput = `usage: borg create [-h] [--critical] [--error] [--warning] [--info] [--debug]
+                   [--debug-topic TOPIC] [-p] [--iec] [--log-json]
+                   [--lock-wait SECONDS] [--bypass-lock] [--show-version]
+                   [--show-rc] [--umask M] [--remote-path PATH]
+                   [--remote-ratelimit RATE] [--upload-ratelimit RATE]
+                   [--remote-buffer UPLOAD_BUFFER]
+                   [--upload-buffer UPLOAD_BUFFER] [--consider-part-files]
+                   [--debug-profile FILE] [--rsh RSH] [-n] [-s] [--list]
+                   [--filter STATUSCHARS] [--json] [--no-cache-sync]
+                   [--stdin-name NAME] [--stdin-user USER]
+                   [--stdin-group GROUP] [--stdin-mode M]
+                   [--content-from-command] [--paths-from-stdin]
+                   [--paths-from-command] [--paths-delimiter DELIM]
+                   [-e PATTERN] [--exclude-from EXCLUDEFILE]
+                   [--pattern PATTERN] [--patterns-from PATTERNFILE]
+                   [--exclude-caches] [--exclude-if-present NAME]
+                   [--keep-exclude-tags] [--exclude-nodump] [-x]
+                   [--numeric-owner] [--numeric-ids] [--noatime] [--atime]
+                   [--noctime] [--nobirthtime] [--nobsdflags] [--noflags]
+                   [--noacls] [--noxattrs] [--sparse] [--files-cache MODE]
+                   [--files-changed MODE] [--read-special] [--comment COMMENT]
+                   [--timestamp TIMESTAMP] [-c SECONDS]
+                   [--chunker-params PARAMS] [-C COMPRESSION]
+                   ARCHIVE [PATH ...]
+borg create: error: argument -C/--compression: level must be >= 1 and <= 22`
+
+	// `borg check --error /tmp/r` over a repository with one zeroed segment, rc 1. Both
+	// lines are usable, the cause is first and a summary that mentions errors without
+	// being one is last: the shape that fails if the summary is ever preferred to the
+	// cause, whether by direction or by matching the bare word "error".
+	checkIntegrityOutput = `Data integrity error: Invalid segment magic [segment 3, offset 0]
+Finished full repository check, errors found.`
+
+	// `borg --show-rc create --error /nonexistent/repo::x .`, rc 2. No line carries
+	// "error:" — "terminating with error status" is a summary, not a diagnosis — so
+	// position decides, and the informative line is the FIRST one. This is the measured
+	// case against preferring the last line.
+	showRCMissingRepositoryOutput = `Repository /nonexistent/repo does not exist.
+terminating with error status, rc 2`
+
+	// `borg --log-json create --error --json --pattern bogus ::x .`, rc 2: one plain
+	// line, no record, no "error:". A single line must be quoted exactly as before.
+	patternRejectionOutput = `A pattern/command must start with any of: -, !, +, R, r, P, p`
+)
+
+// Container.Exec allocates a TTY, so every one of those lines arrives \r\n-framed.
+var (
+	argparseCompressionOutputTTY     = strings.ReplaceAll(argparseCompressionOutput, "\n", "\r\n")
+	checkIntegrityOutputTTY          = strings.ReplaceAll(checkIntegrityOutput, "\n", "\r\n")
+	showRCMissingRepositoryOutputTTY = strings.ReplaceAll(showRCMissingRepositoryOutput, "\n", "\r\n")
+)
+
 // The same payload on one line. The fragment guard cannot help here — this IS valid
 // JSON, and it unmarshals into LogMessage as all-zero fields because none of its keys
 // match. Only the Message-or-MsgID test rejects it, which is why that test exists.
@@ -192,6 +255,48 @@ var failureRecordChecks = []struct {
 		in:     questionPromptRecord + "\r\n",
 		wantOK: false,
 	},
+	{
+		// The defect this ordering exists for: the reason reported for a rejected
+		// argument was "usage: borg create [-h] [--critical] [--error] ...".
+		name:      "argparse rejection quotes the error, not the usage banner",
+		in:        argparseCompressionOutputTTY + "\r\n",
+		wantOK:    true,
+		wantMsg:   "borg create: error: argument -C/--compression: level must be >= 1 and <= 22",
+		wantMsgID: "",
+	},
+	{
+		// The diagnosis is what is being selected, not its position: quoting the last
+		// line here would report a summary that explains nothing on its own.
+		name:      "diagnosis before a summary returns the diagnosis",
+		in:        checkIntegrityOutputTTY + "\r\n",
+		wantOK:    true,
+		wantMsg:   "Data integrity error: Invalid segment magic [segment 3, offset 0]",
+		wantMsgID: "",
+	},
+	{
+		// Nothing carries "error:", so position decides — and the cause is above the
+		// line that merely restates that borg is giving up.
+		name:      "multi-line output with no diagnosis returns the first line",
+		in:        showRCMissingRepositoryOutputTTY + "\r\n",
+		wantOK:    true,
+		wantMsg:   "Repository /nonexistent/repo does not exist.",
+		wantMsgID: "",
+	},
+	{
+		name:      "single non-json borg line",
+		in:        patternRejectionOutput + "\r\n",
+		wantOK:    true,
+		wantMsg:   "A pattern/command must start with any of: -, !, +, R, r, P, p",
+		wantMsgID: "",
+	},
+	{
+		// A record still wins outright, whatever the lines around it say.
+		name:      "record beats a diagnosis line",
+		in:        checkIntegrityOutputTTY + "\r\n" + lockTimeoutRecord + "\r\n",
+		wantOK:    true,
+		wantMsg:   "Failed to create/acquire the lock /mnt/borg/backup/lock.exclusive (timeout).",
+		wantMsgID: "LockTimeout",
+	},
 }
 
 func TestFailureRecord(t *testing.T) {
@@ -261,6 +366,52 @@ func TestFailureRecordNeverQuotesAPayloadFragment(t *testing.T) {
 		if trimmed := strings.TrimSpace(line); trimmed != "" && got.Message == trimmed {
 			t.Fatalf("Received a payload fragment as the reason: %q", got.Message)
 		}
+	}
+}
+
+// No line of a usage banner may ever be the reported reason: the banner is the least
+// informative thing in the response, and it is what borg prints first. The line the
+// agent picked is still not borg's own verdict, so it carries no msgid.
+func TestFailureRecordNeverQuotesTheUsageBanner(t *testing.T) {
+	got, ok := failureRecord(argparseCompressionOutputTTY + "\r\n")
+	if !ok {
+		t.Fatal("Received ok=false, wanted the argparse diagnosis")
+	}
+	if got.MsgID != "" {
+		t.Errorf("Received msgid %q, wanted none for a line the agent picked", got.MsgID)
+	}
+	for _, line := range strings.Split(argparseCompressionOutput, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "error:") {
+			continue
+		}
+		if got.Message == trimmed {
+			t.Fatalf("Received a usage banner line as the reason: %q", got.Message)
+		}
+	}
+}
+
+var looksLikeDiagnosisChecks = []struct {
+	name string
+	in   string
+	want bool
+}{
+	{name: "argparse error", in: "borg create: error: argument -C/--compression: level must be >= 1 and <= 22", want: true},
+	{name: "data integrity error", in: "Data integrity error: Invalid segment magic [segment 3, offset 0]", want: true},
+	{name: "python exception line", in: "borg.helpers.errors.IntegrityError: Data integrity error: Invalid segment magic", want: true},
+	{name: "usage banner", in: "usage: borg create [-h] [--critical] [--error] [--warning]", want: false},
+	{name: "check summary", in: "Finished full repository check, errors found.", want: false},
+	{name: "show-rc line", in: "terminating with error status, rc 2", want: false},
+	{name: "shell error", in: "sh: 1: borg: not found", want: false},
+}
+
+func TestLooksLikeDiagnosis(t *testing.T) {
+	for _, i := range looksLikeDiagnosisChecks {
+		t.Run(i.name, func(t *testing.T) {
+			if got := looksLikeDiagnosis(i.in); got != i.want {
+				t.Errorf("Received %v, wanted %v", got, i.want)
+			}
+		})
 	}
 }
 

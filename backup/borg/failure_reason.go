@@ -100,6 +100,18 @@ func looksLikeJSONFragment(line string) bool {
 	return false
 }
 
+// looksLikeDiagnosis reports whether a non-JSON line is the one that says what went
+// wrong. argparse marks the reason with "<prog>: error: <what>", and the test is
+// case-insensitive so Python's own uncaught-exception lines ("...IntegrityError: Data
+// integrity error: ...") count too.
+//
+// "error:" with the colon, not the bare word: "Finished full repository check, errors
+// found." and "terminating with error status, rc 2" are summaries that mention an error
+// without being one, and matching them would prefer a summary over the cause.
+func looksLikeDiagnosis(line string) bool {
+	return strings.Contains(strings.ToLower(line), "error:")
+}
+
 // severityRank orders borg's levelname values. It decides only WHICH record gets
 // quoted, never whether a command failed — borg logs a WARNING on the way to the
 // ERROR that actually stopped it, and the ERROR is the useful one. An unrecognised or
@@ -134,17 +146,41 @@ func severityRank(levelName string) int {
 // there is no record at all, and then it becomes Message with NO MsgID, so a line
 // the agent found rather than borg reported can never be mistaken for borg's own.
 //
+// Among non-JSON lines the first one that looks like a diagnosis wins, and failing
+// that the first usable line. Position alone was measured to be the wrong sole test:
+// a rejected argument produces no record at all — argparse writes plain text before
+// --log-json takes effect — and it writes the usage banner FIRST and the reason LAST,
+// so `--compression zstd,99` reported "usage: borg create [-h] [--critical] [--error]
+// ..." when borg had said "borg create: error: argument -C/--compression: level must
+// be >= 1 and <= 22". The diagnosis test, not a change of direction, is what fixes
+// that: position stays first because when nothing carries "error:" the first line is
+// the measured best. `--show-rc` puts "Repository ... does not exist." above
+// "terminating with error status, rc 2"; a plain borg traceback puts the exception
+// above Platform/PID/sys.argv trailers; multi-line shell failures put the root cause
+// above its consequences. In every one of those the later lines follow FROM the first.
+//
+// How much these two rules have to carry is bounded: every RunBorg command passes
+// --log-json, so a borg failure that got as far as running arrives as a record and
+// takes the branch above. What reaches here is output produced before borg's json
+// logging exists (argparse) or by something other than borg (the shell, a wrapper) —
+// short, human-written text, which is why a simple rule is adequate.
+//
 // ok is false when nothing usable was found.
 func failureRecord(response string) (LogMessage, bool) {
 	var best LogMessage
 	var bestRank int
 	var found bool
-	var fallback string
+	var diagnosisLine, firstLine string
 
 	for _, l := range scanBorgOutput(response) {
 		if !l.isRecord {
-			if fallback == "" && !l.isJSON && !looksLikeJSONFragment(l.raw) {
-				fallback = l.raw
+			if !l.isJSON && !looksLikeJSONFragment(l.raw) {
+				if firstLine == "" {
+					firstLine = l.raw
+				}
+				if diagnosisLine == "" && looksLikeDiagnosis(l.raw) {
+					diagnosisLine = l.raw
+				}
 			}
 			continue
 		}
@@ -163,8 +199,11 @@ func failureRecord(response string) (LogMessage, bool) {
 	if found {
 		return best, true
 	}
-	if fallback != "" {
-		return LogMessage{Message: fallback}, true
+	if diagnosisLine != "" {
+		return LogMessage{Message: diagnosisLine}, true
+	}
+	if firstLine != "" {
+		return LogMessage{Message: firstLine}, true
 	}
 	return LogMessage{}, false
 }
