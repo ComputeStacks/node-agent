@@ -149,6 +149,17 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 	// Override file paths for our custom strategies.
 	filePaths := params.FilePaths
 
+	// A confirmation pass, not the stop that protects the volume. preRestore has already
+	// stopped this same set of containers — it has to, because it moves /mnt/data aside and
+	// that move is a cross-device copy, not a rename — so this loop is normally re-stopping
+	// containers that are already down, which Stop() treats as a no-op.
+	//
+	// It is not redundant for that. It still catches a container that came back up in
+	// between (the orchestrator rescheduling one, an operator starting the service), and its
+	// failure path is the one that HAS somewhere to fall back to: the snapshot exists by the
+	// time control reaches here, so failedToStop below can call rollbackRestore and put the
+	// volume back. A failure inside preRestore's stop cannot and does not need to — nothing
+	// has been moved yet at that point.
 	failedToStop := false
 	for _, c := range containers {
 		backupLogger().Debug("Start Restore: Stop Container", "volume", vol.Name, "container", c.ID)

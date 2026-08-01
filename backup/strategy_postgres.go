@@ -43,27 +43,23 @@ func postBackupPostgres(event *progress, repo *borg.Repository) bool {
 	return true
 }
 
-// preRestorePostgres stops the database before the volume underneath it is disturbed.
+// preRestorePostgres has no strategy-specific work left to do.
 //
-// It used to return true and stop nothing, which was survivable only while nothing
-// touched the volume before Restore's own container stop loop. preRestore now takes the
-// /mnt/data snapshot, and preRestore runs ahead of that loop, so postgres was getting
-// its data directory moved out from under a running server. Not a rename either: the
-// snapshot lives in the backup container's filesystem rather than in the volume, so the
-// move is a per-file copy followed by an unlink — a torn copy in the snapshot and an
-// empty volume, with the database still writing.
+// It briefly stopped the service's containers, because preRestore had started taking the
+// /mnt/data snapshot ahead of Restore's own stop loop and postgres was getting its data
+// directory moved out from under a running server. That was never a postgres problem: the
+// snapshot is a cross-device copy followed by an unlink for every strategy, so every
+// strategy needed the stop. preRestore does it once now, for all of them — see
+// stopServiceContainers, which also records the writers that stop does not reach and the
+// fact that Restore, not this hook, starts the containers again.
 //
-// stopAllMysqlContainers is named after its first caller rather than after what it does:
-// FindAllByService on the volume's service, Stop() on each container, and a restart of
-// all of them if any refuses to stop. There is nothing mysql-specific in it. Renaming it
-// would touch the mysql hooks and their comments for no change in behaviour, so the name
-// stays and this comment carries the explanation.
-//
-// The containers stopped here are started again by Restore, which restarts the list it
-// captured before any of this ran, regardless of who stopped them — the mysql strategy
-// has always relied on that.
+// It is kept, with its case in preRestore's switch, as the place a genuinely
+// postgres-specific pre-restore step would go — and because that switch runs before the
+// stop, so a hook there can still reach a live server the way preBackupPostgres above does
+// when it issues `checkpoint;`. postBackupPostgres, postRestorePostgres and
+// rollbackRestorePostgres are the same shape.
 func preRestorePostgres(vol *types.Volume, event *progress, repo *borg.Repository) (preRestorePostgresSuccess bool) {
-	return stopAllMysqlContainers(vol, event)
+	return true
 }
 
 func postRestorePostgres(event *progress, repo *borg.Repository) bool {

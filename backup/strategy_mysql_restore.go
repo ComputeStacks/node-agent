@@ -2,23 +2,24 @@ package backup
 
 import (
 	"cs-agent/backup/borg"
-	"cs-agent/containermgr"
 	"cs-agent/types"
-	"strconv"
 	"strings"
-
-	"github.com/docker/docker/client"
-	"github.com/spf13/viper"
 )
 
-// preRestoreMysql stops the database before the volume underneath it is disturbed.
+// preRestoreMysql has no strategy-specific work left to do.
 //
-// It no longer snapshots /mnt/data. preRestore does that for every strategy, right
-// after this returns, so the snapshot is taken once by one owner instead of here and
-// again inside Archive.Restore — where the second attempt ran against the directory
-// this hook had already emptied, and reported the unexpanded glob as a failure.
+// It once snapshotted /mnt/data and then, later, stopped the database. Both moved out and
+// for the same reason: neither was mysql's business. preRestore takes the snapshot once for
+// every strategy, and it now stops the service's containers once for every strategy too,
+// because an ordinary application volume needed that exactly as much as a database did —
+// see stopServiceContainers for what that stop does and does not cover.
+//
+// It is kept, with its case in preRestore's switch, as the place a genuinely mysql-specific
+// pre-restore step would go — and because a hook in that switch still runs while the service
+// is up, which a hook below the stop would not. postBackupPostgres, postRestorePostgres and
+// rollbackRestorePostgres are the same shape.
 func preRestoreMysql(vol *types.Volume, event *progress, repo *borg.Repository) (preRestoreMysqlSuccess bool) {
-	return stopAllMysqlContainers(vol, event)
+	return true
 }
 
 func postRestoreMysql(event *progress, repo *borg.Repository) bool {
@@ -79,33 +80,4 @@ func rollbackRestoreMysql(event *progress, repo *borg.Repository) bool {
 
 	return true
 
-}
-
-func stopAllMysqlContainers(vol *types.Volume, event *progress) bool {
-	cli, cliErr := client.NewClientWithOpts(client.WithVersion(viper.GetString("docker.version")))
-	if cliErr != nil {
-		backupLogger().Warn("Failed to connect to docker", "error", cliErr.Error(), "function", "stopAllMysqlContainers")
-		event.PostEventUpdate("agent-45a73ed06ea34e25", cliErr.Error())
-		return false
-	}
-	containers, findAllErr := containermgr.FindAllByService(cli, strconv.Itoa(vol.ServiceID), true)
-	if findAllErr != nil {
-		backupLogger().Warn("Failed to retrieve containers", "error", findAllErr.Error(), "function", "stopAllMysqlContainers")
-		event.PostEventUpdate("agent-0248a778f49a1eb4", findAllErr.Error())
-		return false
-	}
-	failedToStop := false
-	for _, c := range containers {
-		if !c.Stop() {
-			failedToStop = true
-		}
-	}
-	if failedToStop {
-		event.PostEventUpdate("agent-6becd55bb6a584de", "Failed to stop some containers, unable to restore.")
-		for _, c := range containers {
-			_ = c.Start() // Ignore containers that fail to start
-		}
-		return false
-	}
-	return true
 }

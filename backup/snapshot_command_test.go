@@ -85,10 +85,11 @@ func writeFile(t *testing.T, path, content string) {
 }
 
 // An empty source must SUCCEED and move nothing. This is the clone case — the
-// controller clones a volume by restoring into a brand-new, empty one — and it is also
-// every mysql restore, whose database containers stop before the snapshot runs. A bare
-// `mv src/* dst/` fails here, because the glob does not expand and mv is handed the
-// literal `src/*`.
+// controller clones a volume by restoring into a brand-new, empty one — and it is a
+// reachable state for a restore of any strategy: preRestore stops the service's containers
+// before it takes the snapshot, so what the move sees is whatever a quiesced service left
+// in /mnt/data, up to and including nothing. A bare `mv src/* dst/` fails here, because the
+// glob does not expand and mv is handed the literal `src/*`.
 func TestSnapshotCommandEmptySource(t *testing.T) {
 	src, dst := snapshotDirs(t)
 
