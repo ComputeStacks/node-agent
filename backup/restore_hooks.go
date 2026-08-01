@@ -45,10 +45,44 @@ const (
 	snapshotPath = "/root/.snapshot"
 )
 
-// snapshotCommand builds a shell command that moves the contents of src into dst,
-// creating dst first. It is the single implementation of that move: preRestore uses it
-// to set the volume aside, rollbackRestore uses it with src and dst swapped to put the
-// volume back.
+// entryGlobs returns the three patterns that, together, match every entry of dir except
+// `.` and `..` — visible names, dotted names, and doubly-dotted names.
+//
+// A single `dir/*` is what this replaces, and it was a silent data-loss bug in both
+// directions of the snapshot. The volume's dotfiles were never moved aside, so a partial
+// extract overwrote them with the archive's copies and the rollback — globbing just as
+// blindly — neither cleared what the extract had written nor had anything hidden to put
+// back. The pre-restore content of every dotfile the extract touched was gone, in an
+// AutoRemove container with no second copy, and the rollback reported success. On the
+// success path the same blindness left a dotfile that the archive does not contain
+// sitting in the volume, so the restore did not produce the archive's point-in-time
+// state. This fleet hosts WordPress, so the exposed set is `.htaccess`, `.user.ini`,
+// `.env`, `.git/` and `.ssh/`. Borg was never the problem: archive.go runs
+// `cd /mnt/data && borg create … ::archive .`, and `.` recurses into dotfiles.
+//
+// `dir/.[!.]*` cannot match `.` — something has to follow the dot — and cannot match
+// `..`, because the character after the dot is required not to be a dot. That is what
+// leaves `dir/..?*` to do: it catches names beginning with two dots, and cannot match
+// `..` itself because it demands a third character. `!` rather than `^` is the negation
+// POSIX defines, which is what dash accepts.
+//
+// `dir/.*` must NEVER be written here. It expands to include `dir/.` and `dir/..`, which
+// hands the move direction the volume's own directory and its parent, and asks the
+// rollback direction's `rm -rf` to delete the parent of the volume. GNU coreutils refuse
+// (`rm: refusing to remove '.' or '..'`), so on today's image the damage stops at a
+// failed rollback — but backups.borg.image is a floating `:latest` on an image this repo
+// does not build, and an `rm` that does not refuse takes the docker volume's parent
+// directory with it.
+//
+// Nothing here is quoted, so dir must stay free of shell metacharacters — and now of `[`
+// and `]` as well, since it is spliced into a bracket expression. Production passes
+// /mnt/data and /root/.snapshot.
+func entryGlobs(dir string) []string {
+	return []string{dir + "/*", dir + "/.[!.]*", dir + "/..?*"}
+}
+
+// moveEntriesCommand builds a shell command that moves every entry of src into dst,
+// creating dst first.
 //
 // `set --` and the test that follows are what make an empty src a success. A bare
 // `mv src/* dst/` exits non-zero when src is empty, because the glob does not expand
@@ -56,22 +90,55 @@ const (
 // is a first-class flow: cloning a volume restores into a brand-new one. Now that a
 // non-zero exit fails the restore, an empty source had to stop looking like a failure.
 //
-// `|| [ -L "$1" ]` is mandatory, not defensive. `[ -e ]` follows symlinks, so a
-// dangling symlink that happens to sort first — `current -> releases/gone`, an ordinary
-// shape for an application volume — would make a directory full of data read as empty.
-// The move would be skipped, the command would exit 0, and the extract would then run
-// over live data with nothing to roll back to: exactly the accident the guard exists to
-// prevent, wearing a success exit code.
+// One guarded group per pattern, not one `mv` with all three. dash leaves an unmatched
+// glob as a literal, and `mv` handed a literal `src/..?*` fails — and `..?*` matches
+// nothing on virtually every volume, so a single-`mv` version would fail on essentially
+// every restore.
 //
-// Glob semantics are otherwise unchanged on purpose. `set -- src/*` still skips
-// dotfiles, exactly as `mv src/*` did, so dotfiles are still neither snapshotted nor
-// put back by a rollback — a pre-existing gap that needs its own reasoning about `.`
-// and `..`, and changing it here would quietly change what a rollback restores.
-// Quoting "$@" is a free fix: filenames containing spaces now survive, where the old
-// unquoted glob broke them.
+// The groups are joined with `&&`, never `;`. With `;` the command's exit status is the
+// last group's, and since the `..?*` group almost never matches, a failed move of the
+// visible entries — nearly all the data — would report a snapshot that worked, and the
+// extract would then run believing it could be undone.
+//
+// `|| [ -L "$1" ]` is mandatory in EVERY group, not defensive and not just in the first.
+// `[ -e ]` follows symlinks, so a dangling symlink that happens to sort first —
+// `current -> releases/gone`, or `.current -> releases/gone`, an ordinary shape for an
+// application volume in either the visible or the dotted group — would make a directory
+// full of data read as empty. The move would be skipped, the command would exit 0, and
+// the extract would then run over live data with nothing to roll back to: exactly the
+// accident the guard exists to prevent, wearing a success exit code.
+//
+// Quoting "$@" is what lets filenames containing spaces survive, where the unquoted glob
+// this replaces broke them. The trailing `/` on dst stops a single-entry move from
+// renaming that entry to dst when dst does not exist.
+func moveEntriesCommand(src, dst string) string {
+	cmd := "mkdir -p " + dst
+	for _, pattern := range entryGlobs(src) {
+		cmd += ` && { set -- ` + pattern + `; if [ -e "$1" ] || [ -L "$1" ]; then mv "$@" ` + dst + `/; fi; }`
+	}
+	return cmd
+}
+
+// snapshotCommand moves the contents of src into dst. It is the single implementation of
+// the snapshot move, in both of its directions: preRestore uses it to set the volume
+// aside, rollbackRestore uses it with src and dst swapped to put the volume back.
+//
+// It stays a named wrapper over moveEntriesCommand — which the mysql restore also needs —
+// because it is the owner of the snapshot's semantics rather than of the shell string. In
+// particular, an empty src is a success here and not an edge case: restoring into a
+// brand-new empty volume is how the controller clones one.
 func snapshotCommand(src, dst string) string {
-	return "mkdir -p " + dst + " && set -- " + src + "/*" +
-		` && if [ -e "$1" ] || [ -L "$1" ]; then mv "$@" ` + dst + `/; fi`
+	return moveEntriesCommand(src, dst)
+}
+
+// clearEntriesCommand builds a shell command that removes every entry of dir, dotfiles
+// included, leaving dir itself in place.
+//
+// Unlike the move, this needs no `[ -e ]` guard: POSIX requires `rm -f` neither to write
+// a diagnostic nor to change its exit status for an operand that does not exist, and an
+// unmatched glob that dash has left as a literal is exactly such an operand.
+func clearEntriesCommand(dir string) string {
+	return "rm -rf " + strings.Join(entryGlobs(dir), " ")
 }
 
 // rollbackCommand builds the shell command that puts the snapshot back: empty the volume
@@ -83,12 +150,20 @@ func snapshotCommand(src, dst string) string {
 // inline and the rollback tests rebuilt the same string themselves, a lost `&&` or a
 // changed path in production would have left every one of those tests passing.
 //
-// `rm -rf dst/*` needs no guard of its own — `rm -f` exits 0 on an unexpanded glob — and
-// it cannot destroy anything unrecoverable: src is empty only when dst was empty when
-// the snapshot was taken, so what this removes is either nothing or what the failed
-// restore itself just wrote there.
+// The clear ahead of the put-back needs no guard of its own — `rm -f` exits 0 on an
+// unexpanded glob, for each of the three patterns it is given — and it must be all three:
+// clearing only `dst/*` left whatever dotfiles a partial extract had written sitting in
+// the volume, mixed in among the snapshot's own once it came back. The one pattern it must
+// not be given is `dst/.*`, which expands to `dst/.` and `dst/..` and so asks `rm -rf` to
+// delete the parent of the volume; see entryGlobs.
+//
+// It cannot destroy anything unrecoverable: src is empty only when dst was empty when the
+// snapshot was taken, so what this removes is either nothing or what the failed restore
+// itself just wrote there. That argument is stronger now than it was, because the snapshot
+// no longer has a dotfile-shaped hole in it — src being empty used to mean "dst held no
+// visible entries", and it now means dst held nothing at all.
 func rollbackCommand(src, dst string) string {
-	return "rm -rf " + dst + "/* && " + snapshotCommand(src, dst)
+	return clearEntriesCommand(dst) + " && " + snapshotCommand(src, dst)
 }
 
 // takeRestoreSnapshot moves the volume's current contents aside so that a restore which
