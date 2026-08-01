@@ -3,9 +3,12 @@
 ## v3.1.0
 
 Correctness release on top of v3.0.0 — **no migrations (`control.db` stays at schema `v4`), no
-config changes, no API changes.** Three restore paths that could destroy a customer volume are
+config changes, no API changes.** Five restore paths that could destroy a customer volume are
 fixed, a failed `borg` is no longer reported as a success, and a published port is now reachable
 across projects on the same node.
+
+Two of the restore fixes change what an operator sees on a normal, successful restore — a longer
+outage, and dotfiles now tracking the archive exactly. Both are called out inline below.
 
 - [FIX] **Restore rollback no longer destroys the snapshot it exists to restore.**
   `rollbackRestore` ran the volume's `PostRestore` command *before* putting `/root/.snapshot` back,
@@ -22,10 +25,36 @@ across projects on the same node.
   `rollbackRestore` puts it back once, before the strategy hooks. This also gives the `default` and
   `postgres` strategies a real rollback, which they never had — the internal one only ran on the
   docker-fault path, so a `borg` failure rolled back nothing and left the volume empty.
-- [FIX] **Stop postgres and mariadb before snapshotting them.** The snapshot is a cross-device
-  copy-and-delete rather than a rename, so taking it under a live database left a torn copy in the
-  snapshot and an empty volume. `postgres` stopped nothing, and `mariadb` was absent from
-  `preRestore`'s switch altogether despite being an accepted `borg_strategy`.
+- [FIX] **The service stops before the volume is snapshotted, for every strategy.** The snapshot is
+  a cross-device copy-and-delete rather than a rename, so taking it under anything still writing
+  left a torn copy in the snapshot and an emptied volume — and `preRestore` stopped containers only
+  for `mysql`, `mariadb` and `postgres`, with no default case. An ordinary application volume, which
+  is the common case, was copied while its containers ran. (`postgres` also stopped nothing, and
+  `mariadb` was absent from the switch altogether despite being an accepted `borg_strategy`.) The
+  stop is now unconditional and owned by one place. It still runs *after* the volume's `PreRestore`
+  command, which needs a running container to exec into. **Operator-visible:** an ordinary
+  application restore now takes its downtime before the snapshot copy rather than during it, so the
+  outage is longer by roughly the time it takes to copy the volume. That is not a loss of real
+  availability — the application was previously "up" against a directory being emptied underneath
+  it — but the wall-clock window does grow.
+- [FIX] **Dotfiles are snapshotted, cleared and put back.** The snapshot moved `src/*` and the
+  rollback cleared `dst/*`; neither glob matches a leading dot. On a failed restore the snapshot
+  never held the volume's dotfiles, `borg extract` overwrote whichever ones the archive carried, the
+  rollback did not clear them, and the put-back had nothing hidden to return — so the pre-restore
+  content of every dotfile a partial extract touched was gone, with the rollback reporting success.
+  On a WordPress volume that is `.htaccess`, `.user.ini`, `.env`, `.git/` and `.ssh/`. Archives were
+  never affected: `borg create` recurses from `.` and always captured them. **Operator-visible:** a
+  successful restore is now faithful to the archive, so a dotfile present in the volume but absent
+  from the archive is removed rather than surviving. Note `borg create` runs with `--exclude-caches`,
+  so the contents of a `CACHEDIR.TAG`-marked directory were never archived — hidden cache trees
+  therefore go from quietly surviving a restore to being deleted by one.
+- [FIX] **A mysql restore refuses to promote something that is not a prepared dump.** The mysql
+  strategy rearranges the extracted archive by promoting its `backups/` directory into the datadir.
+  That step now verifies up front that `backups/` is a real directory (not a symlink out of the
+  volume), is non-empty, and carries the `xtrabackup_checkpoints` that `xtrabackup`/`mariabackup`
+  write — and it fails before moving anything, with a diagnosis, rather than discovering the problem
+  after it has already emptied the volume. Previously a volume whose `backups/` was missing, empty,
+  or not a dump at all could leave the datadir wrong, and the failure arrived too late to be cheap.
 - [FIX] **Restore-rollback outcomes are reported the right way round** — a successful rollback no
   longer reports as a failure, or the reverse.
 - [FIX] **A failed `borg` fails the task.** `containermgr.Container.Exec` returns a nil error for a
