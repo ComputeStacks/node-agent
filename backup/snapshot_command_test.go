@@ -341,7 +341,8 @@ func TestSnapshotCommandNeverMovesDotOrDotDot(t *testing.T) {
 //
 // `mv file dst/` where dst/file is a directory fails for every uid — "cannot overwrite
 // directory … with non-directory" — which is what makes this provable in CI, where the
-// suite runs as uid 0. Permission tricks do not work there; see the skip above.
+// suite runs as uid 0. Permission tricks do not work there; see the uid check that makes
+// TestSnapshotCommandUncreatableDestinationFails skip.
 func TestSnapshotCommandDotfileMoveFailureFails(t *testing.T) {
 	src, dst := snapshotDirs(t)
 	writeFile(t, filepath.Join(src, ".htaccess"), "pre-restore")

@@ -76,7 +76,10 @@ const (
 //
 // Nothing here is quoted, so dir must stay free of shell metacharacters — and now of `[`
 // and `]` as well, since it is spliced into a bracket expression. Production passes
-// /mnt/data and /root/.snapshot.
+// /mnt/data and /root/.snapshot through the snapshot, and /mnt/data, /root/.staging and
+// /root/.staging/backups through promoteDumpCommand — the last of those is the only one
+// whose last component comes out of an archive rather than out of a constant, and
+// promoteDumpCommand is where it is checked before it gets here.
 func entryGlobs(dir string) []string {
 	return []string{dir + "/*", dir + "/.[!.]*", dir + "/..?*"}
 }
@@ -216,14 +219,24 @@ func rollbackRestoreSnapshot(event *progress, repo *borg.Repository) bool {
 //
 //   - A bastion container is skipped by label. FindAllByService drops any container whose
 //     com.computestacks.role is "backup" or "bastion" (containermgr/containermgr.go).
-//     Dropping "backup" is necessary — that is the container this restore is running
-//     inside. Dropping "bastion" is a real gap rather than a formality: the skip can only
-//     ever affect a container that already matched the com.computestacks.service_id filter,
-//     so the exclusion's existence is itself the evidence that a bastion can belong to the
-//     service being restored, and write access to that service's volumes is the whole
-//     purpose of an SFTP/SSH container. A customer with a transfer in flight keeps writing
-//     to /mnt/data through the snapshot and through the extract, and neither this function
-//     nor Restore's stop loop touches them.
+//     Dropping "backup" is NOT about the container this restore is running inside, which
+//     is worth being exact about, because a reader who believed that could delete the
+//     clause: borg's own container sets com.computestacks.role and com.computestacks.for
+//     and no com.computestacks.service_id at all (backup/borg/container.go), so it never
+//     matches the service_id filter this function passes and the role skip never gets to
+//     see it. What the "backup" clause really protects is the mysql helper that
+//     buildBackupAgent creates (strategy_mysql.go), which sets BOTH service_id and
+//     role=backup and mounts the database's volume to run xtrabackup against it. Delete
+//     the clause and a restore would stop the helper of a backup running concurrently on
+//     the same service.
+//     That helper is also the standing proof of the premise the bastion gap rests on, and
+//     the gap is real rather than a formality. The skip can only ever affect a container
+//     that already matched the com.computestacks.service_id filter, so a container CAN
+//     carry both labels — the helper does. A bastion belonging to the service being
+//     restored is exactly such a container, and write access to that service's volumes is
+//     the whole purpose of an SFTP/SSH container. A customer with a transfer in flight
+//     keeps writing to /mnt/data through the snapshot and through the extract, and
+//     neither this function nor Restore's stop loop touches them.
 //   - Zero containers is indistinguishable from success. FindAllByService returns
 //     (nil, nil) when nothing matches the filter, the loop body never runs, and this
 //     returns true. types.Volume.ServiceID is an unvalidated int decoded straight from the

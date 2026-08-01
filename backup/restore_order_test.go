@@ -161,10 +161,26 @@ func TestPreRestoreStopsContainersBeforeSnapshot(t *testing.T) {
 		t.Fatalf("stopServiceContainers is not guarded by `if !…`; a restore that could not " +
 			"quiesce the service must not begin")
 	}
-	if call, ok := unary.X.(*ast.CallExpr); !ok {
+	call, ok := unary.X.(*ast.CallExpr)
+	if !ok {
 		t.Fatalf("the `if !…` condition in preRestore is not a call to stopServiceContainers")
-	} else if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "stopServiceContainers" {
+	}
+	if id, ok := call.Fun.(*ast.Ident); !ok || id.Name != "stopServiceContainers" {
 		t.Fatalf("the `if !…` condition in preRestore does not call stopServiceContainers directly")
+	}
+	// 5a. It stops the service being RESTORED. stopServiceContainers resolves its container
+	//     list from the volume it is handed, so handing it anything but preRestore's own vol
+	//     — a fresh &types.Volume{}, say, whose ServiceID is the zero value — quiesces some
+	//     other service, or none, and reports success either way: FindAllByService returns
+	//     (nil, nil) for a filter nothing matches, so the snapshot then runs under the live
+	//     service exactly as it did before the stop existed.
+	if len(call.Args) == 0 {
+		t.Fatalf("stopServiceContainers is called with no arguments")
+	} else if id, ok := call.Args[0].(*ast.Ident); !ok || id.Name != "vol" {
+		t.Errorf("stopServiceContainers is passed %v, not preRestore's own vol; it would stop "+
+			"the containers of a different service — or of none, which FindAllByService "+
+			"reports as success — and the snapshot would run under the live writer",
+			call.Args[0])
 	}
 	if len(ifStmt.Body.List) != 1 {
 		t.Fatalf("the stopServiceContainers guard body has %d statements, want exactly "+
@@ -186,11 +202,18 @@ func TestPreRestoreStopsContainersBeforeSnapshot(t *testing.T) {
 	}
 
 	// The AST assertions above are all about WHERE the call sits. They would every one of
-	// them still pass if stopServiceContainers itself were gutted to `return true`, which
-	// would restore the original bug while leaving preRestore looking correct. This is a
-	// substring check in the style of TestBackupPathUsesBackupContinueOnError because it is
-	// a question about text: the function has to still name the two operations that make it
-	// a stop at all.
+	// them still pass if stopServiceContainers itself were gutted, which would restore the
+	// original bug while leaving preRestore looking correct. These are substring checks in
+	// the style of TestBackupPathUsesBackupContinueOnError because they are questions about
+	// text: the function has to still name the operations that make it a stop at all, and
+	// it has to still fail when it fails.
+	//
+	// Each of the three was measured as a mutation that the AST half above passes:
+	// `if !c.Stop() { failedToStop = true }` reduced to `continue`, the findAllErr guard
+	// returning true instead of false, and the whole body reduced to `return true`. Every
+	// one of them makes stopServiceContainers report a quiesced service that is still
+	// writing, which is the state takeRestoreSnapshot must never run in — the stop's ONLY
+	// purpose is that a false return halts the restore before /mnt/data is moved aside.
 	src, readErr := os.ReadFile(file)
 	if readErr != nil {
 		t.Fatalf("read %s: %v", file, readErr)
@@ -204,6 +227,36 @@ func TestPreRestoreStopsContainersBeforeSnapshot(t *testing.T) {
 		t.Error("stopServiceContainers no longer calls Stop() on anything; preRestore would be " +
 			"asking a no-op to quiesce the service before it moves /mnt/data aside")
 	}
+	if !strings.Contains(fn, "failedToStop = true") {
+		t.Error("stopServiceContainers no longer records a container that refused to stop; " +
+			"Stop()'s bool is the only report there is, so ignoring it leaves a running writer " +
+			"on the volume and tells preRestore the service is down")
+	}
+	if guard := findAllErrGuard(t, fn); !strings.Contains(guard, "return false") {
+		t.Errorf("stopServiceContainers does not return false when FindAllByService errors; "+
+			"a docker failure would read as \"no containers to stop\" and the restore would "+
+			"proceed to snapshot a live volume. Guard body:\n%s", guard)
+	}
+}
+
+// findAllErrGuard returns the text of stopServiceContainers' `if findAllErr != nil` block,
+// so the `return false` asserted on it cannot be satisfied by one of the function's other
+// early returns.
+func findAllErrGuard(t *testing.T, fn string) string {
+	t.Helper()
+	const guard = "if findAllErr != nil {"
+	start := strings.Index(fn, guard)
+	if start < 0 {
+		t.Fatalf("stopServiceContainers no longer checks FindAllByService's error; a docker " +
+			"failure would leave containers nil and read as a service with nothing to stop")
+	}
+	rest := fn[start:]
+	// The block ends at the first line that is exactly one tab and a closing brace, gofmt
+	// having indented every brace nested inside it further.
+	if end := strings.Index(rest, "\n\t}\n"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 // stopServiceContainersSource returns the text of stopServiceContainers' body, so the
