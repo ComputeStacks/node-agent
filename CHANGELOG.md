@@ -1,5 +1,77 @@
 # Changelog
 
+## v3.1.0
+
+Correctness release on top of v3.0.0 — **no migrations (`control.db` stays at schema `v4`), no
+config changes, no API changes.** Three restore paths that could destroy a customer volume are
+fixed, a failed `borg` is no longer reported as a success, and a published port is now reachable
+across projects on the same node.
+
+- [FIX] **Restore rollback no longer destroys the snapshot it exists to restore.**
+  `rollbackRestore` ran the volume's `PostRestore` command *before* putting `/root/.snapshot` back,
+  and gave up if that command errored — and on the rollback path it could only error, because the
+  hook resolves its target to *running* containers and every caller is downstream of the restore's
+  stop loop. So for any volume with a `PostRestore` command configured, rollback returned early,
+  the deferred teardown removed the AutoRemove backup container, and the snapshot — which lives in
+  that container's own filesystem, not in the volume — went with it. The put-back now runs first,
+  unconditionally, for every strategy.
+- [FIX] **One owner for the restore snapshot and its rollback.** The strategy hooks and the borg
+  layer each took the snapshot and each rolled it back; once a non-zero `borg` exit counts as a
+  failure, both rollbacks running would move the snapshot back into `/mnt/data` and then delete it.
+  `preRestore` now takes the snapshot once, for every strategy, and halts the restore if it cannot;
+  `rollbackRestore` puts it back once, before the strategy hooks. This also gives the `default` and
+  `postgres` strategies a real rollback, which they never had — the internal one only ran on the
+  docker-fault path, so a `borg` failure rolled back nothing and left the volume empty.
+- [FIX] **Stop postgres and mariadb before snapshotting them.** The snapshot is a cross-device
+  copy-and-delete rather than a rename, so taking it under a live database left a torn copy in the
+  snapshot and an empty volume. `postgres` stopped nothing, and `mariadb` was absent from
+  `preRestore`'s switch altogether despite being an accepted `borg_strategy`.
+- [FIX] **Restore-rollback outcomes are reported the right way round** — a successful rollback no
+  longer reports as a failure, or the reverse.
+- [FIX] **A failed `borg` fails the task.** `containermgr.Container.Exec` returns a nil error for a
+  non-zero exit, so the borg layer only ever reported docker-level faults: a failed `init`,
+  `create`, `prune`, `compact`, `info`, `contents` or `delete` could complete as a success —
+  including `create`, which is how a backup could be recorded green with nothing in the archive.
+  Every invocation now goes through one exec funnel that owns the verdict and reports `borg`'s own
+  diagnosis, extracted from its `--log-json` record.
+- [FIX] **Quote `borg`'s diagnosis, not its usage banner.** When `borg` rejects an argument it emits
+  no JSON record at all (argparse writes plain text before JSON logging is in effect, banner first
+  and reason last), so the fallback quoted the least informative line available. It now prefers the
+  line carrying `error:`, falling back to first-line for output where nothing does.
+- [FEATURE] **Published ports are reachable across projects on the same node.** The blanket
+  cross-project isolation rule in `DOCKER-USER` dropped bridge-to-bridge traffic to a published
+  (direct-NAT) port, so whether an exposed port answered depended on the luck of container
+  co-placement. A published port is a node-level endpoint, not external-only, so a connection that
+  arrived via a DNAT'd endpoint (`-m conntrack --ctstate DNAT`, connection-scoped, so replies are
+  covered) is now allowed. Direct private-bridge-IP access across projects still drops.
+- [FIX] **Gate the `cs_agent` DNAT chain on `fib daddr type local`.** The DNAT rule matched only
+  l4proto plus dport-in-published-set, with no destination-address gate, so a container dialing a
+  sibling project's private bridge IP on a colliding port was silently redirected to the publisher.
+  With the gate (the nft analog of Docker's `-m addrtype --dst-type LOCAL`), "was DNAT'd" means
+  "dialed a node-local published endpoint" by construction. External ingress and the host-origin
+  `OUTPUT` mirror DNAT as before.
+- [FIX] **`postBackup` runs after a failed `create`, per `backup_error_cont`.** The failed-create
+  branch consulted `restore_error_cont` — the restore hooks' flag — so a mysql-strategy volume
+  whose backup failed skipped `postBackup` unless the restore flag happened to be set, leaving the
+  xtrabackup/mariabackup dump in `/mnt/data/backups` on the customer's volume until the next
+  successful backup. (Unreachable before a failing `borg` could fail the task.)
+- [FIX] **Failures no longer reach the controller with a bare `()` prefix.** The msgid prefix is
+  only populated for messages that came from `borg`'s JSON output, so every message the agent
+  synthesizes itself was prefixed with `"() "` in production task errors. The two `DeleteBackup`
+  failure paths also put a rendered, mostly-empty struct in `result_json` instead of the reason.
+- [CHANGE] **A completed task logs a terminal line** with its task id, kind and elapsed duration.
+  Success previously logged nothing at the task layer, so a task UUID could not be traced
+  start→finish in the node log and confirming one meant querying `control.db` or the controller's
+  projection.
+- [CHANGE] **The `borg delete --stats` table is recorded, not logged at INFO.** It was the last
+  success-path `PostEventUpdate` in the package, so the final thing a successful delete wrote to the
+  node log was a 9-line stats table that reads like a truncated failure. Verbose payloads stay
+  reachable on the node: `Record` now also logs at DEBUG.
+
+Upgrading is a plain `apt-get install cs-agent` per node — no `agent.yml` changes, no controller
+coordination, and no maintenance window. Because there is no migration, downgrading to v3.0.0 is a
+normal `apt-get install --allow-downgrades cs-agent=3.0.0`.
+
 ## v3.0.0
 
 Major release — **Consul is fully removed from the agent.** The embedded SQLite `control.db`
