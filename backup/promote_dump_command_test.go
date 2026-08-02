@@ -42,14 +42,25 @@ func mkdirAll(t *testing.T, path string) {
 }
 
 // mkDump creates a directory that a promote is allowed to promote: a real directory
-// carrying dumpMarker, which is how promoteDumpCommand tells a prepared
+// carrying a marker, which is how promoteDumpCommand tells a prepared
 // xtrabackup/mariabackup dump apart from any other directory called `backups`. Every
-// fixture that must SUCCEED has to carry it, and the fixtures that must fail are the ones
-// that do not.
+// fixture that must SUCCEED has to carry one, and the fixtures that must fail are the ones
+// that carry none.
+//
+// It writes xtrabackupMarker because that is the name shared by Percona xtrabackup and
+// MariaDB ≤ 11.0, so a fixture using it exercises the older half of the fleet. The newer
+// name is not an also-ran — mariadb:12 writes only `mariadb_backup_checkpoints` — and
+// TestPromoteDumpCommandAcceptsEveryMarkerName is what holds the promote to accepting
+// each name in dumpMarkers on its own.
 func mkDump(t *testing.T, dir string) {
 	t.Helper()
+	mkDumpMarked(t, dir, xtrabackupMarker)
+}
+
+func mkDumpMarked(t *testing.T, dir, marker string) {
+	t.Helper()
 	mkdirAll(t, dir)
-	writeFile(t, filepath.Join(dir, dumpMarker), "backup_type = full-prepared\nfrom_lsn = 0\n")
+	writeFile(t, filepath.Join(dir, marker), "backup_type = full-prepared\nfrom_lsn = 0\n")
 }
 
 // containerRoot fills in the directory that staging sits inside — /root in production —
@@ -83,7 +94,7 @@ func TestPromoteDumpCommandPromotesTheDump(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
 	}
-	if got, want := names(t, data), []string{"data.ibd", dumpMarker, "xtrabackup_info"}; !equalNames(got, want) {
+	if got, want := names(t, data), []string{"data.ibd", xtrabackupMarker, "xtrabackup_info"}; !equalNames(got, want) {
 		t.Fatalf("volume = %v, want %v — the volume must end up as exactly the dump's contents", got, want)
 	}
 	content, err := os.ReadFile(filepath.Join(data, "data.ibd"))
@@ -95,6 +106,67 @@ func TestPromoteDumpCommandPromotesTheDump(t *testing.T) {
 	// AutoRemove backup container.
 	if _, err := os.Stat(filepath.Join(staging, "ibdata1")); err != nil {
 		t.Errorf("the archived datadir should have been left in staging: %v", err)
+	}
+}
+
+// REGRESSION. Every name in dumpMarkers identifies a dump ON ITS OWN, because in practice
+// a dump carries exactly one of them: MariaDB 11.1 renamed mariadb-backup's metadata files
+// from `xtrabackup_*` to `mariadb_backup_*`, and a backup taken by one binary never carries
+// the other's name.
+//
+// Testing for a single name is not a cosmetic bug, which is why this runs the WHOLE promote
+// per name rather than asserting over the command string. A mariadb:12 volume clone failed
+// the marker check on a perfectly good prepared dump; postRestoreMysql returned false,
+// restore.go rolled the restore back, and the destination volume was left empty — reported,
+// at the time, as a completed clone.
+//
+// Table-driven over dumpMarkers rather than two hand-written cases, so a name added to that
+// set without a working `-f` test for it fails here instead of in production.
+func TestPromoteDumpCommandAcceptsEveryMarkerName(t *testing.T) {
+	if len(dumpMarkers) == 0 {
+		t.Fatal("dumpMarkers is empty; the promote would accept any non-empty directory called backups")
+	}
+	for _, marker := range dumpMarkers {
+		t.Run(marker, func(t *testing.T) {
+			data, staging := promoteDirs(t)
+			writeFile(t, filepath.Join(data, "ibdata1"), "hot copy, torn")
+			mkDumpMarked(t, filepath.Join(data, dumpDir), marker)
+			writeFile(t, filepath.Join(data, dumpDir, "data.ibd"), "consistent")
+
+			code, out := runSh(t, promoteDumpCommand(data, staging))
+
+			if code != 0 {
+				t.Fatalf("a dump identified by %s must promote, got exit %d: %s", marker, code, out)
+			}
+			if got, want := names(t, data), []string{"data.ibd", marker}; !equalNames(got, want) {
+				t.Fatalf("volume = %v, want %v", got, want)
+			}
+			if _, err := os.Stat(filepath.Join(staging, "ibdata1")); err != nil {
+				t.Errorf("the archived datadir should have been left in staging: %v", err)
+			}
+		})
+	}
+}
+
+// The other half of the same invariant: accepting both names must not have widened what
+// counts as a dump. A directory carrying NEITHER — an application volume's own backups/
+// folder, which is the shape that makes the marker check worth having — must still be
+// refused, with the volume left exactly as the extract wrote it.
+func TestPromoteDumpCommandUnknownMarkerNameFails(t *testing.T) {
+	data, staging := promoteDirs(t)
+	writeFile(t, filepath.Join(data, "index.php"), "an application volume")
+	mkDumpMarked(t, filepath.Join(data, dumpDir), "percona_backup_checkpoints")
+
+	code, out := runSh(t, promoteDumpCommand(data, staging))
+
+	if code == 0 {
+		t.Fatalf("a directory carrying no known marker must fail, got exit 0: %s", out)
+	}
+	if got, want := names(t, data), []string{dumpDir, "index.php"}; !equalNames(got, want) {
+		t.Fatalf("volume = %v, want %v — nothing may move before the dump is identified", got, want)
+	}
+	if _, err := os.Stat(staging); !os.IsNotExist(err) {
+		t.Errorf("staging should never have been created: %v", err)
 	}
 }
 
@@ -116,7 +188,7 @@ func TestPromoteDumpCommandPromotesDumpDotfiles(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, out)
 	}
-	if got, want := names(t, data), []string{".rocksdb", "data.ibd", dumpMarker}; !equalNames(got, want) {
+	if got, want := names(t, data), []string{".rocksdb", "data.ibd", xtrabackupMarker}; !equalNames(got, want) {
 		t.Fatalf("volume = %v, want %v — the dump's dotfiles must arrive and the datadir's must not", got, want)
 	}
 	content, err := os.ReadFile(filepath.Join(data, ".rocksdb", "CURRENT"))
@@ -129,7 +201,7 @@ func TestPromoteDumpCommandPromotesDumpDotfiles(t *testing.T) {
 // so it must promote, and it must arrive whole rather than as a bare marker file.
 //
 // This case used to be the one that proved the precondition asks `ls -A` and not bare
-// `ls`. The marker check has taken that argument over: dumpMarker is a visible entry, so
+// `ls`. The marker check has taken that argument over: xtrabackupMarker is a visible entry, so
 // no dump that passes step 2 can look empty to bare `ls` either. What is left here is the
 // promote's own dot-globs, which is why the assertion is on the promoted contents.
 func TestPromoteDumpCommandDotfileOnlyDump(t *testing.T) {
@@ -143,7 +215,7 @@ func TestPromoteDumpCommandDotfileOnlyDump(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("a dotfile-only dump must succeed, got exit %d: %s", code, out)
 	}
-	if got, want := names(t, data), []string{".rocksdb", dumpMarker}; !equalNames(got, want) {
+	if got, want := names(t, data), []string{".rocksdb", xtrabackupMarker}; !equalNames(got, want) {
 		t.Fatalf("volume = %v, want %v", got, want)
 	}
 }
@@ -328,7 +400,7 @@ func TestPromoteDumpCommandDumpAsSelfSymlinkFails(t *testing.T) {
 // symlinks, so this is a shape an extract can produce.
 //
 // This is the case that isolates `[ ! -L ]` from every other guard: the target really is
-// a prepared dump, carrying dumpMarker, so the precondition's `-d`, `ls -A` and marker
+// a prepared dump, carrying xtrabackupMarker, so the precondition's `-d`, `ls -A` and marker
 // tests would ALL pass through the link. Only `-L` refuses it. It used to be this file's
 // postcondition case — the link resolved from /mnt/data, then dangled once the park had
 // moved it to /root/.staging, so the promote moved nothing and left an empty datadir for
@@ -354,7 +426,7 @@ func TestPromoteDumpCommandDumpAsRelativeSymlinkFails(t *testing.T) {
 	if got, want := names(t, data), []string{dumpDir}; !equalNames(got, want) {
 		t.Fatalf("volume = %v, want %v — nothing may move before the check", got, want)
 	}
-	if got, want := names(t, sibling), []string{"data.ibd", dumpMarker}; !equalNames(got, want) {
+	if got, want := names(t, sibling), []string{"data.ibd", xtrabackupMarker}; !equalNames(got, want) {
 		t.Fatalf("the link's target = %v, want %v — nothing may move before the check", got, want)
 	}
 	if _, err := os.Stat(staging); !os.IsNotExist(err) {
@@ -385,7 +457,7 @@ func TestPromoteDumpCommandDumpAsAbsoluteSymlinkFails(t *testing.T) {
 	if got, want := names(t, data), []string{dumpDir, "realdump"}; !equalNames(got, want) {
 		t.Fatalf("volume = %v, want %v — nothing may move before the check", got, want)
 	}
-	if got, want := names(t, target), []string{"data.ibd", dumpMarker}; !equalNames(got, want) {
+	if got, want := names(t, target), []string{"data.ibd", xtrabackupMarker}; !equalNames(got, want) {
 		t.Fatalf("the link's target = %v, want %v — nothing may move before the check", got, want)
 	}
 }
@@ -402,7 +474,7 @@ func TestPromoteDumpCommandDumpAsAbsoluteSymlinkFails(t *testing.T) {
 // the AutoRemove container is reaped with the parked site and the pre-restore snapshot
 // inside it. The customer's site is gone and the task says it succeeded.
 //
-// dumpMarker is what tells the two apart: backupMysql and prepareMysqlBackup
+// xtrabackupMarker is what tells the two apart: backupMysql and prepareMysqlBackup
 // (strategy_mysql_backup.go) run xtrabackup/mariabackup against
 // `--target-dir=<datadir>/backups`, and those binaries always write it there. A site's own
 // backups/ folder does not have one.
@@ -436,6 +508,12 @@ func TestPromoteDumpCommandOrdinaryBackupsDirectoryFails(t *testing.T) {
 // which nearly always means the restore was aimed at a volume that is not a database —
 // see restore.go's filePaths switch on the SOURCE volume's strategy.
 //
+// It names EVERY accepted marker, and that is not decoration. The message is the whole of
+// what an operator gets — postRestoreMysql calls repo.Container.Exec directly, so the
+// controller sees this text and nothing else — and the reader's next move is to look in the
+// directory for the file it names. Naming only one sends someone hunting for
+// `xtrabackup_checkpoints` in a MariaDB 11.1+ dump that was never going to contain it.
+//
 // The subshell wrapper with stdout discarded is what makes this an assertion about stderr
 // specifically; runSh merges the two streams.
 func TestPromoteDumpCommandMarkerDiagnosticReachesStderr(t *testing.T) {
@@ -446,11 +524,16 @@ func TestPromoteDumpCommandMarkerDiagnosticReachesStderr(t *testing.T) {
 	code, out := runSh(t, "( "+promoteDumpCommand(data, staging)+" ) 1>/dev/null")
 
 	if code == 0 {
-		t.Fatalf("a directory with no %s must fail, got exit 0: %s", dumpMarker, out)
+		t.Fatalf("a directory with no marker must fail, got exit 0: %s", out)
 	}
-	want := filepath.Join(data, dumpDir) + " holds no " + dumpMarker
-	if !strings.Contains(out, want) {
+	if want := filepath.Join(data, dumpDir) + " holds no "; !strings.Contains(out, want) {
 		t.Errorf("stderr = %q, want it to contain %q", out, want)
+	}
+	for _, marker := range dumpMarkers {
+		if !strings.Contains(out, marker) {
+			t.Errorf("stderr = %q, want it to name %q — an operator cannot look for a file the "+
+				"diagnostic never mentions", out, marker)
+		}
 	}
 	if notWant := "no mysql dump directory"; strings.Contains(out, notWant) {
 		t.Errorf("stderr = %q, must not contain %q — the directory is there, it is just not a dump", out, notWant)

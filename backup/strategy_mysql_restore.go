@@ -22,15 +22,30 @@ import (
 // again afterwards (both in strategy_mysql_backup.go). rollbackRestoreMysql still spells
 // the same path literally.
 //
-// dumpMarker is the file that tells a prepared dump apart from any other directory that
-// happens to be called `backups`. See promoteDumpCommand for why that distinction is the
-// difference between a restore and an unrecoverable data loss reported as success, and
-// for the evidence that this particular file is always in a dump this agent produced.
+// The dump markers are the files that tell a prepared dump apart from any other directory
+// that happens to be called `backups`. See promoteDumpCommand for why that distinction is
+// the difference between a restore and an unrecoverable data loss reported as success, and
+// for the evidence that one of these files is always in a dump this agent produced.
+//
+// There are two of them because the file was RENAMED. MariaDB 11.1 renamed
+// mariadb-backup's metadata files from `xtrabackup_*` to `mariadb_backup_*`; Percona
+// xtrabackup, and mariabackup up to and including MariaDB 11.0, still write the old name.
+// Both must be accepted, and neither can be dropped: a MariaDB 11.1+ server's dumps carry
+// only the new name, while archives taken before that upgrade — and every mysql-variant
+// volume, which uses Percona xtrabackup — carry only the old one.
 const (
 	stagingPath = "/root/.staging"
 	dumpDir     = "backups"
-	dumpMarker  = "xtrabackup_checkpoints"
+
+	// xtrabackupMarker is what Percona xtrabackup and MariaDB ≤ 11.0 write.
+	xtrabackupMarker = "xtrabackup_checkpoints"
+	// mariadbMarker is what mariadb-backup writes from MariaDB 11.1 on.
+	mariadbMarker = "mariadb_backup_checkpoints"
 )
+
+// dumpMarkers is the set the promote accepts, most-established name first. Any ONE of them
+// identifies the directory as a prepared dump.
+var dumpMarkers = []string{xtrabackupMarker, mariadbMarker}
 
 // preRestoreMysql has no strategy-specific work left to do.
 //
@@ -142,28 +157,41 @@ func preRestoreMysql(vol *types.Volume, event *progress, repo *borg.Repository) 
 // site and the snapshot inside it. Unrecoverable, and reported to the controller as a
 // successful restore.
 //
-// So the promote asks for identification: `[ -f dump/xtrabackup_checkpoints ]`. That is
-// not a guess about the format, it is the file this agent's own backups always leave
-// there, and two facts about this repository are what make it safe to insist on:
+// So the promote asks for identification: a checkpoints file, under EITHER of the two
+// names the backup binaries write (dumpMarkers). That is not a guess about the format, it
+// is the file this agent's own backups always leave there, and three facts are what make
+// it safe to insist on:
 //
 //   - backupMysql runs `xtrabackup`/`mariabackup`/`mariadb-backup --backup` with
 //     `--target-dir=<datadir>/backups`, and prepareMysqlBackup then runs `--prepare`
 //     against that same directory (both in strategy_mysql_backup.go). Every one of those
-//     binaries writes `xtrabackup_checkpoints` into the target directory; it is core to
-//     the format rather than incidental — `--prepare` reads it, rewrites it, and
-//     incremental backups chain off the LSNs in it — so it is there both before and after
-//     the prepare that this strategy always performs.
+//     binaries writes a checkpoints file into the target directory; it is core to the
+//     format rather than incidental — `--prepare` reads it, rewrites it, and incremental
+//     backups chain off the LSNs in it — so it is there both before and after the prepare
+//     that this strategy always performs.
+//   - What it is CALLED depends on the binary, which is the whole reason dumpMarkers is a
+//     set. MariaDB 11.1 renamed mariadb-backup's metadata files from `xtrabackup_*` to
+//     `mariadb_backup_*`; the old names are still read as a fallback when preparing an
+//     older backup, but a fresh backup writes only the new ones. Percona xtrabackup, and
+//     mariabackup up to MariaDB 11.0, write only the old ones. Testing for a single name
+//     therefore rejects valid dumps this agent produced itself — which is exactly what
+//     happened: a MariaDB 12 volume clone failed this check on a good prepared dump, the
+//     restore rolled back, and the destination volume was left empty.
 //   - No other dump shape has ever existed here to be broken by the requirement.
 //     `mysqldump` appears nowhere under backup/ in this repository's whole history
 //     (`git log --all -S mysqldump -- backup/` is empty), and
 //     `--target-dir=<datadir>/backups` dates to the initial commit, 613c594.
 //
-// An archive that predates any of this therefore still carries the marker, and the shapes
-// that do not carry it are exactly the ones that must not be promoted. When the marker is
-// the thing missing the operator is told precisely that, in its own diagnostic: a
-// directory that exists but is not a dump is a different problem from no directory at
-// all, and it usually means the volume is not a database and the restore was aimed at the
-// wrong strategy.
+// An archive that predates any of this therefore still carries one of the markers, and the
+// shapes that carry neither are exactly the ones that must not be promoted. Adding a name
+// here is safe and dropping one is not: an old archive is restorable for as long as it is
+// retained, so `xtrabackup_checkpoints` cannot be retired once every server has moved to
+// MariaDB 11.1+.
+//
+// When the marker is the thing missing the operator is told precisely that, in its own
+// diagnostic naming both accepted files: a directory that exists but is not a dump is a
+// different problem from no directory at all, and it usually means the volume is not a
+// database and the restore was aimed at the wrong strategy.
 //
 // What the marker does not buy, and no check at this layer can: a directory named
 // `backups` that happens to contain a file called `xtrabackup_checkpoints` without being
@@ -172,7 +200,7 @@ func preRestoreMysql(vol *types.Volume, event *progress, repo *borg.Repository) 
 //
 // The marker check makes `[ -n "$(ls -A dump)" ]` redundant — a directory holding a
 // regular file is not empty — and with it, `ls -A` versus bare `ls` no longer changes any
-// outcome either, because the marker is itself a visible entry. Both stay: the emptiness
+// outcome either, because a marker is itself a visible entry. Both stay: the emptiness
 // test is the layer that survives someone relaxing the marker check, and it owns the
 // distinct "no mysql dump directory" diagnostic for an empty one. What the `-A` was there
 // for in the first place — a dump whose only content is hidden, as MyRocks' `.rocksdb`
@@ -204,10 +232,20 @@ func preRestoreMysql(vol *types.Volume, event *progress, repo *borg.Repository) 
 func promoteDumpCommand(data, staging string) string {
 	dump := data + "/" + dumpDir
 	staged := staging + "/" + dumpDir
+
+	// One `-f` test per accepted marker name, joined with `||`: any one of them identifies
+	// the directory as a prepared dump. Built from dumpMarkers rather than spelled out, so
+	// the test and the diagnostic below cannot name different sets.
+	markerTests := make([]string, 0, len(dumpMarkers))
+	for _, marker := range dumpMarkers {
+		markerTests = append(markerTests, "[ -f "+dump+"/"+marker+" ]")
+	}
+
 	return "{ [ ! -L " + dump + " ] && [ -d " + dump + ` ] && [ -n "$(ls -A ` + dump + `)" ]; } || ` +
 		`{ echo "no mysql dump directory at ` + dump + `" >&2; exit 1; }` +
-		" && { [ -f " + dump + "/" + dumpMarker + " ] || " +
-		`{ echo "` + dump + ` holds no ` + dumpMarker + `, so it is not a prepared mysql dump" >&2; exit 1; }; }` +
+		" && { " + strings.Join(markerTests, " || ") + " || " +
+		`{ echo "` + dump + ` holds no ` + strings.Join(dumpMarkers, " or ") +
+		`, so it is not a prepared mysql dump" >&2; exit 1; }; }` +
 		" && " + moveEntriesCommand(data, staging) +
 		" && " + clearEntriesCommand(data) +
 		" && { [ ! -L " + staged + " ] && [ -d " + staged + " ] || " +
