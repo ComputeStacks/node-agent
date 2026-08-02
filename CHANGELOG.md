@@ -97,6 +97,19 @@ outage, and dotfiles now tracking the archive exactly. Both are called out inlin
   node log was a 9-line stats table that reads like a truncated failure. Verbose payloads stay
   reachable on the node: `Record` now also logs at DEBUG.
 
+**Still open — a crashed agent mid-restore loses the volume.** The pre-restore snapshot is written
+to `/root/.snapshot` inside the backup container rather than into the volume, and that container is
+`AutoRemove`, so it is only a rollback anchor for as long as the container lives. If the agent dies
+between the snapshot and the rollback, no rollback runs: a panic unwinds through the deferred
+teardown, which removes the container and its snapshot immediately, while a hard kill (OOM, power
+loss) leaves the container orphaned and the boot reconcile marks the task failed without replaying
+it — restores never auto-replay, deliberately. Either way the volume is left empty and the task is
+reported failed truthfully, but the pre-restore contents are gone or unreachable. This is not new
+in v3.1.0 and is not fixed by it; the fixes above close paths where the *restore logic itself*
+destroyed the volume, not this one. Recovery is to re-run the restore, not to expect a rollback.
+The real fix is to take the snapshot inside the volume so every entry moves by `rename(2)` and
+survives the container — a redesign of the extract path, tracked separately.
+
 Upgrading is a plain `apt-get install cs-agent` per node — no `agent.yml` changes, no controller
 coordination, and no maintenance window. Because there is no migration, downgrading to v3.0.0 is a
 normal `apt-get install --allow-downgrades cs-agent=3.0.0`.
