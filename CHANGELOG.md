@@ -1,5 +1,23 @@
 # Changelog
 
+## v3.1.1
+
+Patch release for v3.1.0. **No migrations (`control.db` stays at schema `v4`), no config changes,
+no API changes.** Upgrade if you run MariaDB 11.1 or newer: on those servers every `mysql`-strategy
+restore and volume clone fails, and the failure is reported as a success.
+
+- [FIX] **A `mysql` restore accepts a dump from MariaDB 11.1 or newer.** MariaDB 11.1 renamed
+  `mariadb-backup`'s metadata files, so a dump from those versions carries
+  `mariadb_backup_checkpoints` where an older one carries `xtrabackup_checkpoints`. v3.1.0 looked
+  only for the older name and rejected the dump as "not a prepared mysql dump", failing the restore
+  and rolling it back; a volume clone of such a service failed the same way and left the new volume
+  empty. Both names are now accepted, and the older one stays supported — Percona `xtrabackup` still
+  writes it, and archives taken before an upgrade restore for as long as they are retained.
+- [FIX] **A restore that rolls back is reported as failed.** When the post-restore step failed, the
+  agent restored the volume's previous contents and then reported the task as completed, so a failed
+  restore appeared to succeed and a volume clone finished over an empty volume. The task now fails,
+  and carries the reason it failed.
+
 ## v3.1.0
 
 Correctness release on top of v3.0.0 — **no migrations (`control.db` stays at schema `v4`), no
