@@ -198,6 +198,20 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			}
 		} else {
 			if !postRestore(&destVol, projectEvent, repo) {
+				// A rolled-back restore is a FAILED restore, and saying so is this
+				// line's whole job. The task's terminal status comes from
+				// EventLog.Status via progress.Failed() (backup/runner.go), so with it
+				// left at "running" this branch reported COMPLETED: the controller
+				// recorded a successful restore — and, for a clone, a completed clone
+				// job with an empty destination volume — over data that had just been
+				// rolled back. Every other failure branch in Restore sets it; only this
+				// one did not, and under the pre-v3.0.0 csevent stream the omission was
+				// invisible because the controller watched the event rather than the
+				// task result.
+				//
+				// It is set BEFORE the rollback so the status does not depend on how the
+				// rollback goes: a rollback that succeeds still leaves the restore failed.
+				projectEvent.EventLog.Status = "failed"
 				projectEvent.PostEventUpdate("agent-12b99684cb30d029", "postRestore failed, executing rollback.")
 				if rollbackRestore(&destVol, projectEvent, repo) {
 					backupLogger().Info("Completed restore rollback", "volume", destVol.Name)
