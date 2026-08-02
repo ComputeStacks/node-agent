@@ -163,8 +163,12 @@ leftover `consul:` keys are ignored.
    re-renders the same rules, and schedules rebuild with a future `next_fire_at` (no backup
    storm).
 5. **Verify per node:** `cs-agent -version` (v3.0.0), `control.db` at schema `v4`, firewall
-   renders (`nft list table inet cs_agent`), tasks dispatch, and task status/results flow up
-   the changelog with ack + prune working.
+   renders (`nft list table ip cs_agent`), tasks dispatch, and task status/results flow up the
+   changelog with the ack watermark advancing. **Pruning is not a gate for this window** — both
+   prune rules are age-floored (acked rows at `changelog.prune_min_age_sec`, 7d; the
+   ack-independent fallback at `changelog.prune_max_age_sec`, 30d), so no row can be pruned
+   during the cutover no matter how promptly the controller acks. Confirm the changelog is
+   shrinking a week later, not here.
 6. **Tear down Consul** (per node, once confirmed) and remove it from the provisioner. The v3
    agent has no Consul client and its unit no longer orders after `consul.service`, so this is
    safe; the old `:8502` HTTP relocation is obsolete.
