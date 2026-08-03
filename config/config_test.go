@@ -24,6 +24,7 @@ func TestConfigureAppDefaults(t *testing.T) {
 		{"backups.compact_freq", "45 2 * * *"},
 		{"backups.compact_jitter_sec", 1800},
 		{"backups.borg.lock_wait_create", "600"},
+		{"backups.borg.lock_wait_restore", "120"},
 		{"backups.borg.nfs_borg_path", "borg"},
 		{"backups.export.workers", 1},
 		{"backups.export.timeout_sec", 14400},

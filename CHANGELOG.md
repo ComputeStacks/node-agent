@@ -1,5 +1,55 @@
 # Changelog
 
+## v3.1.3
+
+Patch release for v3.1.2. **No migrations (`control.db` stays at schema `v4`)**, one new
+configuration key (`backups.borg.lock_wait_restore`), and one additive task-result field
+(`restore_warning`, below). Three behaviour changes, all on the restore path: a restore that names
+individual file paths is refused; a restore now waits up to 120 seconds for the repository lock
+instead of 1; and a failed restore's `result_json.error` now carries the reason rather than the
+literal string `task reported failure`, which matters if anything downstream matches on it.
+Upgrade if you rely on being able to diagnose a restore from the task it reports: a restore that
+fails partway currently reports no usable reason.
+
+- [CHANGE] **A restore that names individual file paths is refused.** A restore replaces the whole
+  volume — the volume's current contents are set aside, the archive is extracted over it, and the
+  contents are put back only if the restore fails. A request naming individual paths cannot be
+  honoured correctly within that model, so it now fails immediately, before anything is moved, with
+  a reason saying so. Volumes using the `mysql`, `mariadb` and `postgres` strategies are unaffected:
+  their restore has always used the whole archive, and a request carrying file paths continues to
+  succeed with the paths ignored.
+- [FIX] **`borg extract` no longer runs with `--error`.** The flag suppressed the `WARNING` record
+  carrying `borg`'s explanation of its own exit, so a restore that failed partway could only report
+  `borg extract exited 1: no diagnostic output`. `borg`'s diagnosis is now available to both the
+  operator and the task result. This is the same reason `--error` is not passed to `borg create` or
+  `borg delete`.
+- [FIX] **A failed restore reports the file that failed, rather than a generic exception.** When
+  `borg` cannot write a file it logs that file and the reason, and — depending on where the failure
+  lands — may then also raise a generic top-level exception. The generic record explains nothing but
+  outranked the useful one by severity, so a restore that ran out of disk space reported
+  `Local Exception`. The reason now names the path and the error `borg` reported for it, and every
+  such record is included in the task's output, so a restore that failed on several files lists
+  them.
+- [FIX] **A failed restore reports a readable reason as its error.** Every restore failure recorded
+  its reason only in the task's accumulated output and left the task's own error as a generic
+  "task reported failure"; where the reason came from `borg` it was rendered as an entire log
+  structure, so what reached the controller was a mostly-empty record wrapped around one line of
+  text. Restore failures now carry `(msgid) reason`, matching the backup path, and record that
+  reason as the task's error.
+- [FIX] **A restore whose rollback also failed says so first.** When a restore fails, the volume's
+  set-aside contents are put back; if that put-back itself fails, that is now the task's reported
+  error rather than a line in the output behind the original failure. It is the condition that
+  needs attention first.
+- [FEATURE] **A completed restore that carried a warning reports it.** The task result now includes
+  a `restore_warning` field with `borg`'s own diagnosis for a restore that completed with a record
+  attached but no failure.
+- [CHANGE] **`borg extract` waits longer for the repository lock.** It used `backups.borg.lock_wait`
+  (1 second by default), so an in-agent prune or compact of the same repository, or a backup of it,
+  could fail a restore that would otherwise have succeeded — and a failed restore is rolled back.
+  The new `backups.borg.lock_wait_restore` defaults to 120 seconds. It is deliberately shorter than
+  `lock_wait_create`: the wait happens with the service stopped and the volume already set aside, so
+  it is bounded rather than maximised.
+
 ## v3.1.2
 
 Patch release for v3.1.1. **No migrations (`control.db` stays at schema `v4`), no config changes,

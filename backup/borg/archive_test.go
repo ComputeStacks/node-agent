@@ -451,3 +451,272 @@ func TestCreateGatesSuccessOnWroteCompleteArchive(t *testing.T) {
 		t.Error("archive.go passes --error to borg create; it filters the warning record wroteCompleteArchive reads")
 	}
 }
+
+// The measured `borg extract` records, captured on borg 1.4.4 against
+// ghcr.io/computestacks/cs-docker-borg:latest with the agent's own flag set and NO --error.
+// With --error every one of these responses is empty, which is what left a partial restore
+// reporting "borg extract exited 1: no diagnostic output".
+//
+// The first three are one run: an extract into a 2 MiB tmpfs of an archive holding a 5 MB
+// file. ENOSPC surfaced first in the per-item write (the WARNING, which names the file and
+// the errno) and again in truncate_and_attrs inside the item context's __exit__, where it
+// escaped as a top-level exception — so borg exited 2 and logged all three records, the
+// ERROR pair saying nothing more than "Local Exception" and a traceback. big.bin was left
+// at 2,093,056 of 5,000,000 bytes.
+const (
+	extractENOSPCWarningRecord   = `{"type": "log_message", "time": 1785772540.0208194, "message": "big.bin: write: [Errno 28] No space left on device", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupOSError"}`
+	extractLocalExceptionRecord  = `{"type": "log_message", "time": 1785772540.0228317, "message": "Local Exception", "levelname": "ERROR", "name": "borg.archiver", "msgid": "Exception"}`
+	extractENOSPCTracebackRecord = `{"type": "log_message", "time": 1785772540.022891, "message": "Traceback (most recent call last):\n  File \"borg/archive.py\", line 858, in extract_item\nOSError: [Errno 28] No space left on device\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"borg/archive.py\", line 850, in extract_item\n  File \"borg/archive.py\", line 214, in __exit__\nborg.helpers.errors.BackupOSError: truncate_and_attrs: [Errno 28] No space left on device\n\nDuring handling of the above exception, another exception occurred:\n\nTraceback (most recent call last):\n  File \"borg/archiver.py\", line 5759, in main\n  File \"borg/archiver.py\", line 5677, in run\n  File \"borg/archiver.py\", line 200, in wrapper\n  File \"borg/archiver.py\", line 215, in wrapper\n  File \"borg/archiver.py\", line 937, in do_extract\n  File \"borg/archive.py\", line 836, in extract_item\nOSError: [Errno 28] No space left on device\n\nPlatform: Linux a1be824fb056 6.12.94+deb13-cloud-amd64 #1 SMP PREEMPT_DYNAMIC Debian 6.12.94-1 (2026-06-20) x86_64\nLinux: Unknown Linux  \nBorg: 1.4.4  Python: CPython 3.11.14 msgpack: 1.1.2 fuse: llfuse 1.5.2 [pyfuse3,llfuse]\nPID: 51  CWD: /small\nsys.argv: ['borg', '--log-json', '--lock-wait', '1', 'extract', '--numeric-ids', '/repo::a1']\nSSH_ORIGINAL_COMMAND: None\n", "levelname": "ERROR", "name": "borg.archiver"}`
+)
+
+// The other warning-tier source, from the same image: an extract given an include path
+// that matched nothing exits 1 and names the pattern. It is the only extract warning that
+// is reachable solely through filePaths.
+const includeNeverMatchedRecord = `{"type": "log_message", "time": 1785772537.663821, "message": "Include pattern 'nosuchpath' never matched.", "levelname": "WARNING", "name": "borg.archiver", "msgid": "IncludePatternNeverMatchedWarning"}`
+
+// The rc 0 records. container.go exports BORG_RELOCATED_REPO_ACCESS_IS_OK=yes on every
+// backup container, so an extract from a repository whose path has changed answers borg's
+// prompt itself and logs this pair — captured verbatim from a repository moved from /repo
+// to /repo2, where the extract then succeeded and exited 0. Neither record says anything
+// about the restore, and publishing the prompt would tell a customer their successful
+// restore had warned about something.
+const (
+	relocatedRepoQuestionPrompt = `{"type": "question_prompt", "msgid": "BORG_RELOCATED_REPO_ACCESS_IS_OK", "message": "Warning: The repository at location /repo2 was previously located at /repo\nDo you want to continue? [yN] "}`
+	relocatedRepoQuestionAnswer = `{"env_var": "BORG_RELOCATED_REPO_ACCESS_IS_OK", "type": "question_env_answer", "msgid": "BORG_RELOCATED_REPO_ACCESS_IS_OK", "message": "yes (from BORG_RELOCATED_REPO_ACCESS_IS_OK)"}`
+)
+
+// Container.Exec allocates a TTY, so every record above arrives \r\n-framed.
+var (
+	// The measured out-of-space response, whole and in borg's own order: the WARNING that
+	// names the file FIRST, then the two ERROR records that do not.
+	extractENOSPCVariantB = strings.ReplaceAll(
+		extractENOSPCWarningRecord+"\n"+extractLocalExceptionRecord+"\n"+extractENOSPCTracebackRecord+"\n", "\n", "\r\n")
+
+	relocatedRepoQuestions = strings.ReplaceAll(
+		relocatedRepoQuestionPrompt+"\n"+relocatedRepoQuestionAnswer+"\n", "\n", "\r\n")
+)
+
+// TestExtractCommand pins the flag set, and is above all the guard against someone
+// re-adding --error to match the other subcommands. On extract that flag is worse than it
+// was on create: borg's WARNING tier IS the set of partial restores, so with --error every
+// measured partial restore printed nothing at all and reported "borg extract exited 1: no
+// diagnostic output".
+func TestExtractCommand(t *testing.T) {
+	cmd := strings.Join(extractCommand("::auto-1", nil, "120"), " ")
+
+	want := "cd /mnt/data && borg --log-json --lock-wait 120 extract --numeric-ids ::auto-1"
+	if cmd != want {
+		t.Errorf("Received %q, wanted %q", cmd, want)
+	}
+	if strings.Contains(cmd, "--error") {
+		t.Errorf("Received %q, wanted no --error: it suppresses the only record that can explain a partial restore", cmd)
+	}
+
+	// The lock wait is whatever the caller resolved, not a literal in here: Restore reads
+	// lockWait("restore") and passes it in, so viper is not needed to test the flag set.
+	if got := strings.Join(extractCommand("::auto-1", nil, "7"), " "); !strings.Contains(got, "--lock-wait 7 ") {
+		t.Errorf("Received %q, wanted the lock wait passed in", got)
+	}
+
+	// An empty slice must be indistinguishable from nil — the orchestration refuses
+	// file_paths, so this is the shape every real call has.
+	if got := strings.Join(extractCommand("::auto-1", []string{}, "120"), " "); got != want {
+		t.Errorf("Received %q for an empty filePaths, wanted %q", got, want)
+	}
+
+	// Include paths follow the archive, and in the order given: borg reads the first
+	// positional as ARCHIVE, so a path that precedes it is taken for the archive name —
+	// measured as `borg extract: error: argument ARCHIVE: "dir1": No archive specified`.
+	withPaths := strings.Join(extractCommand("::auto-1", []string{"dir1", "b.txt"}, "120"), " ")
+	if withPaths != want+" dir1 b.txt" {
+		t.Errorf("Received %q, wanted the archive path before the include paths", withPaths)
+	}
+}
+
+// extractRecords must report EVERY record borg logged, in order — the per-item records are
+// the only thing that names the paths a partial restore did not put back, and a failure
+// reason can carry just one of them.
+//
+// The question-record exclusions are the ones with teeth: BORG_RELOCATED_REPO_ACCESS_IS_OK
+// is set on every backup container, so without them every restore from a moved repository
+// would publish borg's interactive prompt to the customer as a warning about a restore that
+// exited 0.
+func TestExtractRecords(t *testing.T) {
+	for _, i := range []struct {
+		name string
+		in   string
+		want []string
+	}{
+		{
+			// The measured out-of-space response, in borg's own order.
+			name: "every record in order",
+			in:   extractENOSPCVariantB,
+			want: []string{"BackupOSError", "Exception", ""},
+		},
+		{
+			name: "the warning-tier record on its own",
+			in:   strings.ReplaceAll(extractENOSPCWarningRecord+"\n", "\n", "\r\n"),
+			want: []string{"BackupOSError"},
+		},
+		{
+			name: "an unmatched include path",
+			in:   strings.ReplaceAll(includeNeverMatchedRecord+"\n", "\n", "\r\n"),
+			want: []string{"IncludePatternNeverMatchedWarning"},
+		},
+		{
+			// rc 0 on a relocated repository. Nothing here is about the restore.
+			name: "the relocated-repo question pair is excluded",
+			in:   relocatedRepoQuestions,
+			want: nil,
+		},
+		{
+			// A question record must not shield the records around it either.
+			name: "questions excluded from a real response",
+			in:   relocatedRepoQuestions + extractENOSPCVariantB,
+			want: []string{"BackupOSError", "Exception", ""},
+		},
+		{
+			// The --stats table bypasses borg's level filter, so it turns up in responses
+			// that have nothing else to say. It explains nothing about a restore.
+			name: "the stats table is excluded",
+			in:   statsRecord + "\r\n" + extractENOSPCWarningRecord + "\r\n" + statsRecord + "\r\n",
+			want: []string{"BackupOSError"},
+		},
+		{
+			// Whatever the shell or a wrapper wrote is not a record. It is still not lost:
+			// failureRecord promotes it into the reason, which is where it belongs.
+			name: "a non-JSON line contributes nothing",
+			in:   "sh: 1: borg: not found\r\n",
+			want: nil,
+		},
+		{name: "empty response", in: "", want: nil},
+	} {
+		t.Run(i.name, func(t *testing.T) {
+			got := extractRecords(i.in)
+			if len(got) != len(i.want) {
+				t.Fatalf("Received %d records (%+v), wanted %d", len(got), got, len(i.want))
+			}
+			for n, w := range i.want {
+				if got[n].MsgID != w {
+					t.Errorf("Received msgid %q at %d, wanted %q", got[n].MsgID, n, w)
+				}
+				if got[n].Message == "" {
+					t.Errorf("Received an empty message at %d, wanted borg's own text", n)
+				}
+			}
+		})
+	}
+}
+
+// The regression this exists for: an extract that ran out of space exited 2 having named
+// the file and the errno, and the agent reported "(Exception) Local Exception". The
+// override must fire for exactly that shape and for nothing else — a real ERROR verdict
+// about the whole command must never be displaced by a per-item warning.
+func TestExtractFailure(t *testing.T) {
+	// Derived from the measured response the way run() derives it, so the fixture itself
+	// proves the bug still reproduces rather than being asserted against a hand-built pick.
+	quoted, ok := failureRecord(extractENOSPCVariantB)
+	if !ok {
+		t.Fatal("fixture no longer parses: failureRecord found nothing in the measured response")
+	}
+	if quoted.MsgID != genericExtractMsgID {
+		t.Fatalf("fixture no longer reproduces the bug: failureRecord chose %q, wanted %q", quoted.MsgID, genericExtractMsgID)
+	}
+	records := extractRecords(extractENOSPCVariantB)
+
+	t.Run("prefers the record that names the file", func(t *testing.T) {
+		got := extractFailure(ExecResult{ExitCode: 2, Response: extractENOSPCVariantB, Failure: &quoted}, records)
+		if got.MsgID != "BackupOSError" {
+			t.Fatalf("Received msgid %q, wanted BackupOSError — the record that names the file", got.MsgID)
+		}
+		if !strings.Contains(got.Message, "big.bin") || !strings.Contains(got.Message, "Errno 28") {
+			t.Errorf("Received %q, wanted borg's own text naming the file and the errno", got.Message)
+		}
+	})
+
+	// Each of these is a verdict about the whole command, and each arrives with the same
+	// per-item records beside it — a restore can run out of space on one file while the
+	// repository is also corrupt. The reason must stay the one that stopped borg.
+	for _, i := range []struct {
+		name    string
+		failure *LogMessage
+	}{
+		{
+			// Constructed, not captured: the measured integrity failure came back as a
+			// plain traceback line rather than a record. The msgid is what is under test.
+			name:    "IntegrityError",
+			failure: &LogMessage{Message: "Data integrity error: Invalid segment magic", MsgID: "IntegrityError", LevelName: "ERROR"},
+		},
+		{
+			name:    "LockTimeout",
+			failure: mustRecord(t, lockTimeoutRecord),
+		},
+		{
+			name:    "Archive.DoesNotExist",
+			failure: mustRecord(t, archiveDoesNotExistRecord),
+		},
+		{
+			// The case that matters most. failureRecord promotes a line that is not borg
+			// JSON at all into a msgid-less reason, and that line can be the only
+			// diagnosis in the response — `sh: borg: not found` says the command never
+			// ran, which no per-item warning may overwrite.
+			name:    "no msgid",
+			failure: &LogMessage{Message: "sh: 1: borg: not found"},
+		},
+		{
+			// A docker fault always arrives msgid-less, because dockerFailure strips it:
+			// a verdict from a command that may never have run must not be
+			// machine-actionable. So the override cannot reach this path.
+			name:    "docker fault",
+			failure: &LogMessage{Message: "Cannot connect to the Docker daemon"},
+		},
+	} {
+		t.Run("keeps "+i.name, func(t *testing.T) {
+			got := extractFailure(ExecResult{ExitCode: 2, Response: extractENOSPCVariantB, Failure: i.failure}, records)
+			if got != i.failure {
+				t.Errorf("Received %+v, wanted the reason borg gave for the command as a whole", got)
+			}
+		})
+	}
+
+	t.Run("keeps Exception when no per-item record is present", func(t *testing.T) {
+		// Same msgid, nothing to prefer over it: the generic record is all borg said, so
+		// it is still the best reason available.
+		response := strings.ReplaceAll(extractLocalExceptionRecord+"\n"+extractENOSPCTracebackRecord+"\n", "\n", "\r\n")
+		failure := mustRecord(t, extractLocalExceptionRecord)
+		got := extractFailure(ExecResult{ExitCode: 2, Response: response, Failure: failure}, extractRecords(response))
+		if got != failure {
+			t.Errorf("Received %+v, wanted res.Failure untouched", got)
+		}
+	})
+
+	t.Run("an unmatched include path is not displaced", func(t *testing.T) {
+		// IncludePatternNeverMatchedWarning is not a per-item record — it names a pattern,
+		// not a path borg failed to write — so it is not on the allowlist and cannot be
+		// promoted over anything.
+		response := strings.ReplaceAll(includeNeverMatchedRecord+"\n", "\n", "\r\n")
+		failure := &LogMessage{Message: "Local Exception", MsgID: genericExtractMsgID, LevelName: "ERROR"}
+		got := extractFailure(ExecResult{ExitCode: borgWarningExit, Response: response, Failure: failure}, extractRecords(response))
+		if got != failure {
+			t.Errorf("Received %+v, wanted res.Failure untouched", got)
+		}
+	})
+
+	t.Run("no failure at all", func(t *testing.T) {
+		if got := extractFailure(ExecResult{Response: extractENOSPCVariantB}, records); got != nil {
+			t.Errorf("Received %+v, wanted nil: a clean exit has no reason to report", got)
+		}
+	})
+}
+
+// mustRecord parses a measured record fixture into the *LogMessage run() would have put in
+// ExecResult.Failure, so the identity assertions above compare against borg's own text
+// rather than a re-typed copy of it.
+func mustRecord(t *testing.T, fixture string) *LogMessage {
+	t.Helper()
+	record, ok := failureRecord(fixture + "\r\n")
+	if !ok {
+		t.Fatalf("fixture did not parse as a record: %s", fixture)
+	}
+	return &record
+}

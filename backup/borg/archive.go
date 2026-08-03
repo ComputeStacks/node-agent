@@ -14,9 +14,15 @@ import (
 )
 
 // lockWait returns the borg --lock-wait value for an operation, falling back to
-// the global backups.borg.lock_wait when no per-op override is configured. A
-// scheduled `create` uses a longer wait so it rides out an in-agent compact/prune
-// (both hold borg's exclusive lock) instead of failing fast and missing a backup.
+// the global backups.borg.lock_wait when no per-op override is configured.
+//
+// Two operations override it, for related but not identical reasons. A scheduled
+// `create` uses a long wait so it rides out an in-agent compact/prune (both hold
+// borg's exclusive lock) instead of failing fast and missing a backup. `restore`
+// uses a shorter one: the same contention would roll a restore back, but its
+// extract waits with the service stopped and the volume already moved aside, so
+// the wait is bounded rather than maximised. Both values, and that reasoning, live
+// in config/config.go.
 func lockWait(op string) string {
 	if v := viper.GetString("backups.borg.lock_wait_" + op); v != "" {
 		return v
@@ -268,8 +274,186 @@ func decodeArchiveMessage(response string) (ArchiveMessage, bool) {
 	return msg, true
 }
 
+// extractCommand builds the `borg extract` command.
+//
+// NO --error, deliberately, and this is the flag's worst placement of the three: on
+// extract, borg's WARNING tier is exactly the set of PARTIAL restores, so --error blinds
+// the agent to the only records that can explain one. Measured on borg 1.4.4 with the
+// agent's own flags:
+//
+//   - an extract that filled the destination filesystem exited 1 and printed NOTHING with
+//     --error ("borg extract exited 1: no diagnostic output"); the same run without it
+//     emitted {"msgid":"BackupOSError","message":"big.bin: write: [Errno 28] No space left
+//     on device","levelname":"WARNING"} — the one record naming the file and the errno;
+//   - an unmatched include path exited 1 and printed nothing with --error, versus
+//     IncludePatternNeverMatchedWarning naming the pattern without it;
+//   - the out-of-space run that escalates to rc 2 emits the same BackupOSError WARNING
+//     beside a top-level ERROR whose entire message is "Local Exception", so even at the
+//     error tier the WARNING is the only useful record (see extractFailure).
+//
+// Same call Archive.Delete and createCommand already make.
+//
+// Dropping it does not make the clean path noisy — a clean extract emits no records with
+// or without the flag (measured) — but rc 0 is not unconditionally silent either:
+// container.go exports BORG_RELOCATED_REPO_ACCESS_IS_OK=yes on every backup container, so
+// a repository whose path has changed answers borg's prompt and logs a question_prompt /
+// question_env_answer pair at rc 0. extractRecords filters those out.
+//
+// A pure function of its inputs, so its flag set is testable without docker or viper;
+// Restore reads the configuration and passes it in.
+func extractCommand(archivePath string, filePaths []string, lockWaitSecs string) []string {
+	cmd := []string{"cd /mnt/data && borg --log-json"}
+	cmd = append(cmd, "--lock-wait "+lockWaitSecs)
+	cmd = append(cmd, "extract --numeric-ids")
+	cmd = append(cmd, archivePath)
+	cmd = append(cmd, filePaths...)
+	return cmd
+}
+
+// extractRecords returns every log record in an extract response, in order.
+//
+// This is the per-file detail of a restore. Without --error borg emits one record per item
+// it could not extract, and those records are what name the paths that did not come back;
+// a failure reason can carry only one of them, so the caller gets the whole list and
+// decides what to publish.
+//
+// It is built on createWarnings so there is ONE definition of "is a log record" in this
+// package rather than a second scan of the response that can drift from it. Despite the
+// name, that helper is not create-specific: it returns the records and filters nothing.
+//
+// Three kinds of record are dropped, none of which says anything about the restore, and
+// all three are exclusions failureRecord and readRepoResponse already make:
+//
+//   - borg.output.stats, the --stats table, which bypasses borg's level filter and so
+//     tends to be the loudest thing present while explaining nothing;
+//   - question_prompt and question_env_answer, borg's interactive protocol. These are why
+//     the filter is not optional. container.go sets BORG_RELOCATED_REPO_ACCESS_IS_OK=yes,
+//     so a restore from a repository that has moved emits, AT RC 0, a prompt reading
+//     "Warning: The repository at location /repo2 was previously located at /repo\nDo you
+//     want to continue? [yN] " followed by its env answer (measured on 1.4.4). Publishing
+//     that would tell a customer their successful restore had warned about something.
+//
+// Nothing else is filtered. An unrecognised record is reported, which is the safe
+// direction here: whether the restore failed is settled by borg's exit code before this
+// list is read, so a record nobody anticipated can only add information — it can never
+// turn a good restore into a failed one, which is precisely what the check this replaces
+// (readArchiveRestoreResponse on a clean exit) would have done once --error was dropped.
+//
+// The LIST is deliberately unbounded — how many of these may ride in a task's result_json
+// is the caller's policy, not a property of the response — but each MESSAGE is capped, at
+// maxReasonBytes and with the same explicit marker classify uses. This is the boundary
+// where records leave the borg layer for a task result, and it is the only place that cap
+// can be applied once: from here a record reaches the reason (via extractFailure, which
+// hands back a record classify never saw and therefore never capped) and the task output.
+// Neither is bounded by borg — a path is PATH_MAX, and the traceback record measured on an
+// out-of-space extract runs past a kilobyte on its own.
+func extractRecords(response string) []LogMessage {
+	var records []LogMessage
+	for _, r := range createWarnings(response) {
+		if r.Name == "borg.output.stats" {
+			continue
+		}
+		if r.Type == "question_prompt" || r.Type == "question_env_answer" {
+			continue
+		}
+		r.Message = truncateReason(r.Message)
+		records = append(records, r)
+	}
+	return records
+}
+
+// perItemExtractMsgIDs are the msgids borg attaches to a record that names ONE path and
+// why that path failed, as opposed to a verdict about the whole command.
+//
+// borg raises BackupWarning(path, e) per item and print_warning_instance takes the msgid
+// from the WRAPPED exception's class, so these are borg's own BackupError subclass names.
+// BackupOSError is the one measured on 1.4.4 ("big.bin: write: [Errno 28] No space left on
+// device"); its siblings are listed because which one arrives depends only on which
+// OSError subclass borg caught, and they are the same shape of record with the same
+// meaning.
+//
+// Note what this set cannot do, and is not used for: it does not separate lost data from
+// lost metadata. The same BackupOSError carries both `write:` (file truncated) and
+// `attrs:` (content fine, an ACL did not apply) — only the op token in the message text
+// tells them apart. So this is a preference for which record to QUOTE, never grounds to
+// downgrade a failed extract.
+var perItemExtractMsgIDs = map[string]bool{
+	"BackupOSError":            true,
+	"BackupPermissionError":    true,
+	"BackupIOError":            true,
+	"BackupFileNotFoundError":  true,
+	"BackupRaceConditionError": true,
+	"BackupError":              true,
+}
+
+// genericExtractMsgID is borg's top-level "something threw" record. Measured on an
+// out-of-space extract as {"levelname":"ERROR","msgid":"Exception","message":"Local
+// Exception"} — emitted alongside the WARNING that actually names the file.
+const genericExtractMsgID = "Exception"
+
+// extractFailure picks the reason to report for a failed `borg extract`, mirroring
+// Archive.createFailure's job of overriding failureRecord's severity-based pick where that
+// pick is measurably the wrong record.
+//
+// It exists for one measured shape. When ENOSPC surfaces in truncate_and_attrs inside the
+// item context's __exit__ it escapes as a top-level exception, so borg exits 2 and emits
+// THREE records: the BackupOSError WARNING naming the file and the errno, an ERROR with
+// msgid Exception whose entire message is "Local Exception", and an untagged ERROR
+// traceback. failureRecord ranks ERROR above WARNING and prefers a msgid on ties, so it
+// quotes the one record that says nothing — the operator was told "(Exception) Local
+// Exception" about a restore that ran out of disk on a file borg had already named.
+//
+// The override is keyed on that single msgid and nothing else — not on severity, not on
+// the exit code — because every other ERROR verdict is a real one that a per-item warning
+// must not displace:
+//
+//   - IntegrityError, LockTimeout and Archive.DoesNotExist describe the whole command;
+//   - a record with an EMPTY msgid is the case that matters most, because failureRecord
+//     promotes a non-JSON line into a msgid-less reason and that line may be the only
+//     diagnosis in the response (`sh: borg: not found`).
+//
+// Under this rule none of them can be replaced. A docker fault cannot reach the override
+// either: dockerFailure deliberately strips the msgid from a fault's reason, so
+// res.Failure.MsgID is empty on every DockerFault path and the msgid test below rejects it
+// without needing a DockerFault term of its own.
+//
+// When the override does not fire, res.Failure is returned untouched and nothing is lost —
+// the per-item records travel back to the caller through extractRecords regardless.
+func extractFailure(res ExecResult, records []LogMessage) *LogMessage {
+	if res.Failure == nil || res.Failure.MsgID != genericExtractMsgID {
+		return res.Failure
+	}
+	for _, r := range records {
+		if !perItemExtractMsgIDs[r.MsgID] {
+			continue
+		}
+		perItem := r
+		// RunBorg already logged this failure at WARN, but it logged failureRecord's
+		// pick — the record that says "Local Exception". This is the line that says
+		// which file and which errno.
+		borgLogger().Warn("Restore failed", "exitCode", res.ExitCode,
+			"msgid", perItem.MsgID, "reason", perItem.Message)
+		return &perItem
+	}
+	return res.Failure
+}
+
 // Restore extracts an archive over /mnt/data, restoring the whole of it unless
 // filePaths names specific files to pick out (DEPRECATED).
+//
+// It returns borg's log records and, second, the reason the restore failed — records
+// first, failure second, the shape Archive.Delete already uses. A non-nil second value
+// means the restore failed; the records are the per-file detail either way, and on a
+// successful extract they are informational (see extractRecords for what rc 0 can still
+// log). EVERY non-zero exit is a failure: unlike create there is no benign tier to
+// recognise, because borg's extract warnings mean either that a file was not written or
+// that an include path matched nothing, and both leave /mnt/data short of the archive.
+//
+// filePaths is no longer reached in practice: restore.Restore refuses a request carrying
+// file_paths before anything is moved, because the snapshot hook empties the whole of
+// /mnt/data and a named-path extract then puts back only what was named. The parameter
+// stays here because the borg-level capability is real and tested; refusing it is a
+// policy, and it belongs to the orchestration that owns the snapshot.
 //
 // It does NOT move the volume's existing contents aside, and it does not roll anything
 // back: the restore hooks own the snapshot and its rollback, in one place each.
@@ -290,31 +474,36 @@ func decodeArchiveMessage(response string) (ArchiveMessage, bool) {
 // docker-fault path, so a borg failure — the path that actually fires — rolled back
 // nothing at all. Every failure now returns non-nil to one caller, restore.Restore,
 // which calls rollbackRestore for all of them.
-func (a *Archive) Restore(filePaths []string) *LogMessage {
+func (a *Archive) Restore(filePaths []string) ([]LogMessage, *LogMessage) {
 	if reflect.ValueOf(a.Repository.Container).IsNil() {
-		return &LogMessage{Message: "Missing backup container"}
+		return nil, &LogMessage{Message: "Missing backup container"}
 	}
 
-	// Perform Restore
-	cmd := []string{"cd /mnt/data && borg --log-json"}
-	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
-	cmd = append(cmd, "extract --error --numeric-ids")
-	cmd = append(cmd, a.archivePath())
-	for _, p := range filePaths {
-		cmd = append(cmd, p)
-	}
-
-	res := a.Repository.RunBorg("borg extract", cmd)
+	res := a.Repository.RunBorg("borg extract", extractCommand(a.archivePath(), filePaths, lockWait("restore")))
 
 	borgLogger().Debug("Restore Response", "output", res.Response)
 
+	records := extractRecords(res.Response)
+
 	if res.Failure != nil {
-		return res.Failure
+		return records, extractFailure(res, records)
 	}
 
-	// Belt and braces on a clean exit: extract is silent on success with --error, so
-	// anything here is a record borg emitted without failing.
-	return readArchiveRestoreResponse(res.Response)
+	// The clean-exit check this replaces called readArchiveRestoreResponse, which treats
+	// ANY non-question record as a failure. That was survivable only while --error kept
+	// the response empty; without the flag it would fail a good restore over a record borg
+	// logged without setting an exit code. Removing it is safe BECAUSE the exit was 0:
+	// every path that warns during an extract goes through print_warning/add_warning or
+	// calls set_ec(EXIT_WARNING) directly, so rc 0 is borg's own statement that nothing
+	// warned. readArchiveRestoreResponse stays in the package for ExportTar, which runs
+	// without --error already and only consults it behind a non-zero exit.
+	if len(records) > 0 {
+		// Symmetric with create's "Completed backup with warnings": the restore stands,
+		// and the caller publishes the records.
+		borgLogger().Warn("Completed restore with warnings", "archive", a.Name,
+			"msgid", records[0].MsgID, "warning", records[0].Message)
+	}
+	return records, nil
 }
 
 func (a *Archive) Info() (*ArchiveResponse, *LogMessage) {

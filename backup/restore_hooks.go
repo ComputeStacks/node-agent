@@ -400,7 +400,50 @@ func postRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool
 	}
 }
 
-func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool {
+// rollbackOutcome says how far rollbackRestore got. It replaces a bool because the two
+// ways a rollback can fall short are not remotely equally urgent, and the caller reports
+// them: one means the customer's data may be about to be destroyed, the other means it is
+// sitting in the volume where it belongs and a step around it did not finish.
+//
+// The distinction is not hypothetical. rollbackRestore's PostRestore hook CANNOT succeed on
+// this path at all (see below), so for every volume that configures one, a rollback whose
+// put-back worked perfectly used to be indistinguishable from one that lost the snapshot —
+// and the caller escalated both.
+type rollbackOutcome int
+
+const (
+	// rollbackCleanupFailed is the ZERO VALUE deliberately. The one path that can leave
+	// this return unset is the deferred recover() in the PostRestore block below, and that
+	// block runs only after rollbackRestoreSnapshot has already succeeded — so "the
+	// snapshot is back, something after it did not finish" is exactly the truth in that
+	// case. A panic there must never land on rollbackComplete (silently reporting a clean
+	// rollback) nor on rollbackSnapshotLost (crying wolf over data that is where it should
+	// be).
+	rollbackCleanupFailed rollbackOutcome = iota
+
+	// rollbackComplete: the snapshot is back in the volume and every step after it ran.
+	rollbackComplete
+
+	// rollbackSnapshotLost: the put-back ITSELF failed. The volume is as the failed restore
+	// left it, the only other copy of the customer's data is /root/.snapshot inside the
+	// backup container, and the deferred repo.StopContainer() is moments from reaping it.
+	// This is the outcome that needs a human immediately, and the only one the caller
+	// escalates into the task's reported error.
+	rollbackSnapshotLost
+)
+
+// cleanupOutcome maps a post-put-back step's bool onto an outcome. Failure is never
+// rollbackSnapshotLost: every one of these runs after the snapshot is already back in the
+// volume, and what they do is tidy up around it — rollbackRestoreMysql, for instance, only
+// removes the promoted dump directory.
+func cleanupOutcome(ok bool) rollbackOutcome {
+	if ok {
+		return rollbackComplete
+	}
+	return rollbackCleanupFailed
+}
+
+func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) rollbackOutcome {
 
 	// The snapshot goes back first: once, for every strategy — including the default
 	// one, which had no rollback at all before and simply left the volume as the failed
@@ -414,7 +457,7 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 	// and the deferred repo.StopContainer() then took the only copy of the customer's
 	// data with the AutoRemove container.
 	if !rollbackRestoreSnapshot(event, repo) {
-		return false
+		return rollbackSnapshotLost
 	}
 
 	// This hook cannot currently succeed on this path, and is kept only because removing
@@ -424,9 +467,15 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 	// "running". With none running it returns "no containers found" and this block
 	// reports a rollback failure. It no longer costs the snapshot, which is the part
 	// that mattered.
+	//
+	// Which is why it reports rollbackCleanupFailed rather than a lost snapshot: for every
+	// volume with a PostRestore command this branch is taken on EVERY rollback, so an
+	// outcome that says the data may be gone would be the routine one — and the day the
+	// put-back really does fail, that message would already have been ignored for months.
 	if len(vol.PostRestore) > 0 {
-		// A recovered panic leaves rollbackRestore's unnamed bool return at its zero
-		// value false, i.e. "rollback failed" — which is what the caller reports.
+		// A recovered panic leaves rollbackRestore's unnamed return at its zero value,
+		// which is rollbackCleanupFailed — correct here, because the put-back above has
+		// already succeeded by the time this block can panic. See rollbackOutcome.
 		// This closure's own return value was never consumed, so it has none.
 		defer func() {
 			if r := recover(); r != nil {
@@ -437,13 +486,13 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 
 		if err != nil {
 			event.PostEventUpdate("agent-9393516879f411ea", withOutput(err.Error(), out))
-			return false
+			return rollbackCleanupFailed
 		}
 
 		if exitCode > 0 {
 			finalMsg := "Post-Backup commands returned a non-zero exit code (" + strconv.Itoa(exitCode) + "): " + strings.Join(vol.PostRestore, " ")
 			event.PostEventUpdate("agent-cf02d05dd4d77905", withOutput(finalMsg, out))
-			return false
+			return rollbackCleanupFailed
 		}
 
 	}
@@ -452,10 +501,10 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 	// strategy-specific work.
 	switch vol.Strategy {
 	case "mysql":
-		return rollbackRestoreMysql(event, repo)
+		return cleanupOutcome(rollbackRestoreMysql(event, repo))
 	case "postgres":
-		return rollbackRestorePostgres(event, repo)
+		return cleanupOutcome(rollbackRestorePostgres(event, repo))
 	default:
-		return true
+		return rollbackComplete
 	}
 }

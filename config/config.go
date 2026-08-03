@@ -82,6 +82,16 @@ func ConfigureApp() {
 	// in-agent compact/prune (both hold borg's exclusive lock) rather than fail
 	// after 1s and miss the backup. Ops without an override fall back to lock_wait.
 	viper.SetDefault("backups.borg.lock_wait_create", "600")
+	// Longer lock-wait for `borg extract` too, but deliberately far shorter than
+	// lock_wait_create: a create waits with the volume in place and the service up,
+	// whereas a restore's extract waits AFTER the pre-restore hook has stopped the
+	// service and moved /mnt/data into the backup container. Every second of that wait
+	// is a second with the volume empty and its only copy inside an AutoRemove
+	// container. 120s rides out an in-agent prune/compact or a lock handover instead of
+	// rolling back a restore over a transient lock, while keeping the empty-volume
+	// window to the same order as the extract itself. When it does expire the failure is
+	// the safe one: LockTimeout with nothing extracted, and the snapshot goes back.
+	viper.SetDefault("backups.borg.lock_wait_restore", "120")
 
 	viper.SetDefault("backups.borg.ssh.enabled", false)
 	viper.SetDefault("backups.borg.ssh.user", "")

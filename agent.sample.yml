@@ -78,6 +78,7 @@ backups:
     image: "ghcr.io/computestacks/cs-docker-borg:1.5"
     lock_wait: 1 # wait at most SECONDS for acquiring a repository/cache lock
     lock_wait_create: 600 # `borg create` waits this long, so a scheduled backup rides out an in-agent compact instead of failing
+    lock_wait_restore: 120 # `borg extract` waits this long; kept short because the volume is already moved aside while it waits
 
     ##
     # SSH
