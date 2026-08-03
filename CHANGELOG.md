@@ -1,15 +1,18 @@
 # Changelog
 
-## v3.1.3
+## v3.2.0
 
-Patch release for v3.1.2. **No migrations (`control.db` stays at schema `v4`)**, one new
-configuration key (`backups.borg.lock_wait_restore`), and one additive task-result field
-(`restore_warning`, below). Three behaviour changes, all on the restore path: a restore that names
-individual file paths is refused; a restore now waits up to 120 seconds for the repository lock
-instead of 1; and a failed restore's `result_json.error` now carries the reason rather than the
-literal string `task reported failure`, which matters if anything downstream matches on it.
-Upgrade if you rely on being able to diagnose a restore from the task it reports: a restore that
-fails partway currently reports no usable reason.
+Diagnosability release for the restore path — **no migrations (`control.db` stays at schema `v4`)**,
+one new configuration key (`backups.borg.lock_wait_restore`), and one additive task-result field
+(`restore_warning`). A restore that fails partway is the case this release is about: until now it
+reported no usable reason for it, and the reason is the only thing that says which files did not
+come back.
+
+Three changes alter behaviour rather than only reporting, all on the restore path, and each is
+called out inline below: a restore that names individual file paths is refused; a restore waits up
+to 120 seconds for the repository lock instead of 1; and a failed restore's `result_json.error`
+carries the reason rather than the literal string `task reported failure`, which matters if
+anything downstream matches on that text.
 
 - [CHANGE] **A restore that names individual file paths is refused.** A restore replaces the whole
   volume — the volume's current contents are set aside, the archive is extracted over it, and the
@@ -36,10 +39,12 @@ fails partway currently reports no usable reason.
   structure, so what reached the controller was a mostly-empty record wrapped around one line of
   text. Restore failures now carry `(msgid) reason`, matching the backup path, and record that
   reason as the task's error.
-- [FIX] **A restore whose rollback also failed says so first.** When a restore fails, the volume's
-  set-aside contents are put back; if that put-back itself fails, that is now the task's reported
-  error rather than a line in the output behind the original failure. It is the condition that
-  needs attention first.
+- [FIX] **A restore whose contents could not be put back says so first.** When a restore fails, the
+  volume's set-aside contents are put back; if that put-back itself fails, that is now the task's
+  reported error rather than a line in the output behind the reason the restore failed. It is the
+  condition that needs attention first, and it is reported for that case alone: a put-back that
+  succeeded and a step after it that did not are now told apart, and the second is reported without
+  claiming the volume was left unrestored.
 - [FEATURE] **A completed restore that carried a warning reports it.** The task result now includes
   a `restore_warning` field with `borg`'s own diagnosis for a restore that completed with a record
   attached but no failure.
