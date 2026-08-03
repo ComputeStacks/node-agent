@@ -18,6 +18,37 @@ for local dev only.
 The pool is **append-only** (every version stays installable → rollback); the
 index is a regenerable function of the pool (self-healing).
 
+Because step 3 rebuilds the index from whatever step 2 left on disk, a pull that
+quietly comes back short would publish an index listing only the release being
+cut — silently un-installing every older version. So `pull`:
+
+- **refuses an empty listing** (`--allow-empty` overrides, for bootstrapping a
+  genuinely new repo);
+- **fails the whole pull if any single object fails**, after retrying it;
+- writes each object to a `.part` file and renames on success, and checks the
+  bytes received against the size the listing reported — so a file present in the
+  pool is a whole object, not a truncated one whose own hashes the index would
+  happily publish as authoritative (a corruption the daily reconcile cannot
+  detect, because it re-derives the index from the same bytes);
+- retries each object up to 4 times with exponential backoff. The AWS SDK's own
+  retryer cannot cover this: a reset while draining the response body happens
+  *after* `GetObject` returned success, so the request layer never sees it. An
+  unretried reset there failed the v3.1.2 publish;
+- gives each attempt a 5-minute deadline, because a *stalled* stream — as opposed
+  to a reset one — produces no error for the retry loop to react to, and would
+  otherwise hang the job until the runner's own limit with the release already
+  cut. Both jobs also carry `timeout-minutes` as a backstop, which matters because
+  a hung job holds the shared `apt-publish` concurrency group and so blocks the
+  reconcile that would heal the repo;
+- does not retry a 4xx other than 408/429 — a rotated key or a missing object
+  cannot be fixed by waiting, and burning the backoff only delays an error the
+  operator has to act on;
+- rejects a key that would resolve outside the working directory. Keys are data
+  from the store, and the pool is intended to be shared with other packages' CI.
+
+Re-running a tag is safe: `replace_existing_artifacts` lets GoReleaser overwrite
+assets it already uploaded, so a failure in steps 2–4 can simply be retried.
+
 ## One-time setup
 
 **GitHub Actions — Environment `release`** (add required reviewers):
@@ -32,6 +63,7 @@ index is a regenerable function of the pool (self-healing).
 | var | `APT_S3_REGION` | e.g. `us-east-1` |
 | var | `APT_S3_BUCKET` | shared **public-read** bucket for all ComputeStacks OSS packages (e.g. `cs-packages`); separate from the private backup bucket |
 | var | `APT_S3_PREFIX` | **shared** repo root — the **same** for every package (empty = bucket root, or e.g. `apt/`); all packages publish into the one `dists/`+`pool/` |
+| var | `APT_PULL_CONCURRENCY` | *optional*, default `8`. In-flight `GetObject`s during `pull`. Lower it if the store dislikes parallel reads; an unparseable value falls back to the default rather than failing the publish |
 
 **S3 bucket (one shared repo):** a **single** apt repo serves every ComputeStacks **OSS**
 package — one `dists/` index over one `pool/` holding all packages — signed with **one
@@ -113,7 +145,33 @@ sudo apt-mark hold cs-agent                   # pin so `upgrade` won't move it b
 
 - The systemd unit ships with `Type=simple`. `Type=notify` + `WatchdogSec` are
   commented out until the agent implements `sd_notify`.
-- `apt-publish` + the S3 interaction (path-style, public-read, checksums) need a
-  **test pass against the real S3 endpoint** before first production use.
+- **`push` has an inconsistency window on every push, not just a failed one.**
+  Uploads are ordered `Packages` → pool → `Release`/`InRelease`, so for the
+  duration of the push the *new* `Packages` is live while the *old* `InRelease`
+  still describes it. A node running `apt-get update` inside that window fetches
+  a matched pair from neither side and fails with a hash-sum mismatch, and there
+  is no by-hash path to fall back to. Ordering Release-meta last only shrinks the
+  window; it does not close it. That window is currently ~14s, twice a day
+  (release + reconcile), and grows with the pool because the whole pool is
+  re-uploaded each time. **Enabling by-hash in `build-apt-repo.sh` is the actual
+  fix** (see the note at the end of that script) — this caveat exists to inform
+  that decision, so don't read it as a rare-failure footnote.
+- `push` re-uploads the entire pool every release, not just the new `.deb`s, and
+  has no equivalent of `pull`'s size verification.
+- **The pool is never pruned.** It is append-only by design, so that every version
+  stays installable — but nothing bounds its growth, and both the transfer cost
+  and the push window above scale with release history. Pruning is a policy call
+  (it removes the ability to pin or roll back to a pruned version), so it is
+  deliberately not automated; revisit when the pool becomes inconvenient.
+- **`pull`'s parallel reads are new, and only partly verified.** Every release up
+  to and including v3.1.2 pulled the pool one object at a time. Because addressing
+  is path-style with an empty prefix, the authenticated URL and the public apt URL
+  are the same URL, so the read path can be measured anonymously with `curl`:
+  12 objects / 75 MB took **29.7s serial, 9.5s at 4-way, 5.9s at 8-way**, all
+  `200`, no `503 SlowDown` and no resets. That was from a workstation, *not* from
+  a GitHub Actions runner, so the network path in CI is still unproven. If the
+  store throttles or caps concurrent reads there, the symptom is a failed `pull`
+  — recoverable by setting `APT_PULL_CONCURRENCY=1` (an environment variable, no
+  release needed) and re-running the tag.
 - Validate the `.deb` `Depends:` package names (`borgbackup`, `iptables`,
   `ca-certificates`) on Debian 12/13.

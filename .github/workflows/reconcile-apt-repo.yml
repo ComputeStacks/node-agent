@@ -20,6 +20,10 @@ concurrency:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
+    # Backstop, not the primary guard (apt-publish deadlines each download). A hung
+    # reconcile holds the shared apt-publish concurrency group, which would block
+    # releases and every later reconcile behind it.
+    timeout-minutes: 30
     # Dedicated environment (not `release`): same S3/GPG creds, but a branch
     # policy allowing `main` and no required reviewer, so the daily scheduled
     # run can publish unattended. `release` stays locked to v* tags + review.
