@@ -3,19 +3,18 @@
 ## v3.1.2
 
 Patch release for v3.1.1. **No migrations (`control.db` stays at schema `v4`), no config changes,
-no API changes.** Upgrade if any volume is written to while it is being backed up — on those
-volumes every backup is reported as failed even though the archive was created correctly.
+and no breaking API changes** — a task result gains one additive field (`backup_warning`, below).
+Upgrade if any volume is written to while it is being backed up: on those volumes every backup is
+reported as failed even though the archive was created correctly.
 
 - [FIX] **A backup that `borg` completes with a warning is no longer reported as failed.** `borg`
   exits `1` when a command reaches its normal end but logged a warning, and v3.1.0 began treating
   every non-zero exit as a failure. The common case is a file being written while `borg` reads it
   (`file changed while we backed it up`), which happens on any volume with an active application.
   The archive is complete and restorable in that case, so the task now completes, `last_backup`
-  advances, and the repository is synced. **Archives created during the affected window are valid
-  and restorable** — the backup itself succeeded; only the reported outcome was wrong. One caveat
-  for volumes that configure a `PostBackup` command without `backup_error_cont`: because the task
-  was treated as failed, that command was skipped on those runs, so anything it undoes may have
-  been left in place until the next backup the volume reported as successful.
+  advances, and the repository is synced. **Archives created before upgrading are valid and
+  restorable** — the backup itself succeeded; only the reported outcome was wrong, so there is
+  nothing to re-run.
 - [FIX] **A warning that means data is missing from the archive still fails the backup.** Not every
   `borg` warning is harmless: when `borg` cannot read a file it logs the file, skips it, and commits
   an archive without it — at the same exit code and the same severity as the harmless case. The two
@@ -30,12 +29,26 @@ volumes every backup is reported as failed even though the archive was created c
   carrying `borg`'s explanation of its own exit, so a failed backup could only report
   `borg create exited 1: no diagnostic output`. `borg`'s diagnosis is now available to both the
   operator and the task result. This is the same reason `--error` is not passed to `borg delete`.
-- [FIX] **A failed backup reports a readable reason.** The failure reason was rendered as a whole
-  `borg` log structure, so the controller received five empty fields around one line of text.
-  Failures now carry `(msgid) reason`, matching every other backup failure path, and a failed
+- [FIX] **A failed backup reports a readable reason.** The reason was rendered as an entire `borg`
+  log structure, so what reached the controller was a mostly-empty record wrapped around one line of
+  text. Failures now carry `(msgid) reason`, matching every other backup failure path, and a failed
   archive creation records that reason as the task's error rather than a generic "task reported
   failure". Where several files were warned about, the reason names the one that actually failed the
   backup, rather than whichever `borg` happened to encounter first.
+- [CHANGE] **A `borg create` that exits on the warning tier is logged at DEBUG, not WARN.** The
+  borg-layer log line for a non-zero exit is `Command failed`, which is misleading for a warning the
+  agent goes on to accept, and it would otherwise appear on every successful backup of a busy
+  volume. **If you alert on that string, note that it no longer appears for `borg create` exit 1.**
+  A create that genuinely fails still logs at WARN, from the layer that makes the decision, and
+  every other command is unchanged — `borg delete` exiting 1 found no archive to delete and stays
+  visible.
+
+**Operator note — a volume with a `PostBackup` command.** While a backup was being misreported as
+failed, `postBackup` ran only when `backup_error_cont` was set (the `mysql` and `postgres`
+strategies force it, so they were unaffected). A volume on another strategy that configures a
+`PostBackup` command did not run it on those backups, so whatever that command undoes may have been
+left in place until the volume's next successful backup. Worth checking once after upgrading if you
+rely on one.
 
 ## v3.1.1
 

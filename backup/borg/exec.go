@@ -185,8 +185,8 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 // mid-run, a unix socket in the tree) measured as exiting 0. Those five do exit 0 — they
 // were re-measured on borg 1.4.4 and reproduce — but they are not the whole warning tier,
 // and treating an incomplete measurement as a general rule is what made a successful
-// backup report "borg create exited 1: no diagnostic output" on production volumes. Two
-// warnings that DO exit 1 were missed:
+// backup report "borg create exited 1: no diagnostic output" on any volume with an active
+// application writing to it. Two warnings that DO exit 1 were missed:
 //
 //   - FileChangedWarning, which needs a file large enough that borg's read straddles a
 //     concurrent write. It does not reproduce on a small hand-made file and happens
