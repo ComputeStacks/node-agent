@@ -2,6 +2,7 @@ package borg
 
 import (
 	"errors"
+	"os"
 	"strings"
 	"testing"
 )
@@ -151,6 +152,50 @@ func TestClassify(t *testing.T) {
 				t.Errorf("Received msgid %q, wanted %q", got.MsgID, i.wantMsgID)
 			}
 		})
+	}
+}
+
+// DockerFault is the single term protecting against a docker-level fault being mistaken
+// for borg's warning tier: Container.Exec returns a HARDCODED 1 on every docker path, and
+// one of them returns the full captured output with it, so a fault arriving after `borg
+// create` finished looks exactly like a benign warning by exit code alone.
+//
+// wroteCompleteArchive's honouring of the field is covered in archive_test.go. What is
+// covered here is the PRODUCER — otherwise a refactor of run() could drop the field and
+// every test in the repo would still pass while the false-green hole silently reopened.
+//
+// The no-container path is reachable without docker, so it is a real test. The
+// Container.Exec error branch is not, and is pinned at source level below.
+func TestRunReportsDockerFaultWithoutAContainer(t *testing.T) {
+	res := (&Repository{Name: "vol"}).RunBorg("borg info", []string{"true"})
+
+	if !res.DockerFault {
+		t.Error("Received DockerFault=false with no container; nothing ran, so ExitCode is not borg's verdict")
+	}
+	if res.ExitCode != execNoContainer {
+		t.Errorf("Received exit code %d, wanted the execNoContainer sentinel %d", res.ExitCode, execNoContainer)
+	}
+	if res.Failure == nil {
+		t.Error("Received a nil Failure with no container")
+	}
+}
+
+// The docker-error branch of run() needs a docker fake to reach, and this package
+// deliberately has none (see the note at the top of this file). What is checkable is that
+// the branch still sets the field, and that the invariant a caller relies on —
+// DockerFault false IFF ExitCode is the command's own exit code — is not quietly broken by
+// a future edit.
+func TestRunSetsDockerFaultOnTheDockerErrorBranch(t *testing.T) {
+	src, err := os.ReadFile("exec.go")
+	if err != nil {
+		t.Fatalf("read exec.go: %v", err)
+	}
+	// Both non-classify returns in run() must carry it: the no-container sentinel and the
+	// docker-error branch.
+	if got := strings.Count(string(src), "DockerFault: true"); got != 2 {
+		t.Errorf("Received %d `DockerFault: true` assignments in run(), wanted 2 (no-container sentinel + "+
+			"docker-error branch); a docker fault whose ExitCode is a hardcoded 1 must never be readable as "+
+			"borg's warning tier", got)
 	}
 }
 

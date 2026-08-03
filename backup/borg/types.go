@@ -15,6 +15,12 @@ Archive Structures
 type Archive struct {
 	Name       string
 	Repository *Repository
+
+	// Warning is borg's own record when create completed with a benign warning — it
+	// wrote the archive, and something (a file changed mid-read) was logged at WARNING.
+	// Set by Create, which clears it first; nil on a clean run and on a failure. Not an
+	// error: the task succeeds and last_backup advances.
+	Warning *LogMessage
 }
 
 // Response structures from borg.

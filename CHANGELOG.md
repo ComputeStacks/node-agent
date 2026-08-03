@@ -1,5 +1,42 @@
 # Changelog
 
+## v3.1.2
+
+Patch release for v3.1.1. **No migrations (`control.db` stays at schema `v4`), no config changes,
+no API changes.** Upgrade if any volume is written to while it is being backed up — on those
+volumes every backup is reported as failed even though the archive was created correctly.
+
+- [FIX] **A backup that `borg` completes with a warning is no longer reported as failed.** `borg`
+  exits `1` when a command reaches its normal end but logged a warning, and v3.1.0 began treating
+  every non-zero exit as a failure. The common case is a file being written while `borg` reads it
+  (`file changed while we backed it up`), which happens on any volume with an active application.
+  The archive is complete and restorable in that case, so the task now completes, `last_backup`
+  advances, and the repository is synced. **Archives created during the affected window are valid
+  and restorable** — the backup itself succeeded; only the reported outcome was wrong. One caveat
+  for volumes that configure a `PostBackup` command without `backup_error_cont`: because the task
+  was treated as failed, that command was skipped on those runs, so anything it undoes may have
+  been left in place until the next backup the volume reported as successful.
+- [FIX] **A warning that means data is missing from the archive still fails the backup.** Not every
+  `borg` warning is harmless: when `borg` cannot read a file it logs the file, skips it, and commits
+  an archive without it — at the same exit code and the same severity as the harmless case. The two
+  are told apart by `borg`'s own `msgid`, and only an explicitly recognised harmless warning is
+  allowed to complete. An unrecognised warning fails the task and reports `borg`'s message, so a
+  backup is never recorded as successful on the strength of a warning that has not been assessed.
+  A docker-level fault is also never mistaken for a `borg` warning, whatever exit code it carries.
+- [FEATURE] **A completed backup that carried a warning reports it.** The task result now includes
+  a `backup_warning` field with `borg`'s own diagnosis — for the case above, the name of the file
+  that changed while it was being read, whose copy in that archive may therefore be inconsistent.
+- [FIX] **`borg create` no longer runs with `--error`.** The flag suppressed the `WARNING` record
+  carrying `borg`'s explanation of its own exit, so a failed backup could only report
+  `borg create exited 1: no diagnostic output`. `borg`'s diagnosis is now available to both the
+  operator and the task result. This is the same reason `--error` is not passed to `borg delete`.
+- [FIX] **A failed backup reports a readable reason.** The failure reason was rendered as a whole
+  `borg` log structure, so the controller received five empty fields around one line of text.
+  Failures now carry `(msgid) reason`, matching every other backup failure path, and a failed
+  archive creation records that reason as the task's error rather than a generic "task reported
+  failure". Where several files were warned about, the reason names the one that actually failed the
+  backup, rather than whichever `borg` happened to encounter first.
+
 ## v3.1.1
 
 Patch release for v3.1.0. **No migrations (`control.db` stays at schema `v4`), no config changes,

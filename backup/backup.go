@@ -90,10 +90,23 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 
 	backupSucceeded := false
 
+	// createErr carries the create failure's reason out to the return, so result_json
+	// gets borg's own diagnosis instead of runner.go's synthesized "task reported
+	// failure". It cannot be returned where it is discovered: postBackup still has to
+	// run first (see BackupContinueOnError below).
+	var createErr error
+
 	if preBackupSuccess {
 		archiveMsg, archiveErr := archive.Create()
 		if archiveErr != nil {
-			projectEvent.PostEventUpdate("agent-d894f86c71d0db7b", archiveErr.ToYaml())
+			// borgFailure, not ToYaml: ToYaml renders the whole LogMessage struct, so a
+			// reason the agent synthesized itself reached the controller as five empty
+			// fields around one line of text. borgFailure renders "(msgid) reason", or
+			// the bare reason when there is no msgid, exactly as the repo-lookup path
+			// above already does.
+			reason := borgFailure(archiveErr)
+			projectEvent.PostEventUpdate("agent-d894f86c71d0db7b", reason)
+			createErr = errors.New(reason)
 			if projectEvent.EventLog.Status == "running" {
 				projectEvent.EventLog.Status = "failed"
 			}
@@ -112,6 +125,16 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			// logs a concise "Completed backup" line (archive id + duration). The
 			// full response is only worth logging on failure (see archiveErr above).
 			projectEvent.Record(archiveMsg.ToYaml())
+
+			// A benign warning is a success with something the customer should see: borg
+			// wrote the archive, but a file changed while it was being read, so that
+			// file's copy in the archive may be a torn read. Set, not Record, so it is
+			// its own key in result_json next to last_backup rather than a line buried
+			// in the accumulated output of a task that completed green.
+			if archive.Warning != nil {
+				projectEvent.Set("backup_warning", borgFailure(archive.Warning))
+			}
+
 			postBackup(&vol, projectEvent, repo)
 			backupSucceeded = true
 		}
@@ -129,8 +152,15 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 	// task is marked failed (via EventLog.Status) and carries no last_backup, so
 	// the controller — which reads last_backup from the completed task result —
 	// correctly sees the volume as still overdue.
+	//
+	// createErr is returned rather than nil so result_json.error carries borg's own
+	// diagnosis. It changes the error TEXT only, not how the task is finalized:
+	// runner.go already synthesizes errors.New("task reported failure") whenever
+	// EventLog.Status is failed, and job/worker.go already derives TaskFailed from a
+	// non-nil error either way. It is nil on the preBackup-failure path, which keeps
+	// its existing reporting (preBackup posts its own messages).
 	if !backupSucceeded {
-		return nil
+		return createErr
 	}
 
 	projectEvent.Set("last_backup", time.Now().Unix())

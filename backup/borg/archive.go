@@ -24,6 +24,20 @@ func lockWait(op string) string {
 	return viper.GetString("backups.borg.lock_wait")
 }
 
+// benignCreateWarnings are the `borg create` warning msgids that do NOT mean data is
+// missing from the archive. Measured on borg 1.4.4:
+//
+//	FileChangedWarning  "<file>: file changed while we backed it up" — the file IS in
+//	                    the archive; its content may be a torn read.
+//
+// Deliberately an allowlist of one, not a denylist. The measured alternative,
+// BackupPermissionError, exits borgWarningExit at the same WARNING severity and the file
+// is absent from the archive entirely (verified: `borg list` omits it, nfiles is short) —
+// so an unrecognised warning must fail rather than be assumed harmless. When one does,
+// the task carries borg's own message, so widening this set is a deliberate, evidenced
+// decision rather than a silent default.
+var benignCreateWarnings = map[string]bool{"FileChangedWarning": true}
+
 func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 	var borgResponse ArchiveMessage
 	var log LogMessage
@@ -43,24 +57,36 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 		return borgResponse, nameErr
 	}
 
-	backupCmd := []string{"cd /mnt/data && borg --log-json"}
-	backupCmd = append(backupCmd, "--lock-wait "+lockWait("create"))
-	backupCmd = append(backupCmd, "create --error --one-file-system --json --numeric-ids --exclude-caches")
-	backupCmd = append(backupCmd, "--compression "+viper.GetString("backups.borg.compression"))
-	backupCmd = append(backupCmd, a.archivePath())
-	backupCmd = append(backupCmd, ".")
+	// Never inherit a previous run's warning: Warning is an out-param on the receiver
+	// and an Archive can be reused.
+	a.Warning = nil
 
-	res := a.Repository.RunBorg("borg create", backupCmd)
+	res := a.Repository.RunBorgWarnTolerant("borg create", createCommand(a.archivePath(), viper.GetString("backups.borg.compression"), lockWait("create")))
 
-	if res.Failure != nil {
-		return ArchiveMessage{}, res.Failure
+	// Decoded first, before the failure check: on a non-zero exit the payload is the
+	// only thing that can say whether borg wrote an archive at all.
+	borgResponse, decoded := decodeArchiveMessage(res.Response)
+
+	if res.Failure != nil && !wroteCompleteArchive(res, decoded, borgResponse.Archive.ID) {
+		return ArchiveMessage{}, a.createFailure(res)
 	}
-	// Before the decode, deliberately: Sync reports the repository's observed state
-	// (size + archive list) up into control.db, and it is owed for the archive borg
-	// just wrote whether or not its --json payload can be read back.
+
+	// Sync reports the repository's observed state (size + archive list) up into
+	// control.db, and it is owed for the archive borg just wrote on every path that
+	// reports success — including the warned one, and whether or not the --json payload
+	// could be read back.
 	a.Repository.Sync()
 
-	borgResponse, decoded := decodeArchiveMessage(res.Response)
+	if res.Failure != nil {
+		// borg's warning tier over an archive that holds the volume. Not a failure, so
+		// it does not travel in the return value — Create's contract is that a non-nil
+		// *LogMessage means the backup failed. The caller publishes a.Warning.
+		a.Warning = res.Failure
+		borgLogger().Warn("Completed backup with warnings", "archive", borgResponse.Archive.ID,
+			"msgid", res.Failure.MsgID, "warning", res.Failure.Message)
+		return borgResponse, nil
+	}
+
 	if decoded {
 		borgLogger().Info("Completed backup", "archive", borgResponse.Archive.ID, "duration", hclog.Fmt("%.5f", borgResponse.Archive.Duration))
 		return borgResponse, nil
@@ -73,8 +99,140 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 	return ArchiveMessage{}, nil
 }
 
-// decodeArchiveMessage reads `borg create --json`'s payload out of the output of a run
-// that exited 0. ok is false when nothing usable came back.
+// createFailure picks the reason to report for a create that wroteCompleteArchive
+// refused, and logs it — RunBorgWarnTolerant deliberately logs create's warning tier at
+// DEBUG only, because only this function knows whether the warning was accepted.
+//
+// It prefers the record that disqualified the run over failureRecord's severity-based
+// pick, for the reason nonBenignCreateWarning explains. Two cases keep res.Failure:
+//
+//   - a docker fault, where the command may never have run and that fact outranks
+//     anything in the output (and where a msgid must not become machine-actionable —
+//     see dockerFailure);
+//   - any exit other than the warning tier, where borg's ERROR record outranks a WARNING
+//     and failureRecord has already chosen correctly.
+func (a *Archive) createFailure(res ExecResult) *LogMessage {
+	failure := res.Failure
+	if !res.DockerFault && res.ExitCode == borgWarningExit {
+		if offender := nonBenignCreateWarning(res.Response); offender != nil {
+			failure = offender
+		}
+	}
+	borgLogger().Warn("Backup failed", "repo", a.Repository.Name, "exitCode", res.ExitCode,
+		"msgid", failure.MsgID, "reason", failure.Message)
+	return failure
+}
+
+// createCommand builds the `borg create` command.
+//
+// NO --error, deliberately: it filters the WARNING record that says which file warned
+// and why, which is what left a successful backup of a busy volume reporting "borg
+// create exited 1: no diagnostic output" and what wroteCompleteArchive needs in order to
+// tell a torn file from a missing one. Same call Archive.Delete already makes. Dropping
+// it adds nothing to the clean path — borg 1.4.4 emits zero records on an rc 0 create
+// either way (measured).
+//
+// A pure function of its inputs, so its flag set is testable without docker or viper;
+// Create reads the configuration and passes it in.
+func createCommand(archivePath, compression, lockWaitSecs string) []string {
+	cmd := []string{"cd /mnt/data && borg --log-json"}
+	cmd = append(cmd, "--lock-wait "+lockWaitSecs)
+	cmd = append(cmd, "create --one-file-system --json --numeric-ids --exclude-caches")
+	cmd = append(cmd, "--compression "+compression)
+	cmd = append(cmd, archivePath)
+	cmd = append(cmd, ".")
+	return cmd
+}
+
+// createWarnings returns every log record in a create response, in order.
+//
+// Separate from failureRecord, which returns the single best record to quote as a
+// failure reason: the gate needs ALL of them, because one benign warning alongside one
+// data-affecting warning must not read as benign. borg emits one record per warned file.
+//
+// It reuses scanBorgOutput's definition of a record, so a --json data payload — pretty-
+// printed or compact — contributes nothing, and a non-JSON line contributes nothing
+// either. Nothing is filtered out beyond that: an unexpected record makes
+// wroteCompleteArchive refuse the downgrade, which is the safe direction.
+func createWarnings(response string) []LogMessage {
+	var warnings []LogMessage
+	for _, l := range scanBorgOutput(response) {
+		if !l.isRecord {
+			continue
+		}
+		warnings = append(warnings, l.record)
+	}
+	return warnings
+}
+
+// nonBenignCreateWarning returns the first record that is NOT in benignCreateWarnings, or
+// nil when every record is benign (or there are none).
+//
+// It exists so that a create refused by wroteCompleteArchive reports the warning that
+// disqualified it. failureRecord cannot do that job: it picks by severity, and every
+// create warning is levelname WARNING with a msgid, so its tie-break never fires and the
+// FIRST record wins — whichever file borg happened to walk first. On a volume with both a
+// busy file and an unreadable one, that reported "file changed while we backed it up" (the
+// harmless one) for a backup that failed because a different file was missing from the
+// archive entirely, telling the operator the opposite of what happened.
+func nonBenignCreateWarning(response string) *LogMessage {
+	for _, w := range createWarnings(response) {
+		if !benignCreateWarnings[w.MsgID] {
+			offender := w
+			return &offender
+		}
+	}
+	return nil
+}
+
+// wroteCompleteArchive reports whether a non-zero `borg create` nonetheless wrote an
+// archive that holds the volume, and may therefore be reported as a success.
+//
+// Every term is load-bearing:
+//
+//   - DockerFault: Container.Exec returns a HARDCODED 1 on a docker-level fault, and one
+//     of those paths returns the full captured output with it. borg's real exit code is
+//     then unknown and may have been 2, so the exit code below means nothing.
+//   - borgWarningExit: anything else is borg's error tier, never downgradeable.
+//   - decoded and a non-empty archive id: borg's own statement that it committed an
+//     archive. Nothing else in the response proves it.
+//   - at least one record: an rc 1 with nothing to inspect gives no grounds to call the
+//     warning benign, which is also exactly the old behavior if --error ever comes back.
+//   - every record benign: see benignCreateWarnings. BackupPermissionError exits with
+//     the same code at the same severity and means a file is missing from the archive.
+func wroteCompleteArchive(res ExecResult, decoded bool, archiveID string) bool {
+	if res.DockerFault || res.ExitCode != borgWarningExit {
+		return false
+	}
+	if !decoded || archiveID == "" {
+		return false
+	}
+	warnings := createWarnings(res.Response)
+	if len(warnings) == 0 {
+		return false
+	}
+	for _, w := range warnings {
+		if !benignCreateWarnings[w.MsgID] {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeArchiveMessage reads `borg create --json`'s payload out of a create response.
+// ok is false when nothing usable came back.
+//
+// The payload is extracted rather than unmarshalled whole, because create runs without
+// --error: a warning run's response is one --log-json record PER WARNED FILE followed by
+// the payload — several concatenated JSON documents, which will not unmarshal as one.
+// Dropping the records leaves the payload, and the archive id in it is what proves borg
+// committed an archive, which is what wroteCompleteArchive turns on.
+//
+// scanBorgOutput's isRecord is reused so there is ONE definition of "is a log record"
+// for both the failure path and this one, rather than a second that can drift from it. A
+// pretty-printed payload's lines are individually unparseable and so are individually
+// not records, and a compact payload parses but carries no Message or MsgID, so both
+// survive intact.
 //
 // An archive id that decoded empty counts as "nothing usable", exactly like a response
 // that would not unmarshal at all. Go ignores unknown fields, so anything shaped
@@ -84,9 +242,22 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 // claiming a zero duration. There is nothing for a caller to do with an ArchiveMessage
 // that has no id, so it takes the same "succeeded, but the response could not be
 // decoded" path.
+//
+// It fails safe: a non-record line that is not part of the payload makes the rejoin
+// invalid JSON, ok is false, and the gate then fails the run.
 func decodeArchiveMessage(response string) (ArchiveMessage, bool) {
+	var payload []string
+	for _, l := range scanBorgOutput(response) {
+		if l.isRecord {
+			continue
+		}
+		payload = append(payload, l.raw)
+	}
+	if len(payload) == 0 {
+		return ArchiveMessage{}, false
+	}
 	var msg ArchiveMessage
-	if err := json.Unmarshal([]byte(response), &msg); err != nil {
+	if err := json.Unmarshal([]byte(strings.Join(payload, "\n")), &msg); err != nil {
 		borgLogger().Debug("Unmarshal Error on Borg Backup Response", "error", err.Error(), "raw", response)
 		return ArchiveMessage{}, false
 	}

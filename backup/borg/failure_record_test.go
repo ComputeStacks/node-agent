@@ -18,6 +18,18 @@ const (
 	commandErrorRecord        = `{"type": "log_message", "time": 1785448776.8795714, "message": "Command Error: At least one of the \"keep-within\", \"keep-last\", \"keep-secondly\", \"keep-minutely\", \"keep-hourly\", \"keep-daily\", \"keep-weekly\", \"keep-monthly\", \"keep-13weekly\", \"keep-3monthly\", or \"keep-yearly\" settings must be specified.", "levelname": "ERROR", "name": "borg.archiver", "msgid": "CommandError"}`
 )
 
+// The two `borg create` warning-tier records, captured from
+// `borg --log-json create --json ::w .` (no --error) against the same image, one run with
+// a file being rewritten while borg read it and one with a file borg could not open. Both
+// exit 1 at levelname WARNING, and they mean opposite things for whether the customer is
+// protected: FileChangedWarning's file IS in the archive (its content may be a torn
+// read), BackupPermissionError's file is silently absent — verified with `borg list`. One
+// record is emitted per warned file, before the --json payload.
+const (
+	fileChangedWarningRecord    = `{"type": "log_message", "time": 1785723905.7213852, "message": "big.bin: file changed while we backed it up", "levelname": "WARNING", "name": "borg.archiver", "msgid": "FileChangedWarning"}`
+	backupPermissionErrorRecord = `{"type": "log_message", "time": 1785723999.1000000, "message": "secret.txt: open: [Errno 13] Permission denied: 'secret.txt'", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupPermissionError"}`
+)
+
 // Constructed rather than captured: no msgid-less ERROR and no question record turned
 // up in the characterization runs, but both shapes are ones failureRecord must handle
 // (the msgid tie-break, and the question protocol responder.go already excludes).
