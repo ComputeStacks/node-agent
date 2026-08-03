@@ -76,3 +76,12 @@ release:
     name: node-agent
   draft: false
   prerelease: auto
+  # Make a re-run of a tag idempotent. The apt publish steps below run AFTER the
+  # release is cut, so a transient S3 failure there leaves a tag whose assets are
+  # already uploaded; without this, the retry dies at the first asset with
+  # "422 Validation Failed ... already_exists" and the only way forward is to
+  # delete the assets by hand. GoReleaser only pays the extra API calls when an
+  # upload actually returns 422, so the happy path is unchanged.
+  # (Release *notes* are set by a separate `gh release edit` step in the
+  # workflow, so `mode` — which governs notes, not assets — stays default.)
+  replace_existing_artifacts: true
