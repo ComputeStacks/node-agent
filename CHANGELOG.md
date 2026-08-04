@@ -8,11 +8,14 @@ one new configuration key (`backups.borg.lock_wait_restore`), and one additive t
 reported no usable reason for it, and the reason is the only thing that says which files did not
 come back.
 
-Three changes alter behaviour rather than only reporting, all on the restore path, and each is
-called out inline below: a restore that names individual file paths is refused; a restore waits up
-to 120 seconds for the repository lock instead of 1; and a failed restore's `result_json.error`
-carries the reason rather than the literal string `task reported failure`, which matters if
-anything downstream matches on that text.
+It also carries three fixes to the `ssh` backup backend, which are the last three entries below.
+
+Four changes alter behaviour rather than only reporting, and each is called out inline below: a
+restore that names individual file paths is refused; a restore waits up to 120 seconds for the
+repository lock instead of 1; a failed restore's `result_json.error` carries the reason rather than
+the literal string `task reported failure`, which matters if anything downstream matches on that
+text; and on the `ssh` backend a restore whose source is a different volume now reads that volume's
+repository rather than the destination's.
 
 - [CHANGE] **A restore that names individual file paths is refused.** A restore replaces the whole
   volume — the volume's current contents are set aside, the archive is extracted over it, and the
@@ -54,6 +57,25 @@ anything downstream matches on that text.
   The new `backups.borg.lock_wait_restore` defaults to 120 seconds. It is deliberately shorter than
   `lock_wait_create`: the wait happens with the service stopped and the volume already set aside, so
   it is bounded rather than maximised.
+- [FIX] **Repository names are validated before they are used in commands on the backup server.** The
+  agent builds a small number of commands that run on the backup server over SSH — creating and
+  removing a repository's directory — and a repository name reached those commands without being
+  checked first. Names are now validated against the same rules Docker applies to volume names, and a
+  name that does not match is refused rather than used. Names produced by the controller have always
+  matched, so this changes nothing for a normal installation.
+- [FIX] **On the `ssh` backend, restoring one volume's backup into a different volume opened the wrong
+  repository.** Restoring an archive from volume A into volume B — the operation behind a volume
+  clone — looked for A's archive in **B's** repository. Depending on whether B had ever been backed
+  up, the restore either failed reporting that the archive did not exist, failed reporting an invalid
+  repository, or succeeded. It now always reads the repository belonging to the volume the archive
+  came from. Restores where the source and destination are the same volume were unaffected, as were
+  the `local` and `nfs` backends.
+- [FIX] **On the `ssh` backend, a repository that failed to initialize stayed failed.** A volume's
+  first backup creates its repository. If the repository's directory had already been created but the
+  repository itself had not, the agent did not recognise that state, so the backup failed — and kept
+  failing on every subsequent attempt, because the condition that would have retried the setup was
+  never met again. That state is now recognised and the repository is initialized, so a volume already
+  stuck this way recovers on its next scheduled backup with no operator action.
 
 ## v3.1.2
 
