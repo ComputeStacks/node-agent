@@ -1,6 +1,91 @@
 package borg
 
-import "testing"
+import (
+	"cs-agent/types"
+	"testing"
+
+	"github.com/spf13/viper"
+)
+
+// TestRepoPathForSSH pins the remote URL field by field. It is the string a
+// cross-volume restore got wrong: every part of it but the name comes from
+// configuration, so the name is the only thing a caller can put in the wrong place.
+func TestRepoPathForSSH(t *testing.T) {
+	sshBackendConfig()
+
+	want := "ssh://borg@backup.example.com:2222/backups/node001/b-vol-1/backup"
+	if got := repoPathFor("vol-1"); got != want {
+		t.Errorf("Received %q, wanted %q", got, want)
+	}
+}
+
+// TestRepoPathForLocalAndNFS: on both of those backends the docker volume mounted at
+// /mnt/borg is the repository, so the path is a constant and the name does not appear
+// in it at all.
+func TestRepoPathForLocalAndNFS(t *testing.T) {
+	for _, i := range []struct {
+		name  string
+		setup func()
+	}{
+		{name: "local", setup: func() { viper.Reset() }},
+		{
+			name: "nfs",
+			setup: func() {
+				viper.Reset()
+				viper.Set("backups.borg.nfs", true)
+				viper.Set("backups.borg.nfs_host_path", "/mnt/ams001/node001")
+			},
+		},
+	} {
+		t.Run(i.name, func(t *testing.T) {
+			i.setup()
+			if got := repoPathFor("vol-1"); got != "/mnt/borg/backup" {
+				t.Errorf("Received %q, wanted %q", got, "/mnt/borg/backup")
+			}
+		})
+	}
+}
+
+// TestFindRepositoryRefusesAnEmptyTargetName covers the one input FindRepository turns
+// away before it builds anything: the target is the /mnt/data mount and the label saying
+// what the container is for, and an empty docker volume name is not a thing to mount.
+func TestFindRepositoryRefusesAnEmptyTargetName(t *testing.T) {
+	viper.Reset()
+
+	r, failure := FindRepository(nil, &types.Volume{}, &types.Volume{Name: "vol-owner"})
+
+	if failure == nil {
+		t.Fatal("Received a nil failure for an empty target name, wanted one")
+	}
+	if failure.Message != "Missing target volume name" {
+		t.Errorf("Received %q, wanted %q", failure.Message, "Missing target volume name")
+	}
+	if r != nil {
+		t.Errorf("Received a repository (%+v) alongside a failure, wanted nil", r)
+	}
+}
+
+// TestFindRepositoryDoesNotRefuseAnEmptyRepositoryOwner: an absent owner is DEFAULTED to
+// the target, because an archive delete that arrives without one works today. Only the
+// half of that which needs no docker daemon is asserted — that no owner-specific refusal
+// exists, so an empty owner falls through to the target's own guard. Where the defaulted
+// name then lands is containerSpec's business, and that is covered by
+// TestContainerSpecSSHFollowsTheRepositoryOwner.
+func TestFindRepositoryDoesNotRefuseAnEmptyRepositoryOwner(t *testing.T) {
+	viper.Reset()
+
+	r, failure := FindRepository(nil, &types.Volume{}, &types.Volume{})
+
+	if failure == nil {
+		t.Fatal("Received a nil failure, wanted the target volume's")
+	}
+	if failure.Message != "Missing target volume name" {
+		t.Errorf("Received %q, wanted the target's %q — an empty repository owner must be defaulted, not refused", failure.Message, "Missing target volume name")
+	}
+	if r != nil {
+		t.Errorf("Received a repository (%+v) alongside a failure, wanted nil", r)
+	}
+}
 
 // recordMessage pulls borg's own text out of one of the captured --log-json records in
 // failure_record_test.go, so these cases match production wording by construction

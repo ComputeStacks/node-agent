@@ -433,8 +433,11 @@ func TestFailureRecordMeasuredMsgIDs(t *testing.T) {
 		record string
 		msgID  string
 	}{
-		{repoDoesNotExistRecord, "Repository.DoesNotExist"},
-		{invalidRepositoryRecord, "Repository.InvalidRepository"},
+		// The two exported constants, so the spelling a caller outside this package
+		// branches on is pinned to the record borg actually emits — that spelling was
+		// wrong once, and nothing but a captured record can catch it.
+		{repoDoesNotExistRecord, MsgIDRepositoryMissing},
+		{invalidRepositoryRecord, MsgIDRepositoryInvalid},
 		{repoAlreadyExistsRecord, "Repository.AlreadyExists"},
 		{pathAlreadyExistsRecord, "Repository.PathAlreadyExists"},
 		{archiveDoesNotExistRecord, "Archive.DoesNotExist"},
