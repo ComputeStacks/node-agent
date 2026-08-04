@@ -433,10 +433,43 @@ func nfsCompactCommand(name string) (string, bool) {
 	return cmd, true
 }
 
+// shouldSyncRepository reports whether this node may publish observed state for the
+// repository named name — that is, whether name is one of its own volumes.
+//
+// A node reports observed state only for the volumes it owns. The repositories row is
+// keyed on the repository's name and its changelog entry is ingested by the controller,
+// so syncing a repository belonging to another node's volume would publish a row this
+// node has no business writing. That became reachable once Repository.Name started
+// naming the repository's owner rather than the task's own volume: Archive.Delete calls
+// Sync, and an archive delete can be cross-volume. Every current path — backup, prune,
+// compact, trash — operates on this node's own volumes, so this suppresses nothing that
+// is correct today.
+//
+// Only a definite "not here" stops the sync. A store that could not answer leaves
+// today's behaviour alone rather than dropping a legitimate sync over a transient read
+// error — the same distinction compactActionFor draws for the same reason.
+//
+// Split out of Sync because Sync cannot be reached in a test without a docker daemon
+// (it goes straight on to read the repository through the borg container), which left
+// this decision with no coverage while it sat inline.
+func shouldSyncRepository(ctx context.Context, st *store.Store, name string) bool {
+	_, found, err := st.GetVolume(ctx, name)
+	if err != nil {
+		borgLogger().Debug("Could not confirm repository ownership before sync", "repository", name, "error", err.Error())
+		return true
+	}
+	if !found {
+		borgLogger().Debug("Skipping repository sync for a volume this node does not own", "repository", name)
+		return false
+	}
+	return true
+}
+
 // Sync reports the repository's observed state (on-disk size + archive names) UP
 // into control.db via the changelog (entity_type "repository"). It is the
 // store-backed successor to the old Consul borg/repository/<name> write. A no-op
-// when there is no store handle or no live container to read from.
+// when there is no store handle, no live container to read from, or a repository
+// this node does not own (see shouldSyncRepository).
 func (r *Repository) Sync() {
 	if r.Store == nil {
 		return
@@ -445,20 +478,7 @@ func (r *Repository) Sync() {
 		return
 	}
 
-	// A node reports observed state only for the volumes it owns. The row is keyed on
-	// r.Name and the changelog entry is ingested by the controller, so syncing a
-	// repository that belongs to another node's volume would publish a repositories row
-	// this node has no business writing — reachable now that r.Name can be a volume other
-	// than the task's own (Archive.Delete calls Sync, and an archive delete can be
-	// cross-volume). Every current path — backup, prune, compact, trash — operates on this
-	// node's own volumes, so this suppresses nothing that is correct today.
-	//
-	// Only a definite "not here" skips. A store that could not answer leaves today's
-	// behaviour alone rather than dropping a legitimate sync over a transient read error.
-	if _, found, err := r.Store.GetVolume(context.Background(), r.Name); err != nil {
-		borgLogger().Debug("Could not confirm repository ownership before sync", "repository", r.Name, "error", err.Error())
-	} else if !found {
-		borgLogger().Debug("Skipping repository sync for a volume this node does not own", "repository", r.Name)
+	if !shouldSyncRepository(context.Background(), r.Store, r.Name) {
 		return
 	}
 

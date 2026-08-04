@@ -1,7 +1,10 @@
 package borg
 
 import (
+	"context"
+	"cs-agent/store"
 	"cs-agent/types"
+	"encoding/json"
 	"testing"
 
 	"github.com/spf13/viper"
@@ -280,5 +283,47 @@ func TestRepositoryAlreadyExists(t *testing.T) {
 				t.Errorf("Received %v, wanted %v", got, i.want)
 			}
 		})
+	}
+}
+
+// TestShouldSyncRepository covers the decision that keeps a node from publishing a
+// repositories row for a volume it does not own.
+//
+// It is tested here rather than through Sync because Sync goes straight on to read the
+// repository through the borg container, so it cannot be reached without a docker daemon —
+// which is what left this decision uncovered while it sat inline. Splitting it out is the
+// only reason there is a test at all.
+func TestShouldSyncRepository(t *testing.T) {
+	st, err := store.Open(t.TempDir(), store.Options{})
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+
+	if err := st.PutVolume(ctx, store.Volume{
+		Name:   "owned-vol",
+		Node:   "node001",
+		Config: json.RawMessage(`{"name":"owned-vol"}`),
+	}); err != nil {
+		t.Fatalf("PutVolume: %v", err)
+	}
+
+	if !shouldSyncRepository(ctx, st, "owned-vol") {
+		t.Error("Received false for a volume this node owns, wanted true")
+	}
+
+	// The case the guard exists for: Archive.Delete calls Sync, and an archive delete can
+	// name a source volume this node has no desired-state row for.
+	if shouldSyncRepository(ctx, st, "someone-elses-vol") {
+		t.Error("Received true for a volume this node does not own, wanted false")
+	}
+
+	// A store that cannot answer is not the same fact as a volume that is not here: a
+	// transient read error must leave the sync alone rather than silently drop it.
+	_ = st.Close()
+	if !shouldSyncRepository(ctx, st, "owned-vol") {
+		t.Error("Received false when the store could not answer, wanted true (fail open)")
 	}
 }
