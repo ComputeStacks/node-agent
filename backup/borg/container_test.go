@@ -60,7 +60,7 @@ func TestContainerSpecSSHFollowsTheRepositoryOwner(t *testing.T) {
 	sshBackendConfig()
 
 	target := &types.Volume{Name: "vol-target"}
-	labels, env, mounts := containerSpec(target, "vol-owner")
+	labels, env, mounts := (&Repository{Name: "vol-owner"}).containerSpec(target)
 
 	wantRepo := "ssh://borg@backup.example.com:2222/backups/node001/b-vol-owner/backup"
 	gotRepo, ok := borgEnvValue(env, "BORG_REPO")
@@ -95,7 +95,7 @@ func TestContainerSpecLocalBackend(t *testing.T) {
 	viper.Reset()
 	viper.Set("backups.key", "passphrase")
 
-	labels, env, mounts := containerSpec(&types.Volume{Name: "vol-1"}, "vol-1")
+	labels, env, mounts := (&Repository{Name: "vol-1"}).containerSpec(&types.Volume{Name: "vol-1"})
 
 	if got, ok := borgEnvValue(env, "BORG_REPO"); !ok || got != "/mnt/borg/backup" {
 		t.Errorf("Received BORG_REPO %q (present=%v), wanted %q", got, ok, "/mnt/borg/backup")
@@ -121,7 +121,7 @@ func TestContainerSpecNFSBackend(t *testing.T) {
 	viper.Set("backups.key", "passphrase")
 	viper.Set("backups.borg.nfs", true)
 
-	labels, env, _ := containerSpec(&types.Volume{Name: "vol-1"}, "vol-1")
+	labels, env, _ := (&Repository{Name: "vol-1"}).containerSpec(&types.Volume{Name: "vol-1"})
 
 	if got := labels["com.computestacks.backup-kind"]; got != "nfs" {
 		t.Errorf("Received com.computestacks.backup-kind %q, wanted %q", got, "nfs")
@@ -146,7 +146,7 @@ func TestContainerSpecTrashedTargetHasNoDataMount(t *testing.T) {
 		t.Run(i.name, func(t *testing.T) {
 			i.setup()
 
-			_, _, mounts := containerSpec(&types.Volume{Name: "vol-1", Trash: true}, "vol-1")
+			_, _, mounts := (&Repository{Name: "vol-1"}).containerSpec(&types.Volume{Name: "vol-1", Trash: true})
 
 			if got, ok := mountSource(mounts, "/mnt/data"); ok {
 				t.Errorf("Received a /mnt/data mount from %q, wanted none for a trashed target", got)
@@ -164,7 +164,7 @@ func TestContainerSpecTrashedTargetHasNoDataMount(t *testing.T) {
 func TestContainerSpecRemoteEnv(t *testing.T) {
 	sshBackendConfig()
 
-	_, env, _ := containerSpec(&types.Volume{Name: "vol-1"}, "vol-1")
+	_, env, _ := (&Repository{Name: "vol-1"}).containerSpec(&types.Volume{Name: "vol-1"})
 
 	if got, ok := borgEnvValue(env, "BORG_REMOTE_PATH"); !ok || got != "/usr/local/bin/borg" {
 		t.Errorf("Received BORG_REMOTE_PATH %q (present=%v), wanted %q", got, ok, "/usr/local/bin/borg")
@@ -174,7 +174,7 @@ func TestContainerSpecRemoteEnv(t *testing.T) {
 	}
 
 	viper.Reset()
-	_, localEnv, _ := containerSpec(&types.Volume{Name: "vol-1"}, "vol-1")
+	_, localEnv, _ := (&Repository{Name: "vol-1"}).containerSpec(&types.Volume{Name: "vol-1"})
 
 	for _, name := range []string{"BORG_REMOTE_PATH", "BORG_RSH"} {
 		if got, ok := borgEnvValue(localEnv, name); ok {

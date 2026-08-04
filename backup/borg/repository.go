@@ -38,23 +38,13 @@ import (
 // restore of volume A into volume B then looked for A's archive in B's repository and
 // could never find it. Retention comes from repoOwner for the same reason: a retention
 // policy is a property of the repository being pruned.
+//
+// The naming decision itself lives in resolveRepository, which is where it can be tested.
 func FindRepository(st *store.Store, target *types.Volume, repoOwner *types.Volume) (*Repository, *LogMessage) {
-	// An absent repository owner means the caller only ever had one volume in mind, so
-	// the target is it. Defaulted rather than refused because backup/delete.go passes the
-	// task's source_volume through unvalidated and the controller only defaults that
-	// parameter — an archive delete that arrives without one works today and must keep
-	// working. The warning is here because the alternative is a silent guess.
-	if repoOwner.Name == "" {
-		borgLogger().Warn("No repository owner supplied, defaulting to the target volume", "volume", target.Name)
-		repoOwner = target
+	r, failure := resolveRepository(st, target, repoOwner)
+	if failure != nil {
+		return nil, failure
 	}
-	// A missing target has no recovery: it is the /mnt/data mount and the label that says
-	// what the container is for, and an empty docker volume name is not a thing to mount.
-	if target.Name == "" {
-		return nil, &LogMessage{Message: "Missing target volume name"}
-	}
-
-	r := Repository{Name: repoOwner.Name, Retention: repoOwner.Retention, Store: st}
 
 	containerBuilt, containerErr := r.InitBackupContainer(target)
 	if containerErr != nil {
@@ -79,6 +69,37 @@ func FindRepository(st *store.Store, target *types.Volume, repoOwner *types.Volu
 	}
 
 	return &r, nil
+}
+
+// resolveRepository decides WHICH of the two volumes the repository is named after, and
+// returns the Repository named accordingly.
+//
+// This is the decision the whole change is about, and it is a separate function so that it
+// is reachable in a test: FindRepository goes straight on to build a docker container, so
+// the choice made here cannot otherwise be observed without a daemon. That is not a
+// hypothetical — the first attempt at a regression guard asserted the container spec
+// instead, one level DOWN from here, which pinned how the two names flow once chosen and
+// caught nothing when the wrong one was chosen in the first place.
+//
+//   - Name and Retention come from repoOwner. Everything downstream of Name addresses the
+//     repository; only the /mnt/data mount and the container label address the target.
+//   - An absent repoOwner means the caller only ever had one volume in mind, so the target
+//     is it. Defaulted rather than refused because backup/delete.go passes the task's
+//     source_volume through unvalidated and the controller only defaults that parameter —
+//     an archive delete arriving without one works today and must keep working. Warned
+//     rather than silent, because the alternative is a guess nobody can see.
+//   - An absent target has no recovery: it supplies the /mnt/data mount and the label
+//     saying what the container is for, and an empty docker volume name is not a thing to
+//     mount.
+func resolveRepository(st *store.Store, target *types.Volume, repoOwner *types.Volume) (Repository, *LogMessage) {
+	if repoOwner.Name == "" {
+		borgLogger().Warn("No repository owner supplied, defaulting to the target volume", "volume", target.Name)
+		repoOwner = target
+	}
+	if target.Name == "" {
+		return Repository{}, &LogMessage{Message: "Missing target volume name"}
+	}
+	return Repository{Name: repoOwner.Name, Retention: repoOwner.Retention, Store: st}, nil
 }
 
 // missingRepositoryMsgID is the verdict FindRepository's callers act on: backup.Perform
@@ -511,13 +532,10 @@ func (r *Repository) Sync() {
 	}
 }
 
-func (r *Repository) repoPath() string {
-	return repoPathFor(r.Name)
-}
-
-// repoPathFor is repoPath keyed on a bare name, so containerSpec can build BORG_REPO
-// without a *Repository to hang it on — the container spec is the seam the
-// repoOwner-vs-target invariant is tested at, and it must be callable without docker.
+// repoPathFor builds BORG_REPO for the repository named name. It is keyed on a bare name
+// rather than a receiver so it can be exercised directly in a test; the *Repository wrapper
+// it replaces had no callers left once containerSpec became the single place BORG_REPO is
+// assembled.
 //
 // name is ALWAYS the repository owner. On the SSH backend it is spliced into the remote
 // URL, which is exactly where naming the repository after the target volume sent a restore

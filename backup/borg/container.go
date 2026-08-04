@@ -59,7 +59,7 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	randNumber := 10 + rand.Intn(1000-10)
 	containerName := "backup-" + strconv.Itoa(randNumber) + string(t.Format("150405"))
 
-	labels, borgEnv, mounts := containerSpec(target, r.Name)
+	labels, borgEnv, mounts := r.containerSpec(target)
 
 	hostConfig := container.HostConfig{
 		NetworkMode: "none",
@@ -117,10 +117,11 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 // not the random container name — that reads time.Now() and rand, which would make the
 // result unrepeatable and is the one piece of InitBackupContainer that has to stay there.
 //
-// It is a separate function because of the invariant it makes checkable, which is the
-// invariant this whole change is about:
+// It is a METHOD taking only the target, so the repository owner cannot be handed to it
+// wrongly — there is no argument to get wrong, the same reason InitBackupContainer stopped
+// taking one. It is a separate function at all because of the invariant it makes checkable:
 //
-//   - BORG_REPO and the b-<name> mount at /mnt/borg follow repoOwner;
+//   - BORG_REPO and the b-<name> mount at /mnt/borg follow r.Name, the repository owner;
 //   - the /mnt/data mount and the com.computestacks.for label follow target.
 //
 // On every same-volume operation — backup, prune, compact, export — the two are equal and
@@ -128,13 +129,13 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 // can be exercised without a docker daemon and a backup server, which is exactly why the
 // wrong one being used went unnoticed.
 //
-// b-<repoOwner> at /mnt/borg means two different things by backend, and it is the owner's
+// b-<r.Name> at /mnt/borg means two different things by backend, and it is the owner's
 // volume in both: on local/NFS that docker volume IS the repository, while on SSH it holds
 // only borg's BORG_BASE_DIR cache for a repository that lives on the backup server.
 //
 // A trashed target gets no /mnt/data mount: either its volume is being destroyed, or the
 // operation (prune, compact) never reads it.
-func containerSpec(target *types.Volume, repoOwner string) (labels map[string]string, env []string, mounts []mount.Mount) {
+func (r *Repository) containerSpec(target *types.Volume) (labels map[string]string, env []string, mounts []mount.Mount) {
 	labels = map[string]string{
 		"com.computestacks.role": "backup",
 		"com.computestacks.for":  target.Name,
@@ -154,7 +155,7 @@ func containerSpec(target *types.Volume, repoOwner string) (labels map[string]st
 		"BORG_DELETE_I_KNOW_WHAT_I_AM_DOING=YES",
 		"BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES",
 		"BORG_BASE_DIR=/mnt/borg",
-		"BORG_REPO=" + repoPathFor(repoOwner),
+		"BORG_REPO=" + repoPathFor(r.Name),
 	}
 
 	if viper.GetBool("backups.borg.ssh.enabled") {
@@ -171,7 +172,7 @@ func containerSpec(target *types.Volume, repoOwner string) (labels map[string]st
 		},
 		{
 			Type:   mount.TypeVolume,
-			Source: "b-" + repoOwner,
+			Source: "b-" + r.Name,
 			Target: "/mnt/borg",
 		},
 	}
@@ -366,6 +367,15 @@ func sshRepoPathCommand(name string) (string, bool) {
 // removed locally and the directory that gets removed remotely cannot name different
 // repositories — they could, and the local half read the parameter while some of the remote
 // logging already read the field.
+//
+// KNOWN LIMITATION, pre-existing and deliberately not addressed here: the remote half is
+// reached only when the LOCAL docker volume was still there. A teardown whose remote rm -rf
+// fails (backup server briefly unreachable) has already removed the local volume, so the
+// retry takes the "Volume does not exist, skipping..." path above and reports SUCCESS with
+// the customer's backup history still on the backup server and nothing recording that it is
+// owed. Same shape as the create-side defect ensureRemoteRepoPath fixes — remote state gated
+// on an unrelated local volume — and it wants the same treatment, but the trash path's
+// idempotency needs its own thinking and this change does not attempt it.
 //
 // The name is validated FIRST, ahead of the docker VolumeRemove. The remove-command builders
 // refuse an unsafe name and that refusal is what this function returns, but it used to be

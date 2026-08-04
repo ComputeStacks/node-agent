@@ -49,9 +49,73 @@ func TestRepoPathForLocalAndNFS(t *testing.T) {
 	}
 }
 
-// TestFindRepositoryRefusesAnEmptyTargetName covers the one input FindRepository turns
-// away before it builds anything: the target is the /mnt/data mount and the label saying
-// what the container is for, and an empty docker volume name is not a thing to mount.
+// TestResolveRepositoryNamesTheOwner is THE regression guard for this whole change: it
+// asserts the decision that was wrong, at the site it was wrong.
+//
+// A repository is named after the volume that owns it, never the volume the operation is
+// pointed at. Naming it after the target is what made a restore of volume A into volume B
+// open B's repository on the SSH backend and never find A's archive.
+//
+// It has to assert here rather than on the container spec. The spec takes the two names as
+// separate arguments and routes them correctly whichever way round they are handed over, so
+// a spec-level test pins the plumbing and says nothing about the choice — putting the
+// original defect back at this line left such a test green.
+func TestResolveRepositoryNamesTheOwner(t *testing.T) {
+	target := &types.Volume{Name: "vol-target"}
+	owner := &types.Volume{Name: "vol-owner"}
+	owner.Retention.Daily = 7
+	target.Retention.Daily = 99
+
+	r, failure := resolveRepository(nil, target, owner)
+	if failure != nil {
+		t.Fatalf("Received failure %q, wanted a repository", failure.Message)
+	}
+	if r.Name != "vol-owner" {
+		t.Errorf("Received Name %q, wanted the repository owner's %q", r.Name, "vol-owner")
+	}
+	if r.Name == target.Name {
+		t.Errorf("Received Name %q, which is the TARGET volume — the repository belongs to the owner", r.Name)
+	}
+	// Retention describes the repository being pruned, so it travels with the owner. Taken
+	// from the target, a clone would apply the new volume's policy to the source's archives.
+	if r.Retention.Daily != 7 {
+		t.Errorf("Received keep-daily %d, wanted the repository owner's %d", r.Retention.Daily, 7)
+	}
+}
+
+// TestResolveRepositoryDefaultsAnAbsentOwner: an absent owner is DEFAULTED to the target,
+// never refused. backup/delete.go passes the task's source_volume straight through and the
+// controller only defaults it, so an archive delete that arrives without one succeeds today
+// and has to keep succeeding.
+func TestResolveRepositoryDefaultsAnAbsentOwner(t *testing.T) {
+	r, failure := resolveRepository(nil, &types.Volume{Name: "vol-target"}, &types.Volume{})
+	if failure != nil {
+		t.Fatalf("Received failure %q — an absent repository owner must be defaulted, not refused", failure.Message)
+	}
+	if r.Name != "vol-target" {
+		t.Errorf("Received Name %q, wanted the target %q it should have defaulted to", r.Name, "vol-target")
+	}
+}
+
+// TestResolveRepositoryRefusesAnAbsentTarget covers the one input that has no recovery: the
+// target supplies the /mnt/data mount and the label saying what the container is for, and an
+// empty docker volume name is not a thing to mount.
+func TestResolveRepositoryRefusesAnAbsentTarget(t *testing.T) {
+	r, failure := resolveRepository(nil, &types.Volume{}, &types.Volume{Name: "vol-owner"})
+	if failure == nil {
+		t.Fatal("Received a nil failure for an absent target, wanted one")
+	}
+	if failure.Message != "Missing target volume name" {
+		t.Errorf("Received %q, wanted %q", failure.Message, "Missing target volume name")
+	}
+	if r.Name != "" {
+		t.Errorf("Received a named repository (%q) alongside a failure, wanted the zero value", r.Name)
+	}
+}
+
+// TestFindRepositoryRefusesBeforeBuildingAnything pins that the refusal above happens ahead
+// of the docker container build — which is both why it can be tested at all and what stops a
+// junk task from creating a b- volume on the way to failing.
 func TestFindRepositoryRefusesAnEmptyTargetName(t *testing.T) {
 	viper.Reset()
 
@@ -62,28 +126,6 @@ func TestFindRepositoryRefusesAnEmptyTargetName(t *testing.T) {
 	}
 	if failure.Message != "Missing target volume name" {
 		t.Errorf("Received %q, wanted %q", failure.Message, "Missing target volume name")
-	}
-	if r != nil {
-		t.Errorf("Received a repository (%+v) alongside a failure, wanted nil", r)
-	}
-}
-
-// TestFindRepositoryDoesNotRefuseAnEmptyRepositoryOwner: an absent owner is DEFAULTED to
-// the target, because an archive delete that arrives without one works today. Only the
-// half of that which needs no docker daemon is asserted — that no owner-specific refusal
-// exists, so an empty owner falls through to the target's own guard. Where the defaulted
-// name then lands is containerSpec's business, and that is covered by
-// TestContainerSpecSSHFollowsTheRepositoryOwner.
-func TestFindRepositoryDoesNotRefuseAnEmptyRepositoryOwner(t *testing.T) {
-	viper.Reset()
-
-	r, failure := FindRepository(nil, &types.Volume{}, &types.Volume{})
-
-	if failure == nil {
-		t.Fatal("Received a nil failure, wanted the target volume's")
-	}
-	if failure.Message != "Missing target volume name" {
-		t.Errorf("Received %q, wanted the target's %q — an empty repository owner must be defaulted, not refused", failure.Message, "Missing target volume name")
 	}
 	if r != nil {
 		t.Errorf("Received a repository (%+v) alongside a failure, wanted nil", r)
