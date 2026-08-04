@@ -35,6 +35,10 @@ func prune(ctx context.Context, st *store.Store) {
 		if vol.Backup {
 			// Serialize against compact/export of the same repo. Scoped to a
 			// closure so the lock releases each iteration (and on panic).
+			//
+			// vol.Name is the repository owner here — a prune is a same-volume
+			// operation and passes vol as both of FindRepository's arguments — so
+			// the key names the same repository the lock is protecting.
 			func() {
 				defer borg.AcquireRepoLock(vol.Name)()
 				repo, repoErr := borg.FindRepository(st, &vol, &vol)

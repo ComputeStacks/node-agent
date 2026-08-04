@@ -104,6 +104,11 @@ func ExportBackup(ctx context.Context, st *store.Store, task store.Task, project
 	}
 
 	// Serialize against compact/prune of the same repo for the whole stream.
+	//
+	// vol.Name is the right key because an export is a same-volume operation: it is passed
+	// as both arguments to FindRepository below, so it IS the repository owner the lock
+	// names. It cannot be taken from repo.Name instead — the repository does not exist yet,
+	// and opening it first would race the container build this lock exists to serialize.
 	defer borg.AcquireRepoLock(vol.Name)()
 
 	repo, findErr := borg.FindRepository(st, &vol, &vol)

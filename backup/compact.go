@@ -61,6 +61,10 @@ func compact(ctx context.Context, st *store.Store) {
 			// Scoped closure so the lock releases each iteration (and on panic),
 			// and so one repo blocked behind an in-flight export doesn't stall
 			// the rest of the sweep.
+			//
+			// vol.Name is the repository owner: the sweep only ever compacts this
+			// node's own volumes, so the Repository below is built with Name set to
+			// the same value the lock is keyed on.
 			func() {
 				defer borg.AcquireRepoLock(vol.Name)()
 				repo := borg.Repository{Name: vol.Name, Store: st}
