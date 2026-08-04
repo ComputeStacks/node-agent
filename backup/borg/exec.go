@@ -182,11 +182,11 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 //
 // An earlier version of this comment claimed create had "no warning tier" as a fact about
 // borg, on the strength of five scenarios (files deleted, truncated, grown and removed
-// mid-run, a unix socket in the tree) measured as exiting 0. Those five do exit 0 — they
-// were re-measured on borg 1.4.4 and reproduce — but they are not the whole warning tier,
-// and treating an incomplete measurement as a general rule is what made a successful
-// backup report "borg create exited 1: no diagnostic output" on any volume with an active
-// application writing to it. Two warnings that DO exit 1 were missed:
+// mid-run, a unix socket in the tree) measured as exiting 0. Those five exit 0 as measured,
+// but they are not the whole warning tier, and treating an incomplete measurement as a
+// general rule is what made a successful backup report "borg create exited 1: no
+// diagnostic output" on any volume with an active application writing to it. Three
+// warnings that DO exit 1 were missed:
 //
 //   - FileChangedWarning, which needs a file large enough that borg's read straddles a
 //     concurrent write. It does not reproduce on a small hand-made file and happens
@@ -195,8 +195,15 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 //   - BackupPermissionError (and its BackupOSError siblings), where borg cannot read a
 //     file, logs it, SKIPS it, and commits an archive without it. Same exit code, same
 //     WARNING severity, and the file is simply absent — verified with `borg list`.
+//   - BackupFileNotFoundError, which is where "files deleted" above is too coarse to be
+//     load-bearing. A delete borg never sees does exit 0, but borg lists a directory and
+//     then stat()s each entry, and a delete landing inside THAT window exits 1 with one
+//     WARNING per vanished file. It does not reproduce on a hand-made delete for the same
+//     reason FileChangedWarning does not — the window has to be hit — and it happens on
+//     any volume an application is writing to. Measured on borg 1.4.4: 1,181 records and
+//     nfiles 18,648 of 20,000 over a directory losing its tail mid-walk.
 //
-// Those two are why a downgrade must turn on borg's msgid and never on the exit code
+// Those three are why a downgrade must turn on borg's msgid and never on the exit code
 // alone.
 func classify(label string, borgJSON bool, exitCode int, response string) *LogMessage {
 	if exitCode == 0 {

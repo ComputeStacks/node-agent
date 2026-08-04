@@ -30,19 +30,39 @@ func lockWait(op string) string {
 	return viper.GetString("backups.borg.lock_wait")
 }
 
-// benignCreateWarnings are the `borg create` warning msgids that do NOT mean data is
-// missing from the archive. Measured on borg 1.4.4:
+// benignCreateWarnings are the `borg create` warning msgids that do NOT mean the archive
+// came out short of the volume. Measured on borg 1.4.4:
 //
-//	FileChangedWarning  "<file>: file changed while we backed it up" — the file IS in
-//	                    the archive; its content may be a torn read.
+//	FileChangedWarning       "<file>: file changed while we backed it up" — the file IS
+//	                         in the archive; its content may be a torn read.
+//	BackupFileNotFoundError  "<file>: stat: [Errno 2] No such file or directory:
+//	                         '<file>'" — the file was deleted between borg listing its
+//	                         directory and stat'ing it, so it is absent from the archive
+//	                         AND from the volume.
 //
-// Deliberately an allowlist of one, not a denylist. The measured alternative,
-// BackupPermissionError, exits borgWarningExit at the same WARNING severity and the file
-// is absent from the archive entirely (verified: `borg list` omits it, nfiles is short) —
-// so an unrecognised warning must fail rather than be assumed harmless. When one does,
-// the task carries borg's own message, so widening this set is a deliberate, evidenced
-// decision rather than a silent default.
-var benignCreateWarnings = map[string]bool{"FileChangedWarning": true}
+// What the set encodes is not "harmless" but the narrower thing the customer is owed: the
+// archive still matches the volume. That is why the second entry qualifies even though a
+// file is missing from the archive — it is missing from the volume too, and an active
+// volume loses files under a backup constantly. By that test it is the safer of the two:
+// FileChangedWarning leaves a possibly-torn copy IN the archive.
+//
+// Still an allowlist rather than a denylist, and every entry is a captured record rather
+// than an assumption about what borg "probably" means. BackupPermissionError exits
+// borgWarningExit at the same WARNING severity, and its file is absent from the archive
+// while still sitting on the volume (verified: `borg list` omits it, nfiles is short) —
+// keeping that one failing is the whole point of the set, and the same goes for its
+// sibling BackupIOError and for the generic BackupError. An unrecognised warning must fail
+// rather than be assumed harmless. When one does, the task carries borg's own message, so
+// widening this set is a deliberate, evidenced decision rather than a silent default.
+//
+// One case this cannot separate, and accepts knowingly: a DIRECTORY renamed mid-walk
+// raises the same ENOENT for the entries under it, and that subtree does still exist on
+// the volume under its new name — absent from the archive if borg had already walked past
+// the destination. Nothing in the record tells that apart from a plain delete.
+var benignCreateWarnings = map[string]bool{
+	"FileChangedWarning":      true,
+	"BackupFileNotFoundError": true,
+}
 
 func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 	var borgResponse ArchiveMessage

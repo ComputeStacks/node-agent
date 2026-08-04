@@ -180,10 +180,13 @@ func TestDecodeArchiveMessageKeepsThePayloadWhole(t *testing.T) {
 // exercised as it is actually composed.
 func TestWroteCompleteArchive(t *testing.T) {
 	var (
-		warned           = fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
-		twiceWarned      = fileChangedWarningRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
-		permissionDenied = backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
-		mixedWarnings    = fileChangedWarningRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		warned            = fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		twiceWarned       = fileChangedWarningRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		permissionDenied  = backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		mixedWarnings     = fileChangedWarningRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		vanished          = backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		vanishedAndDenied = backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		bothBenign        = fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 	)
 
 	for _, i := range []struct {
@@ -200,6 +203,19 @@ func TestWroteCompleteArchive(t *testing.T) {
 			// One record per warned file, and a busy volume warns about several.
 			name: "several benign warnings",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: twiceWarned},
+			want: true,
+		},
+		{
+			// The file is gone from the archive because it is gone from the volume, so the
+			// archive still matches what was there to back up.
+			name: "vanished file over a committed archive",
+			res:  ExecResult{ExitCode: borgWarningExit, Response: vanished},
+			want: true,
+		},
+		{
+			// Both benign, and for different reasons — neither has to vouch for the other.
+			name: "a torn file and a vanished file together",
+			res:  ExecResult{ExitCode: borgWarningExit, Response: bothBenign},
 			want: true,
 		},
 		{
@@ -243,6 +259,19 @@ func TestWroteCompleteArchive(t *testing.T) {
 			want: false,
 		},
 		{
+			// Same rule for the newer benign entry: a file that vanished says nothing about
+			// the file borg could not read, which IS still on the volume.
+			name: "vanished and data-affecting warnings together",
+			res:  ExecResult{ExitCode: borgWarningExit, Response: vanishedAndDenied},
+			want: false,
+		},
+		{
+			// borg's error tier is never downgradeable, whatever the records say.
+			name: "vanished file at the error tier",
+			res:  ExecResult{ExitCode: 2, Response: vanished},
+			want: false,
+		},
+		{
 			name: "warning record with no payload",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: fileChangedWarningRecord + "\r\n"},
 			want: false,
@@ -281,6 +310,13 @@ func TestCreateWarnings(t *testing.T) {
 			name:     "one record per warned file, in order",
 			response: fileChangedWarningRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + fileChangedWarningRecord + "\r\n",
 			want:     []string{"FileChangedWarning", "BackupPermissionError", "FileChangedWarning"},
+		},
+		{
+			// All three measured create warnings in one response: the gate rules on the whole
+			// list, so every kind has to survive the scan.
+			name:     "all three warning kinds",
+			response: backupFileNotFoundErrorRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + backupPermissionErrorRecord + "\r\n",
+			want:     []string{"BackupFileNotFoundError", "FileChangedWarning", "BackupPermissionError"},
 		},
 		{
 			// A pretty-printed payload's lines are not records, so the payload around the
@@ -348,7 +384,20 @@ func TestNonBenignCreateWarning(t *testing.T) {
 			response:  fileChangedWarningRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY,
 			wantMsgID: "",
 		},
+		{name: "vanished only", response: backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY, wantMsgID: ""},
+		{
+			name:      "both benign kinds",
+			response:  fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY,
+			wantMsgID: "",
+		},
 		{name: "non-benign only", response: backupPermissionErrorRecord + "\r\n", wantMsgID: "BackupPermissionError"},
+		{
+			// The reason a busy volume must still report the real offender: the vanished
+			// files are the loud majority and the unreadable file is the one that matters.
+			name:      "vanished before non-benign",
+			response:  backupFileNotFoundErrorRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY,
+			wantMsgID: "BackupPermissionError",
+		},
 		{
 			// The order that matters: the benign record comes FIRST, which is what
 			// failureRecord would have quoted.
