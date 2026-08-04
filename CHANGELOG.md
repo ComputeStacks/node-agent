@@ -8,13 +8,16 @@ one new configuration key (`backups.borg.lock_wait_restore`), and one additive t
 reported no usable reason for it, and the reason is the only thing that says which files did not
 come back.
 
-It also carries three fixes to the `ssh` backup backend, which are the last three entries below.
+It also carries one backup fix and three fixes to the `ssh` backup backend, which are the last four
+entries below. **Upgrade if files are created and deleted on a volume while it is being backed up:
+on those volumes a backup can be reported as failed even though the archive was created correctly.**
 
-Four changes alter behaviour rather than only reporting, and each is called out inline below: a
+Five changes alter behaviour rather than only reporting, and each is called out inline below: a
 restore that names individual file paths is refused; a restore waits up to 120 seconds for the
 repository lock instead of 1; a failed restore's `result_json.error` carries the reason rather than
 the literal string `task reported failure`, which matters if anything downstream matches on that
-text; and on the `ssh` backend a restore whose source is a different volume now reads that volume's
+text; a backup whose only warnings are files deleted while it ran now completes instead of failing;
+and on the `ssh` backend a restore whose source is a different volume now reads that volume's
 repository rather than the destination's.
 
 - [CHANGE] **A restore that names individual file paths is refused.** A restore replaces the whole
@@ -57,6 +60,18 @@ repository rather than the destination's.
   The new `backups.borg.lock_wait_restore` defaults to 120 seconds. It is deliberately shorter than
   `lock_wait_create`: the wait happens with the service stopped and the volume already set aside, so
   it is bounded rather than maximised.
+- [FIX] **A file deleted while a backup is running no longer fails the backup.** `borg` lists a
+  directory and then reads each entry in turn, and a file removed between those two steps is recorded
+  as a warning, skipped, and the archive committed without it. The agent treated that warning as a
+  failed backup, so on a volume where an application creates and removes files as it works — a
+  temporary file, an upload being moved into place, a cache being cleared — backups could fail while
+  `borg` was in fact producing correct archives. The archive still matches the volume in that case,
+  because the file is gone from the volume too, so the task now completes, `last_backup` advances, and
+  the file `borg` named is reported in the `backup_warning` field. **Archives from backups reported
+  failed this way are valid and restorable** — the backup itself succeeded and only the reported
+  outcome was wrong, so there is nothing to re-run. A warning that means a file is still on the volume
+  but absent from the archive — `borg` being unable to read it, for example — continues to fail the
+  backup, unchanged.
 - [FIX] **Repository names are validated before they are used in commands on the backup server.** The
   agent builds a small number of commands that run on the backup server over SSH — creating and
   removing a repository's directory — and a repository name reached those commands without being
