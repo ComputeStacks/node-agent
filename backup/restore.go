@@ -151,13 +151,18 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 		return errors.New(reason)
 	}
 
+	// vol is the SOURCE and it is the second argument, because the repository being read
+	// belongs to the source volume — destVol only receives the extract. A restore never
+	// creates a repository: whatever comes back here is final, and the two branches below
+	// differ only in the id the failure is reported under.
 	repo, findRepoErr := borg.FindRepository(st, &destVol, &vol)
 
 	if findRepoErr != nil {
-		// Can't restore from an empty repository. (A same-volume restore — source
-		// == destination — has no other repo to fall back to, so fail rather than
-		// try to create one. This was historically a pointer compare that never
-		// fired; it is a value compare now.)
+		// Can't restore from a repository that isn't there. The same-volume case reports the
+		// identical outcome as the branch below it, under its own id: a restore of a volume
+		// onto itself and a restore from another volume's repository are different things to
+		// an operator reading the task result, and the ids are what downstream consumers
+		// have to tell them apart with.
 		if destVol.Name == vol.Name {
 			backupLogger().Warn("Error Restoring volume", "volume", task.Volume, "source_volume", params.SourceVolume, "error", findRepoErr.Message)
 			projectEvent.EventLog.Status = "failed"
@@ -170,26 +175,19 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			return errors.New(reason)
 		}
 
-		// For SSH-backed repositories, we may need to first create the repository.
-		if findRepoErr.MsgID == "Repository.DoesNotExist" && viper.GetBool("backups.borg.ssh.enabled") {
-			// Empty SSH repos return 'InvalidRepository' rather than 'DoesNotExist'.
-			repo = &borg.Repository{Name: vol.Name, Store: st}
-			// Build backup container
-			repoErr := repo.Setup(&destVol, &vol)
-			if repoErr != nil {
-				backupLogger().Warn("Error Setting up repo for volume restore", "volume", task.Volume, "source_volume", params.SourceVolume, "error", repoErr.Message)
-				projectEvent.EventLog.Status = "failed"
-				reason := borgFailure(repoErr)
-				projectEvent.PostEventUpdate("agent-ea3613609e732d68", reason)
-				return errors.New(reason)
-			}
-		} else {
-			backupLogger().Warn("Error Restoring volume", "volume", task.Volume, "source_volume", params.SourceVolume, "error", findRepoErr.Message)
-			projectEvent.EventLog.Status = "failed"
-			reason := borgFailure(findRepoErr)
-			projectEvent.PostEventUpdate("agent-2e2a3156b8e2ffd2", reason)
-			return errors.New(reason)
-		}
+		// No auto-init here, deliberately. This used to run repo.Setup on an SSH backend
+		// when borg said Repository.DoesNotExist, on the belief that the missing repository
+		// was the DESTINATION's — which it never was, and now demonstrably is not: the
+		// repository FindRepository opens belongs to the source, so that verdict means the
+		// volume being restored FROM has no repository and there is nothing to extract. A
+		// `borg init` produced an empty repository, the archive lookup that followed failed
+		// anyway, and on the way it created a repository directory on the backup server for
+		// a volume that had no backups. Restore reads; only backup.Perform creates.
+		backupLogger().Warn("Error Restoring volume", "volume", task.Volume, "source_volume", params.SourceVolume, "error", findRepoErr.Message)
+		projectEvent.EventLog.Status = "failed"
+		reason := borgFailure(findRepoErr)
+		projectEvent.PostEventUpdate("agent-2e2a3156b8e2ffd2", reason)
+		return errors.New(reason)
 	}
 
 	defer repo.StopContainer()

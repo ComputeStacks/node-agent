@@ -63,7 +63,7 @@ func compact(ctx context.Context, st *store.Store) {
 			// the rest of the sweep.
 			func() {
 				defer borg.AcquireRepoLock(vol.Name)()
-				repo := borg.Repository{Name: vol.Name, SourceVolumeName: vol.Name, Store: st}
+				repo := borg.Repository{Name: vol.Name, Store: st}
 				if log := repo.Compact(); log != nil {
 					backupLogger().Warn("Compact Volume Error", "volume", vol.Name, "error", log.Message)
 				}

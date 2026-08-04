@@ -55,20 +55,28 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 	}()
 
 	if findRepoMsg != nil {
-		if findRepoMsg.MsgID == "Repository.DoesNotExist" {
+		if findRepoMsg.MsgID == borg.MsgIDRepositoryMissing {
 			repo = &borg.Repository{Name: vol.Name, Store: st}
 			// Build backup container
-			repoErr := repo.Setup(&vol, &vol)
+			repoErr := repo.Setup(&vol)
 			if repoErr != nil {
 				projectEvent.EventLog.Status = "failed"
 				projectEvent.PostEventUpdate("agent-d4c34f1d89c20aa6", repoErr.ToYaml())
 				return errors.New(repoErr.Message)
 			}
-		} else if findRepoMsg.MsgID == "InvalidRepository" && viper.GetBool("backups.borg.ssh.enabled") {
-			// Empty SSH repos return 'InvalidRepository' rather than 'DoesNotExist'.
+		} else if findRepoMsg.MsgID == borg.MsgIDRepositoryInvalid && viper.GetBool("backups.borg.ssh.enabled") {
+			// An SSH repository whose directory exists but was never initialized: borg
+			// reports Repository.InvalidRepository rather than Repository.DoesNotExist, so
+			// it still needs a `borg init`.
+			//
+			// The comparison is against the exported msgid because it used to be against
+			// the literal "InvalidRepository", which borg never emits — the record is
+			// spelled Repository.InvalidRepository (captured in the borg package's
+			// failure_record_test.go). This branch was therefore dead, and such a
+			// repository failed every backup forever with no way out.
 			repo = &borg.Repository{Name: vol.Name, Store: st}
 			// Build backup container
-			repoErr := repo.Setup(&vol, &vol)
+			repoErr := repo.Setup(&vol)
 			if repoErr != nil {
 				projectEvent.EventLog.Status = "failed"
 				projectEvent.PostEventUpdate("agent-7fad20a06cbd26a2", repoErr.ToYaml())

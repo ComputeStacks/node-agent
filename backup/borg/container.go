@@ -19,7 +19,13 @@ import (
 	"github.com/spf13/viper"
 )
 
-func (r *Repository) InitBackupContainer(vol *types.Volume, source *types.Volume) (bool, error) {
+// InitBackupContainer builds the borg container for an operation on target.
+//
+// It takes no repository-owner parameter: r.Name IS the owner (see Repository.Name), and a
+// parameter that must always equal a field is what let the two drift apart in the first
+// place — FindRepository recorded the target as the repository's name while passing the
+// owner separately, and the SSH backend then built BORG_REPO from the wrong one.
+func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	if !reflect.ValueOf(r.Container).IsNil() {
 		// If a container already exists, stop.
 		return true, nil
@@ -30,8 +36,8 @@ func (r *Repository) InitBackupContainer(vol *types.Volume, source *types.Volume
 		return false, clientErr
 	}
 
-	// Check if the backup volume exists, and create it if it does not.
-	if _, volErr := r.ensureBackupVolumeExists(cli, source); volErr != nil {
+	// Check if the borg cache volume exists, and create it if it does not.
+	if _, volErr := r.ensureCacheVolume(cli); volErr != nil {
 		return false, volErr
 	}
 
@@ -47,69 +53,23 @@ func (r *Repository) InitBackupContainer(vol *types.Volume, source *types.Volume
 		}
 	}
 
-	// Container Labels
-	labels := make(map[string]string)
-	labels["com.computestacks.role"] = "backup"
-	labels["com.computestacks.for"] = vol.Name
-
-	if viper.GetBool("backups.borg.ssh.enabled") {
-		labels["com.computestacks.backup-kind"] = "ssh"
-	} else if viper.GetBool("backups.borg.nfs") {
-		labels["com.computestacks.backup-kind"] = "nfs"
-	} else {
-		labels["com.computestacks.backup-kind"] = "local"
-	}
-
 	// Generate Container Name
 	t := time.Now()
 	rand.New(rand.NewSource(time.Now().UnixNano())) // Seed for random container name
 	randNumber := 10 + rand.Intn(1000-10)
 	containerName := "backup-" + strconv.Itoa(randNumber) + string(t.Format("150405"))
 
-	borgEnv := []string{
-		"BORG_PASSPHRASE=" + viper.GetString("backups.key"),
-		"BORG_RELOCATED_REPO_ACCESS_IS_OK=yes",
-		"BORG_DELETE_I_KNOW_WHAT_I_AM_DOING=YES",
-		"BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES",
-		"BORG_BASE_DIR=/mnt/borg",
-		"BORG_REPO=" + r.repoPath(),
-	}
+	labels, borgEnv, mounts := containerSpec(target, r.Name)
 
 	hostConfig := container.HostConfig{
 		NetworkMode: "none",
 		Binds:       []string{},
-		Mounts:      []mount.Mount{},
+		Mounts:      mounts,
 		AutoRemove:  true,
 		Privileged:  viper.GetBool("docker.privileged"),
 	}
 
-	hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
-		Type:     mount.TypeBind,
-		Source:   "/etc/computestacks",
-		ReadOnly: true,
-		Target:   "/etc/computestacks",
-	})
-
 	hostConfig.NetworkMode = "host"
-
-	if viper.GetBool("backups.borg.ssh.enabled") {
-		borgEnv = append(borgEnv, "BORG_REMOTE_PATH="+viper.GetString("backups.borg.ssh_borg_remote_path"))
-		borgEnv = append(borgEnv, "BORG_RSH=ssh -i "+viper.GetString("backups.borg.ssh.keyfile"))
-	}
-
-	hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
-		Type:   mount.TypeVolume,
-		Source: "b-" + source.Name,
-		Target: "/mnt/borg",
-	})
-
-	if !vol.Trash {
-		hostConfig.Mounts = append(hostConfig.Mounts, mount.Mount{
-			Type:   mount.TypeVolume,
-			Source: vol.Name,
-			Target: "/mnt/data",
-		})
-	}
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:  viper.GetString("backups.borg.image"),
@@ -152,6 +112,81 @@ func (r *Repository) InitBackupContainer(vol *types.Volume, source *types.Volume
 	return true, nil
 }
 
+// containerSpec is the decided-by-configuration part of InitBackupContainer: the labels,
+// the borg environment and the mounts. No docker client, no image pull, and deliberately
+// not the random container name — that reads time.Now() and rand, which would make the
+// result unrepeatable and is the one piece of InitBackupContainer that has to stay there.
+//
+// It is a separate function because of the invariant it makes checkable, which is the
+// invariant this whole change is about:
+//
+//   - BORG_REPO and the b-<name> mount at /mnt/borg follow repoOwner;
+//   - the /mnt/data mount and the com.computestacks.for label follow target.
+//
+// On every same-volume operation — backup, prune, compact, export — the two are equal and
+// nothing tells them apart. Only a cross-volume restore or archive delete does, and neither
+// can be exercised without a docker daemon and a backup server, which is exactly why the
+// wrong one being used went unnoticed.
+//
+// b-<repoOwner> at /mnt/borg means two different things by backend, and it is the owner's
+// volume in both: on local/NFS that docker volume IS the repository, while on SSH it holds
+// only borg's BORG_BASE_DIR cache for a repository that lives on the backup server.
+//
+// A trashed target gets no /mnt/data mount: either its volume is being destroyed, or the
+// operation (prune, compact) never reads it.
+func containerSpec(target *types.Volume, repoOwner string) (labels map[string]string, env []string, mounts []mount.Mount) {
+	labels = map[string]string{
+		"com.computestacks.role": "backup",
+		"com.computestacks.for":  target.Name,
+	}
+
+	if viper.GetBool("backups.borg.ssh.enabled") {
+		labels["com.computestacks.backup-kind"] = "ssh"
+	} else if viper.GetBool("backups.borg.nfs") {
+		labels["com.computestacks.backup-kind"] = "nfs"
+	} else {
+		labels["com.computestacks.backup-kind"] = "local"
+	}
+
+	env = []string{
+		"BORG_PASSPHRASE=" + viper.GetString("backups.key"),
+		"BORG_RELOCATED_REPO_ACCESS_IS_OK=yes",
+		"BORG_DELETE_I_KNOW_WHAT_I_AM_DOING=YES",
+		"BORG_CHECK_I_KNOW_WHAT_I_AM_DOING=YES",
+		"BORG_BASE_DIR=/mnt/borg",
+		"BORG_REPO=" + repoPathFor(repoOwner),
+	}
+
+	if viper.GetBool("backups.borg.ssh.enabled") {
+		env = append(env, "BORG_REMOTE_PATH="+viper.GetString("backups.borg.ssh_borg_remote_path"))
+		env = append(env, "BORG_RSH=ssh -i "+viper.GetString("backups.borg.ssh.keyfile"))
+	}
+
+	mounts = []mount.Mount{
+		{
+			Type:     mount.TypeBind,
+			Source:   "/etc/computestacks",
+			ReadOnly: true,
+			Target:   "/etc/computestacks",
+		},
+		{
+			Type:   mount.TypeVolume,
+			Source: "b-" + repoOwner,
+			Target: "/mnt/borg",
+		},
+	}
+
+	if !target.Trash {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeVolume,
+			Source: target.Name,
+			Target: "/mnt/data",
+		})
+	}
+
+	return labels, env, mounts
+}
+
 /*
  * Helper methods to deal with situations where the container is null.
  */
@@ -169,27 +204,39 @@ func (r *Repository) StopContainer() bool {
 /*
 Volumes
 */
-func (r *Repository) ensureBackupVolumeExists(cli *client.Client, vol *types.Volume) (bool, error) {
+// ensureCacheVolume creates the docker volume b-<r.Name> if it is not already there.
+//
+// It takes no volume parameter: the volume is the repository owner's, always, because of
+// what is mounted at /mnt/borg — the repository itself on local/NFS, borg's cache for the
+// remote repository on SSH. Passing one alongside r.Name is how the local and remote halves
+// of this were able to name different volumes.
+//
+// The NFS remote mkdir/chown STAYS here, unlike the SSH one (see ensureRemoteRepoPath).
+// That directory is a precondition of the NFS mount this function is about to declare — the
+// volume's driver options point the mount straight at it — so on that backend it belongs to
+// volume creation rather than to repository creation, and it is correctly gated on the
+// volume's own absence.
+func (r *Repository) ensureCacheVolume(cli *client.Client) (bool, error) {
 	ctx := context.Background()
 
-	_, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+vol.Name)
+	_, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+r.Name)
 
 	if existingVolumeErr != nil {
 		// Container Labels
 		labels := make(map[string]string)
 		labels["com.computestacks.role"] = "backup"
-		labels["com.computestacks.for"] = vol.Name
+		labels["com.computestacks.for"] = r.Name
 
 		// Driver Opts
 		driverOpts := make(map[string]string)
 
 		if viper.GetBool("backups.borg.nfs") {
 			if viper.GetBool("backups.borg.nfs_create_path") {
-				borgLogger().Info("Creating remote volume directory", "volume", "b-"+vol.Name, "type", "nfs")
-				sshCmd, ok := nfsRepoPathCommand(vol.Name)
+				borgLogger().Info("Creating remote volume directory", "volume", "b-"+r.Name, "type", "nfs")
+				sshCmd, ok := nfsRepoPathCommand(r.Name)
 				if !ok {
-					borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "volume", "b-"+vol.Name, "type", "nfs")
-					return false, errors.New("refusing to create remote directory: unsafe repository name " + vol.Name)
+					borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "volume", "b-"+r.Name, "type", "nfs")
+					return false, errors.New("refusing to create remote directory: unsafe repository name " + r.Name)
 				}
 				connInfo := sshremote.ServerConnInfo{
 					Server: viper.GetString("backups.borg.nfs_host"),
@@ -201,49 +248,22 @@ func (r *Repository) ensureBackupVolumeExists(cli *client.Client, vol *types.Vol
 				createDirSuccess, createDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
 
 				if createDirErr != nil {
-					borgLogger().Error("Fatal error creating directory on remote server", "volume", "b-"+vol.Name, "error", createDirErr.Error())
+					borgLogger().Error("Fatal error creating directory on remote server", "volume", "b-"+r.Name, "error", createDirErr.Error())
 					return false, createDirErr
 				}
 
 				if !createDirSuccess {
-					borgLogger().Warn("Invalid response while creating remote directory", "volume", "b-"+vol.Name)
+					borgLogger().Warn("Invalid response while creating remote directory", "volume", "b-"+r.Name)
 					return false, errors.New("invalid response while creating directory")
 				}
 			}
 			driverOpts["type"] = "nfs"
 			driverOpts["o"] = "addr=" + viper.GetString("backups.borg.nfs_host") + ",rw,nfsvers=4" + viper.GetString("backups.borg.nfs_opts")
-			driverOpts["device"] = ":" + viper.GetString("backups.borg.nfs_host_path") + "/b-" + vol.Name
-
-		} else if viper.GetBool("backups.borg.ssh.enabled") {
-
-			borgLogger().Info("Creating remote volume directory", "repository", "b-"+r.Name, "type", "ssh")
-			sshCmd, ok := sshRepoPathCommand(r.Name)
-			if !ok {
-				borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "repository", r.Name, "type", "ssh")
-				return false, errors.New("refusing to create remote directory: unsafe repository name " + r.Name)
-			}
-			connInfo := sshremote.ServerConnInfo{
-				Server: viper.GetString("backups.borg.ssh.host"),
-				Port:   viper.GetString("backups.borg.ssh.port"),
-				User:   viper.GetString("backups.borg.ssh.user"),
-				Key:    viper.GetString("backups.borg.ssh.keyfile"),
-			}
-
-			createDirSuccess, createDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
-
-			if createDirErr != nil {
-				borgLogger().Error("Fatal error creating directory on remote server", "repository", r.Name, "error", createDirErr.Error(), "type", "ssh")
-				return false, createDirErr
-			}
-
-			if !createDirSuccess {
-				borgLogger().Warn("Invalid response while creating remote directory", "repository", r.Name, "type", "ssh")
-				return false, errors.New("invalid response while creating directory")
-			}
+			driverOpts["device"] = ":" + viper.GetString("backups.borg.nfs_host_path") + "/b-" + r.Name
 		}
 
 		opts := volumeTypes.CreateOptions{
-			Name:       "b-" + vol.Name,
+			Name:       "b-" + r.Name,
 			Driver:     "local",
 			DriverOpts: driverOpts,
 			Labels:     labels,
@@ -252,7 +272,7 @@ func (r *Repository) ensureBackupVolumeExists(cli *client.Client, vol *types.Vol
 		_, volErr := cli.VolumeCreate(ctx, opts)
 
 		if volErr != nil {
-			borgLogger().Warn("Fatal Error Creating Volume", "volume", "b-"+vol.Name, "error", volErr.Error())
+			borgLogger().Warn("Fatal Error Creating Volume", "volume", "b-"+r.Name, "error", volErr.Error())
 			return false, volErr
 		}
 
@@ -260,6 +280,56 @@ func (r *Repository) ensureBackupVolumeExists(cli *client.Client, vol *types.Vol
 
 	}
 	return true, nil
+}
+
+// ensureRemoteRepoPath creates r's repository directory on the SSH backup server.
+//
+// It is called from Setup and from nowhere else. Creating a repository is what Setup is
+// for, and every other operation only READS one: it used to run from inside
+// ensureCacheVolume, so a restore, an export, an archive delete or a prune against a
+// repository the node does not have would mkdir it on the backup server on the way to
+// failing, and a misconfigured node left a trail of empty directories there. Worse, an
+// empty directory is not a repository, so the mkdir converted borg's
+// Repository.DoesNotExist verdict into Repository.InvalidRepository.
+//
+// Not gated on the cache volume's absence either, for the reason it cannot be: b-<name>
+// exists on a node that has backed the volume up before, while the remote directory may
+// have been lost, and Setup is the one caller that needs it there unconditionally.
+//
+// The !nfs term preserves today's behaviour exactly. ensureCacheVolume tested nfs FIRST, so
+// a configuration with both flags set never reached the SSH mkdir, and this must not become
+// the change that gives such a node a new remote write.
+func (r *Repository) ensureRemoteRepoPath() error {
+	if !viper.GetBool("backups.borg.ssh.enabled") || viper.GetBool("backups.borg.nfs") {
+		return nil
+	}
+
+	borgLogger().Info("Creating remote repository directory", "repository", "b-"+r.Name, "type", "ssh")
+	sshCmd, ok := sshRepoPathCommand(r.Name)
+	if !ok {
+		borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "repository", r.Name, "type", "ssh")
+		return errors.New("refusing to create remote directory: unsafe repository name " + r.Name)
+	}
+	connInfo := sshremote.ServerConnInfo{
+		Server: viper.GetString("backups.borg.ssh.host"),
+		Port:   viper.GetString("backups.borg.ssh.port"),
+		User:   viper.GetString("backups.borg.ssh.user"),
+		Key:    viper.GetString("backups.borg.ssh.keyfile"),
+	}
+
+	createDirSuccess, createDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
+
+	if createDirErr != nil {
+		borgLogger().Error("Fatal error creating directory on remote server", "repository", r.Name, "error", createDirErr.Error(), "type", "ssh")
+		return createDirErr
+	}
+
+	if !createDirSuccess {
+		borgLogger().Warn("Invalid response while creating remote directory", "repository", r.Name, "type", "ssh")
+		return errors.New("invalid response while creating directory")
+	}
+
+	return nil
 }
 
 // nfsRepoPathCommand builds the remote shell command that creates the repository
@@ -289,14 +359,31 @@ func sshRepoPathCommand(name string) (string, bool) {
 	return cmd, true
 }
 
-func (r *Repository) TrashBackupVolumeExists(vol *types.Volume) (bool, error) {
+// TrashBackupVolumeExists destroys r's repository: the local b-<r.Name> docker volume and,
+// on a remote backend, the repository directory on the backup server.
+//
+// It takes no volume parameter. Both halves derive from r.Name, so the volume that gets
+// removed locally and the directory that gets removed remotely cannot name different
+// repositories — they could, and the local half read the parameter while some of the remote
+// logging already read the field.
+//
+// The name is validated FIRST, ahead of the docker VolumeRemove. The remove-command builders
+// refuse an unsafe name and that refusal is what this function returns, but it used to be
+// reached only after the local volume was already gone — so an unsafe name destroyed the
+// local half of the repository and then failed, leaving the remote half behind with nothing
+// left to retry against.
+func (r *Repository) TrashBackupVolumeExists() (bool, error) {
+	if !safeRepoName(r.Name) {
+		borgLogger().Error("Refusing to destroy repository with an unsafe name", "repository", r.Name)
+		return false, errors.New("refusing to destroy repository: unsafe repository name " + r.Name)
+	}
 	ctx := context.Background()
 	cli, clientErr := client.NewClientWithOpts(client.WithVersion(viper.GetString("docker.version")))
 	if clientErr != nil {
 		borgLogger().Error("Unable to connect to Docker", "error", clientErr.Error())
 		return false, clientErr
 	}
-	existingVolume, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+vol.Name)
+	existingVolume, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+r.Name)
 
 	if existingVolumeErr != nil {
 		borgLogger().Info("Volume does not exist, skipping...")
@@ -308,12 +395,12 @@ func (r *Repository) TrashBackupVolumeExists(vol *types.Volume) (bool, error) {
 	}
 
 	if viper.GetBool("backups.borg.nfs") {
-		borgLogger().Info("Cleaning remote volume path", "volume", "b-"+vol.Name)
+		borgLogger().Info("Cleaning remote volume path", "volume", "b-"+r.Name)
 
-		sshCmd, ok := nfsRepoRemoveCommand(vol.Name)
+		sshCmd, ok := nfsRepoRemoveCommand(r.Name)
 		if !ok {
-			borgLogger().Error("Refusing to remove remote directory with an unsafe repository name", "volume", "b-"+vol.Name)
-			return false, errors.New("refusing to remove remote directory: unsafe repository name " + vol.Name)
+			borgLogger().Error("Refusing to remove remote directory with an unsafe repository name", "volume", "b-"+r.Name)
+			return false, errors.New("refusing to remove remote directory: unsafe repository name " + r.Name)
 		}
 		connInfo := sshremote.ServerConnInfo{
 			Server: viper.GetString("backups.borg.nfs_host"),
@@ -325,22 +412,22 @@ func (r *Repository) TrashBackupVolumeExists(vol *types.Volume) (bool, error) {
 		destroyDirSuccess, destroyDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
 
 		if destroyDirErr != nil {
-			borgLogger().Error("Error removing remote directory", "volume", "b-"+vol.Name, "error", destroyDirErr.Error())
+			borgLogger().Error("Error removing remote directory", "volume", "b-"+r.Name, "error", destroyDirErr.Error())
 			return false, destroyDirErr
 		}
 
 		if !destroyDirSuccess {
-			borgLogger().Warn("Invalid response while destroying remote directory", "volume", "b-"+vol.Name)
+			borgLogger().Warn("Invalid response while destroying remote directory", "volume", "b-"+r.Name)
 			return false, errors.New("invalid response while destroying directory")
 		}
 	} else if viper.GetBool("backups.borg.ssh.enabled") {
 
 		borgLogger().Info("Cleaning remote volume path", "repository", r.Name, "method", "ssh")
 
-		sshCmd, ok := sshRepoRemoveCommand(vol.Name)
+		sshCmd, ok := sshRepoRemoveCommand(r.Name)
 		if !ok {
 			borgLogger().Error("Refusing to remove remote directory with an unsafe repository name", "repository", r.Name, "type", "ssh")
-			return false, errors.New("refusing to remove remote directory: unsafe repository name " + vol.Name)
+			return false, errors.New("refusing to remove remote directory: unsafe repository name " + r.Name)
 		}
 		connInfo := sshremote.ServerConnInfo{
 			Server: viper.GetString("backups.borg.ssh.host"),
@@ -364,7 +451,7 @@ func (r *Repository) TrashBackupVolumeExists(vol *types.Volume) (bool, error) {
 		borgLogger().Info("NFS disabled, skipping remote file cleanup.")
 	}
 
-	borgLogger().Info("Successfully removed backup volume", "volume", "b-"+vol.Name)
+	borgLogger().Info("Successfully removed backup volume", "volume", "b-"+r.Name)
 	return true, nil
 }
 

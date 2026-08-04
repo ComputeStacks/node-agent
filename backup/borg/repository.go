@@ -27,10 +27,36 @@ import (
 	"github.com/getsentry/sentry-go"
 )
 
-func FindRepository(st *store.Store, vol *types.Volume, source *types.Volume) (*Repository, *LogMessage) {
-	r := Repository{Name: vol.Name, Retention: vol.Retention, SourceVolumeName: source.Name, Store: st}
+// FindRepository opens the repository owned by repoOwner, with target as the volume the
+// operation is pointed at — the same volume on a backup, prune or export, a different one
+// on a cross-volume restore or archive delete.
+//
+// Which of the two the returned Repository is NAMED after is the whole point: everything
+// downstream of Name addresses the repository (BORG_REPO, the b-<name> cache volume, the
+// remote path, the repositories row), and only the /mnt/data mount addresses the target.
+// Naming it after the target opened the TARGET's repository on the SSH backend, where a
+// restore of volume A into volume B then looked for A's archive in B's repository and
+// could never find it. Retention comes from repoOwner for the same reason: a retention
+// policy is a property of the repository being pruned.
+func FindRepository(st *store.Store, target *types.Volume, repoOwner *types.Volume) (*Repository, *LogMessage) {
+	// An absent repository owner means the caller only ever had one volume in mind, so
+	// the target is it. Defaulted rather than refused because backup/delete.go passes the
+	// task's source_volume through unvalidated and the controller only defaults that
+	// parameter — an archive delete that arrives without one works today and must keep
+	// working. The warning is here because the alternative is a silent guess.
+	if repoOwner.Name == "" {
+		borgLogger().Warn("No repository owner supplied, defaulting to the target volume", "volume", target.Name)
+		repoOwner = target
+	}
+	// A missing target has no recovery: it is the /mnt/data mount and the label that says
+	// what the container is for, and an empty docker volume name is not a thing to mount.
+	if target.Name == "" {
+		return nil, &LogMessage{Message: "Missing target volume name"}
+	}
 
-	containerBuilt, containerErr := r.InitBackupContainer(vol, source)
+	r := Repository{Name: repoOwner.Name, Retention: repoOwner.Retention, Store: st}
+
+	containerBuilt, containerErr := r.InitBackupContainer(target)
 	if containerErr != nil {
 		sentry.CaptureException(containerErr)
 		return nil, &LogMessage{Message: containerErr.Error()}
@@ -49,16 +75,32 @@ func FindRepository(st *store.Store, vol *types.Volume, source *types.Volume) (*
 
 	if repoResponse == (RepositoryResponse{}) {
 		r.StopContainer()
-		return nil, &LogMessage{MsgID: "Repository.DoesNotExist", Message: "Missing Repository"}
+		return nil, &LogMessage{MsgID: MsgIDRepositoryMissing, Message: "Missing Repository"}
 	}
 
 	return &r, nil
 }
 
 // missingRepositoryMsgID is the verdict FindRepository's callers act on: backup.Perform
-// and the SSH branch of restore.Perform both read it to decide whether to run
-// Repository.Setup (borg init) for a volume that has no repository yet.
+// reads it to decide whether to run Repository.Setup (borg init) for a volume that has no
+// repository yet. It is the ONLY caller that may — restore reads a repository it does not
+// own, so the same verdict there means the source has nothing to restore from.
 const missingRepositoryMsgID = "Repository.DoesNotExist"
+
+// The two verdicts a caller outside this package branches on, exported so a call site
+// cannot get the spelling wrong. It could, and did: backup.Perform compared against
+// "InvalidRepository" while borg emits "Repository.InvalidRepository" (the captured record
+// is in failure_record_test.go), so the branch that initializes an SSH repository whose
+// directory exists but was never initialized never ran and those backups failed forever.
+const (
+	MsgIDRepositoryMissing = missingRepositoryMsgID
+
+	// MsgIDRepositoryInvalid means the path holds something that is not a repository —
+	// including the empty directory a `mkdir -p` leaves on the SSH backup server ahead of
+	// `borg init`. NOT the same fact as MsgIDRepositoryMissing (see
+	// looksLikeMissingRepository), which is why both are here.
+	MsgIDRepositoryInvalid = "Repository.InvalidRepository"
+)
 
 // stampMissingRepository supplies that msgid when borg reported the condition in words
 // but the record reached us without one.
@@ -113,9 +155,12 @@ func (r *Repository) FindArchive(name string) (a *Archive, err *LogMessage) {
 	return a, nil
 }
 
-func (r *Repository) Setup(vol *types.Volume, source *types.Volume) *LogMessage {
+// Setup initializes r's repository (borg init), building the backup container against
+// target if one is not already running. r.Name is the repository being created; target only
+// supplies the /mnt/data mount and the label saying what the container is for.
+func (r *Repository) Setup(target *types.Volume) *LogMessage {
 	if reflect.ValueOf(r.Container).IsNil() {
-		containerBuilt, containerErr := r.InitBackupContainer(vol, source)
+		containerBuilt, containerErr := r.InitBackupContainer(target)
 		if containerErr != nil {
 			sentry.CaptureException(containerErr)
 			return &LogMessage{Message: containerErr.Error()}
@@ -123,6 +168,16 @@ func (r *Repository) Setup(vol *types.Volume, source *types.Volume) *LogMessage 
 		if !containerBuilt {
 			return &LogMessage{Message: "Failed to build backup container"}
 		}
+	}
+
+	// The SSH backend's repository directory has to exist before `borg init` can write
+	// into it, and this is the only place that creates it — Setup is the one operation
+	// that is allowed to bring a repository into being. It sits OUTSIDE the block above
+	// because the container may already be running (FindRepository built one before it
+	// discovered the repository was missing), and the mkdir is still owed in that case.
+	if err := r.ensureRemoteRepoPath(); err != nil {
+		sentry.CaptureException(err)
+		return &LogMessage{Message: err.Error()}
 	}
 
 	var backupCmd []string
@@ -239,8 +294,7 @@ func (r *Repository) Contents() (RepositoryContentResponse, *LogMessage) {
 }
 
 func (r *Repository) Delete() (bool, error) {
-	vol := types.Volume{Name: r.Name, Trash: true}
-	return r.TrashBackupVolumeExists(&vol)
+	return r.TrashBackupVolumeExists()
 }
 
 /*
@@ -253,10 +307,12 @@ func (r *Repository) Delete() (bool, error) {
 		   an hourly retention of 2 will only retain 1 because the content would not have changed between the 2 backups.
 */
 func (r *Repository) Prune() *LogMessage {
+	// Trash: true, so the container gets no /mnt/data mount — prune only ever touches the
+	// repository. It is the repository's own volume either way: a prune is always run
+	// against a volume this node owns.
 	vol := types.Volume{Name: r.Name, Trash: true}
-	sourceVol := types.Volume{Name: r.SourceVolumeName, Trash: true}
 	if reflect.ValueOf(r.Container).IsNil() {
-		containerBuilt, containerErr := r.InitBackupContainer(&vol, &sourceVol)
+		containerBuilt, containerErr := r.InitBackupContainer(&vol)
 		if containerErr != nil {
 			sentry.CaptureException(containerErr)
 			return &LogMessage{Message: containerErr.Error()}
@@ -302,10 +358,11 @@ func (r *Repository) Compact() *LogMessage {
 }
 
 func (r *Repository) compactContainer() *LogMessage {
+	// As in Prune: Trash: true means no /mnt/data mount, because a compact rewrites the
+	// repository's segments and never reads the volume.
 	vol := types.Volume{Name: r.Name, Trash: true}
-	sourceVol := types.Volume{Name: r.SourceVolumeName, Trash: true}
 	if reflect.ValueOf(r.Container).IsNil() {
-		containerBuilt, containerErr := r.InitBackupContainer(&vol, &sourceVol)
+		containerBuilt, containerErr := r.InitBackupContainer(&vol)
 		if containerErr != nil {
 			sentry.CaptureException(containerErr)
 			return &LogMessage{Message: containerErr.Error()}
@@ -388,6 +445,23 @@ func (r *Repository) Sync() {
 		return
 	}
 
+	// A node reports observed state only for the volumes it owns. The row is keyed on
+	// r.Name and the changelog entry is ingested by the controller, so syncing a
+	// repository that belongs to another node's volume would publish a repositories row
+	// this node has no business writing — reachable now that r.Name can be a volume other
+	// than the task's own (Archive.Delete calls Sync, and an archive delete can be
+	// cross-volume). Every current path — backup, prune, compact, trash — operates on this
+	// node's own volumes, so this suppresses nothing that is correct today.
+	//
+	// Only a definite "not here" skips. A store that could not answer leaves today's
+	// behaviour alone rather than dropping a legitimate sync over a transient read error.
+	if _, found, err := r.Store.GetVolume(context.Background(), r.Name); err != nil {
+		borgLogger().Debug("Could not confirm repository ownership before sync", "repository", r.Name, "error", err.Error())
+	} else if !found {
+		borgLogger().Debug("Skipping repository sync for a volume this node does not own", "repository", r.Name)
+		return
+	}
+
 	// get list of archives
 	contents, contentsErr := r.Contents()
 	if contentsErr != nil {
@@ -418,12 +492,25 @@ func (r *Repository) Sync() {
 }
 
 func (r *Repository) repoPath() string {
+	return repoPathFor(r.Name)
+}
+
+// repoPathFor is repoPath keyed on a bare name, so containerSpec can build BORG_REPO
+// without a *Repository to hang it on — the container spec is the seam the
+// repoOwner-vs-target invariant is tested at, and it must be callable without docker.
+//
+// name is ALWAYS the repository owner. On the SSH backend it is spliced into the remote
+// URL, which is exactly where naming the repository after the target volume sent a restore
+// to the wrong repository. On local/NFS the docker volume mounted at /mnt/borg IS the
+// repository, so the path is a constant and the owner is expressed by which volume got
+// mounted there.
+func repoPathFor(name string) string {
 	if viper.GetBool("backups.borg.ssh.enabled") {
 		sshUser := viper.GetString("backups.borg.ssh.user")
 		sshHost := viper.GetString("backups.borg.ssh.host")
 		sshPort := viper.GetString("backups.borg.ssh.port")
 		hostPath := viper.GetString("backups.borg.ssh.host_path")
-		fullPath := "ssh://" + sshUser + "@" + sshHost + ":" + sshPort + hostPath + "/b-" + r.Name + "/backup"
+		fullPath := "ssh://" + sshUser + "@" + sshHost + ":" + sshPort + hostPath + "/b-" + name + "/backup"
 		return fullPath
 	} else {
 		return "/mnt/borg/backup"

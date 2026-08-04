@@ -177,10 +177,16 @@ func rollbackCommand(src, dst string) string {
 // lives in preRestore rather than in the borg layer — preRestore is gated on success
 // before anything touches the archive, so by the time any rollback can be reached the
 // snapshot has already been taken.
-func takeRestoreSnapshot(event *progress, repo *borg.Repository) bool {
+//
+// volume is the TARGET volume's name, passed in rather than read off repo.Name, which is
+// the volume that owns the repository being restored FROM. /mnt/data is the target's, so on
+// a cross-volume restore or a clone repo.Name named the wrong volume — and this line fires
+// while the target's contents are mid-move, where saying which volume is at risk is the
+// whole value of the log line.
+func takeRestoreSnapshot(event *progress, repo *borg.Repository, volume string) bool {
 	res := repo.RunShell("restore snapshot", []string{snapshotCommand(dataPath, snapshotPath)})
 	if res.Failure != nil {
-		backupLogger().Warn("Failed to snapshot existing data", "volume", repo.Name, "exitCode", res.ExitCode, "error", res.Failure.Message)
+		backupLogger().Warn("Failed to snapshot existing data", "volume", volume, "exitCode", res.ExitCode, "error", res.Failure.Message)
 		event.PostEventUpdate("agent-82c8d22caa01995d", withOutput("Failed to move the existing volume data aside, halting restore: "+res.Failure.Message, res.Response))
 		return false
 	}
@@ -189,10 +195,14 @@ func takeRestoreSnapshot(event *progress, repo *borg.Repository) bool {
 
 // rollbackRestoreSnapshot puts the snapshot back, over whatever the failed restore left
 // behind. See rollbackCommand for why the command it runs lives in its own function.
-func rollbackRestoreSnapshot(event *progress, repo *borg.Repository) bool {
+//
+// volume is the TARGET volume's name, for the reason takeRestoreSnapshot's is: /mnt/data
+// belongs to the target while repo.Name is the source's repository, and this is the line an
+// operator reads when a customer's data did not make it back into the volume.
+func rollbackRestoreSnapshot(event *progress, repo *borg.Repository, volume string) bool {
 	res := repo.RunShell("restore rollback", []string{rollbackCommand(snapshotPath, dataPath)})
 	if res.Failure != nil {
-		backupLogger().Warn("Failed to roll back restore snapshot", "volume", repo.Name, "exitCode", res.ExitCode, "error", res.Failure.Message)
+		backupLogger().Warn("Failed to roll back restore snapshot", "volume", volume, "exitCode", res.ExitCode, "error", res.Failure.Message)
 		event.PostEventUpdate("agent-af1b0badd5d9b9f6", withOutput("Failed to move the snapshot back into the volume: "+res.Failure.Message, res.Response))
 		return false
 	}
@@ -363,7 +373,7 @@ func preRestore(vol *types.Volume, event *progress, repo *borg.Repository) (preR
 		return false
 	}
 
-	return takeRestoreSnapshot(event, repo)
+	return takeRestoreSnapshot(event, repo, vol.Name)
 }
 
 func postRestore(vol *types.Volume, event *progress, repo *borg.Repository) bool {
@@ -456,7 +466,7 @@ func rollbackRestore(vol *types.Volume, event *progress, repo *borg.Repository) 
 	// any volume with a PostRestore command configured the put-back was never reached,
 	// and the deferred repo.StopContainer() then took the only copy of the customer's
 	// data with the AutoRemove container.
-	if !rollbackRestoreSnapshot(event, repo) {
+	if !rollbackRestoreSnapshot(event, repo, vol.Name) {
 		return rollbackSnapshotLost
 	}
 

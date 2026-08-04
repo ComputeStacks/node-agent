@@ -15,7 +15,7 @@ import (
 func Trash(ctx context.Context, st *store.Store, task store.Task, projectEvent *progress) error {
 	// No handler-level sentry.Recover(): let a panic reach the worker terminal
 	// guard so a crashed teardown is FAILED (never a false "completed").
-	repo := borg.Repository{Name: task.Volume, SourceVolumeName: task.Volume, Store: st}
+	repo := borg.Repository{Name: task.Volume, Store: st}
 	if _, err := repo.Delete(); err != nil {
 		projectEvent.EventLog.Status = "failed"
 		projectEvent.PostEventUpdate("agent-volume-trash-failed", err.Error())

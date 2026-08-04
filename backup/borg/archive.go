@@ -593,7 +593,10 @@ func (a *Archive) Delete() ([]LogMessage, *LogMessage) {
 	}
 	a.Repository.Sync()
 
-	borgLogger().Info("Completed Archive Delete event", "volume", a.Repository.Name, "archive", a.Name)
+	// "repository", not "volume": Repository.Name is the volume that OWNS the repository
+	// the archive was deleted from, which on a cross-volume delete is not the volume the
+	// task named.
+	borgLogger().Info("Completed Archive Delete event", "repository", a.Repository.Name, "archive", a.Name)
 	return results, nil
 }
 

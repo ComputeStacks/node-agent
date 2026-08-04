@@ -73,9 +73,14 @@ type LogMessage struct {
 
 // Repo format from ComputeStack Volumes
 type Repository struct {
-	Name             string
-	SourceVolumeName string
-	Container        *containermgr.Container // Track what container we're using to perform this backup
+	// Name is the volume that OWNS the repository, never the volume an operation is
+	// pointed at. The two differ on a cross-volume restore or archive delete, and
+	// everything that names the repository derives from this one field: repoPath's
+	// BORG_REPO, the b-<name> cache volume, the remote path on the SSH/NFS server and
+	// the repositories row Sync upserts. A restore of volume A into volume B has to
+	// open A's repository, so Name is A and only the /mnt/data mount is B.
+	Name      string
+	Container *containermgr.Container // Track what container we're using to perform this backup
 	// Store is the control.db handle used to report observed repo state UP
 	// (size/archives) via Sync — the successor to the Consul borg/repository key.
 	// Set at construction (FindRepository / the &Repository{} literals); Sync is a
