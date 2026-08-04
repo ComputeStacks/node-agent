@@ -187,6 +187,8 @@ func TestWroteCompleteArchive(t *testing.T) {
 		vanished          = backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		vanishedAndDenied = backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		bothBenign        = fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		raced             = backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		vanishedAndRaced  = backupFileNotFoundErrorRecord + "\r\n" + backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 	)
 
 	for _, i := range []struct {
@@ -272,6 +274,19 @@ func TestWroteCompleteArchive(t *testing.T) {
 			want: false,
 		},
 		{
+			// The near miss: same tier and the same flux story as a vanished file, but borg
+			// skipped a file the volume still has. See TestRaceConditionIsNotBenign.
+			name: "raced file alone",
+			res:  ExecResult{ExitCode: borgWarningExit, Response: raced},
+			want: false,
+		},
+		{
+			// And it is not vouched for by the benign record beside it.
+			name: "vanished and raced together",
+			res:  ExecResult{ExitCode: borgWarningExit, Response: vanishedAndRaced},
+			want: false,
+		},
+		{
 			name: "warning record with no payload",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: fileChangedWarningRecord + "\r\n"},
 			want: false,
@@ -294,6 +309,38 @@ func TestWroteCompleteArchive(t *testing.T) {
 				t.Errorf("Received %v, wanted %v", got, i.want)
 			}
 		})
+	}
+}
+
+// TestRaceConditionIsNotBenign pins the one create warning that reads benign and is not,
+// because the argument for adding it is going to be made again.
+//
+// BackupRaceConditionError tells the same story as the two entries that ARE benign: a live
+// volume changed under the backup. borg raises it from stat_update_check when a path's type
+// or inode changed between the name-based stat in its walk and the fd-based fstat in the
+// type handler — an application atomically replacing a file, which is the normal shape of a
+// safe write and happens for the same reasons FileChangedWarning does.
+//
+// What settles it is not the story but where the file ended up. Measured on borg 1.4.4 with
+// 164,395 inode swaps against a walk of 20,000 files: 2 records, rc 1, archive committed,
+// and nfiles 19,998 — exactly two short. borg skips the raced file, and the path still holds
+// a file on the volume. Absent from the archive, present on the volume: that is
+// BackupPermissionError's verdict, so the backup must fail and report it.
+//
+// The msgid also cannot be dismissed as unreachable or as belonging to a different tier: it
+// is a BackupError subclass, so borg reports it through BackupWarning at levelname WARNING
+// and exit 1, and the captured record proves the whole shape.
+func TestRaceConditionIsNotBenign(t *testing.T) {
+	quoted, ok := failureRecord(backupRaceConditionErrorRecord + "\r\n")
+	if !ok {
+		t.Fatal("the captured record was not read back as a record")
+	}
+	if quoted.MsgID != "BackupRaceConditionError" || quoted.LevelName != "WARNING" {
+		t.Fatalf("Received msgid %q at %q, wanted BackupRaceConditionError at WARNING — the fixture no longer carries the measured shape", quoted.MsgID, quoted.LevelName)
+	}
+	if benignCreateWarnings[quoted.MsgID] {
+		t.Error("BackupRaceConditionError is on the benign allowlist; borg skips the raced file and the volume still has it, " +
+			"so a backup downgraded on this warning is short of the volume — the false green the allowlist exists to prevent")
 	}
 }
 
@@ -397,6 +444,13 @@ func TestNonBenignCreateWarning(t *testing.T) {
 			name:      "vanished before non-benign",
 			response:  backupFileNotFoundErrorRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY,
 			wantMsgID: "BackupPermissionError",
+		},
+		{
+			// A raced file is the offender in its own right, and it must be the reason the
+			// operator is shown rather than the benign record borg happened to log first.
+			name:      "raced after benign",
+			response:  fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY,
+			wantMsgID: "BackupRaceConditionError",
 		},
 		{
 			// The order that matters: the benign record comes FIRST, which is what

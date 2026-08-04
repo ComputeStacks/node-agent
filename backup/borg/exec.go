@@ -202,9 +202,14 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 //     reason FileChangedWarning does not — the window has to be hit — and it happens on
 //     any volume an application is writing to. Measured on borg 1.4.4: 1,181 records and
 //     nfiles 18,648 of 20,000 over a directory losing its tail mid-walk.
+//   - BackupRaceConditionError, where a path's type or inode changed between borg's
+//     name-based stat and its fd-based fstat. borg skips the file and commits an archive
+//     without it, while the path still holds a file on the volume — so it shares this tier
+//     with the three above and its VERDICT with BackupPermissionError.
 //
-// Those three are why a downgrade must turn on borg's msgid and never on the exit code
-// alone.
+// Those four are why a downgrade must turn on borg's msgid and never on the exit code
+// alone, and why the msgid alone is not enough either: two of the four exit 1 with a
+// complete archive and two exit 1 with a file missing from it.
 func classify(label string, borgJSON bool, exitCode int, response string) *LogMessage {
 	if exitCode == 0 {
 		return nil

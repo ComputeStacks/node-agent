@@ -47,13 +47,23 @@ func lockWait(op string) string {
 // FileChangedWarning leaves a possibly-torn copy IN the archive.
 //
 // Still an allowlist rather than a denylist, and every entry is a captured record rather
-// than an assumption about what borg "probably" means. BackupPermissionError exits
-// borgWarningExit at the same WARNING severity, and its file is absent from the archive
-// while still sitting on the volume (verified: `borg list` omits it, nfiles is short) —
-// keeping that one failing is the whole point of the set, and the same goes for its
-// sibling BackupIOError and for the generic BackupError. An unrecognised warning must fail
-// rather than be assumed harmless. When one does, the task carries borg's own message, so
-// widening this set is a deliberate, evidenced decision rather than a silent default.
+// than an assumption about what borg "probably" means. What stays OFF the list, and why:
+//
+//   - BackupPermissionError exits borgWarningExit at the same WARNING severity, and its
+//     file is absent from the archive while still sitting on the volume (verified: `borg
+//     list` omits it, nfiles is short). Keeping that one failing is the whole point of the
+//     set, and the same goes for its sibling BackupIOError and the generic BackupError.
+//   - BackupRaceConditionError is the one that looks like it belongs here and does not.
+//     borg raises it when a path's type or inode changed between its name-based stat and
+//     the fd-based fstat in the type handler, which reads like the same "live volume in
+//     flux" story as the two entries above — but borg SKIPS the file (measured: nfiles came
+//     back exactly as short as the record count), and the path still holds a file on the
+//     volume. Absent from the archive, present on the volume: that is the permission
+//     error's category, not this set's.
+//
+// An unrecognised warning must fail rather than be assumed harmless. When one does, the
+// task carries borg's own message, so widening this set is a deliberate, evidenced decision
+// rather than a silent default.
 //
 // One case this cannot separate, and accepts knowingly: a DIRECTORY renamed mid-walk
 // raises the same ENOENT for the entries under it, and that subtree does still exist on

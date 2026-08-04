@@ -18,30 +18,41 @@ const (
 	commandErrorRecord        = `{"type": "log_message", "time": 1785448776.8795714, "message": "Command Error: At least one of the \"keep-within\", \"keep-last\", \"keep-secondly\", \"keep-minutely\", \"keep-hourly\", \"keep-daily\", \"keep-weekly\", \"keep-monthly\", \"keep-13weekly\", \"keep-3monthly\", or \"keep-yearly\" settings must be specified.", "levelname": "ERROR", "name": "borg.archiver", "msgid": "CommandError"}`
 )
 
-// The three `borg create` warning-tier records, captured from
-// `borg --log-json create --json ::w .` (no --error) against the same image: one run with
-// a file being rewritten while borg read it, one with a file borg could not open, and one
-// with files deleted while borg walked their directory. All three exit 1 at levelname
-// WARNING, and they do NOT mean the same thing for whether the customer is protected —
-// which is the whole reason benignCreateWarnings keys on the msgid:
+// The four `borg create` warning-tier records, captured from
+// `borg --log-json create --json ::w .` (no --error) against the same image. All four exit
+// 1 at levelname WARNING, and they do NOT mean the same thing for whether the customer is
+// protected — which is the whole reason benignCreateWarnings keys on the msgid. What
+// separates them is whether the archive still matches the volume:
 //
 //   - FileChangedWarning's file IS in the archive (its content may be a torn read);
+//   - BackupFileNotFoundError's file is absent from the archive AND from the volume;
 //   - BackupPermissionError's file is silently absent while still sitting on the volume —
 //     verified with `borg list`;
-//   - BackupFileNotFoundError's file is absent from the archive AND from the volume.
+//   - BackupRaceConditionError's file is ALSO absent while still sitting on the volume,
+//     which is why it groups with the permission error and not with the two above it,
+//     despite reading like a benign flux warning. See TestRaceConditionIsNotBenign.
 //
 // One record is emitted per warned file, before the --json payload.
 //
-// The ENOENT record is verbatim from a run whose method explains its filename: 20,000
-// 4 KiB files in one directory, with the tail of the listing deleted after create started.
-// borg lists a directory and then stat()s each entry, so the deletes landed inside that
-// window — 1,181 records, every one of them BackupFileNotFoundError at WARNING, rc 1, and
-// an archive committed with nfiles 18,648 of 20,000. A hand-made delete of a single file
-// exits 0; the window has to be hit, which is why this needed a tree rather than one file.
+// Both new records come from runs whose method explains their filenames — 20,000 4 KiB
+// files in one directory, which is what it takes to hit these windows; neither reproduces
+// on a hand-made single file:
+//
+//   - ENOENT: the tail of the listing deleted after create started. borg lists a directory
+//     and then stat()s each entry, so the deletes landed inside that window. 1,181 records,
+//     every one BackupFileNotFoundError at WARNING, rc 1, archive committed with nfiles
+//     18,648 of 20,000.
+//   - Race condition: 164,395 single-rename() inode swaps from a pre-made pool, spread over
+//     8 of those filenames while create walked them. borg compares its name-based stat
+//     against the fd-based fstat in the type handler (archive.py stat_update_check) and
+//     raises on a changed type or inode. 2 records, rc 1, archive committed with nfiles
+//     19,998 of 20,000 — exactly two short, which is the measurement that says the raced
+//     files were SKIPPED rather than retried.
 const (
-	fileChangedWarningRecord      = `{"type": "log_message", "time": 1785723905.7213852, "message": "big.bin: file changed while we backed it up", "levelname": "WARNING", "name": "borg.archiver", "msgid": "FileChangedWarning"}`
-	backupPermissionErrorRecord   = `{"type": "log_message", "time": 1785723999.1000000, "message": "secret.txt: open: [Errno 13] Permission denied: 'secret.txt'", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupPermissionError"}`
-	backupFileNotFoundErrorRecord = `{"type": "log_message", "time": 1785865693.9905984, "message": "f08169: stat: [Errno 2] No such file or directory: 'f08169'", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupFileNotFoundError"}`
+	fileChangedWarningRecord       = `{"type": "log_message", "time": 1785723905.7213852, "message": "big.bin: file changed while we backed it up", "levelname": "WARNING", "name": "borg.archiver", "msgid": "FileChangedWarning"}`
+	backupPermissionErrorRecord    = `{"type": "log_message", "time": 1785723999.1000000, "message": "secret.txt: open: [Errno 13] Permission denied: 'secret.txt'", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupPermissionError"}`
+	backupFileNotFoundErrorRecord  = `{"type": "log_message", "time": 1785865693.9905984, "message": "f08169: stat: [Errno 2] No such file or directory: 'f08169'", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupFileNotFoundError"}`
+	backupRaceConditionErrorRecord = `{"type": "log_message", "time": 1785866746.1638827, "message": "f10002: file type or inode changed while we backed it up (race condition, skipped file)", "levelname": "WARNING", "name": "borg.archiver", "msgid": "BackupRaceConditionError"}`
 )
 
 // Constructed rather than captured: no msgid-less ERROR and no question record turned
