@@ -8,17 +8,27 @@ one new configuration key (`backups.borg.lock_wait_restore`), and one additive t
 reported no usable reason for it, and the reason is the only thing that says which files did not
 come back.
 
-It also carries one backup fix and three fixes to the `ssh` backup backend, which are the last four
-entries below. **Upgrade if files are created and deleted on a volume while it is being backed up:
-on those volumes a backup can be reported as failed even though the archive was created correctly.**
+It also carries a restore data-loss fix, one change to what a backup archives, and a group of fixes
+to the `ssh` backup backend covering which repository an operation opens, which operations may
+create one, and how repository names reach the backup server. **Upgrade if you run restores.** A
+restore whose preparation step failed partway could destroy the volume's set-aside contents and
+leave the service stopped — that is the most serious thing fixed here, and it is fixed for every
+strategy.
 
-Five changes alter behaviour rather than only reporting, and each is called out inline below: a
+**If you host WordPress, this release also stops a daily backup failure.** WordPress writes a
+filesystem write-probe file and deletes it milliseconds later; `borg` catching it mid-flight
+reported the whole backup as failed. The probe is now excluded from backups. Archives from backups
+reported failed this way were always valid and restorable, so there is nothing to re-run.
+
+Nine changes alter behaviour rather than only reporting, and each is called out inline below: a
 restore that names individual file paths is refused; a restore waits up to 120 seconds for the
 repository lock instead of 1; a failed restore's `result_json.error` carries the reason rather than
 the literal string `task reported failure`, which matters if anything downstream matches on that
-text; a backup whose only warnings are files deleted while it ran now completes instead of failing;
-and on the `ssh` backend a restore whose source is a different volume now reads that volume's
-repository rather than the destination's.
+text; a restore whose preparation failed partway puts the volume's contents back, and leaves the
+service stopped if it cannot; a restore no longer creates a repository; on the `ssh` backend a
+restore whose source is a different volume now reads that volume's repository rather than the
+destination's; only a backup creates a repository directory on the backup server; a node publishes
+repository state only for its own volumes; and WordPress's write-probe file is no longer archived.
 
 - [CHANGE] **A restore that names individual file paths is refused.** A restore replaces the whole
   volume — the volume's current contents are set aside, the archive is extracted over it, and the
@@ -60,18 +70,60 @@ repository rather than the destination's.
   The new `backups.borg.lock_wait_restore` defaults to 120 seconds. It is deliberately shorter than
   `lock_wait_create`: the wait happens with the service stopped and the volume already set aside, so
   it is bounded rather than maximised.
-- [FIX] **A file deleted while a backup is running no longer fails the backup.** `borg` lists a
-  directory and then reads each entry in turn, and a file removed between those two steps is recorded
-  as a warning, skipped, and the archive committed without it. The agent treated that warning as a
-  failed backup, so on a volume where an application creates and removes files as it works — a
-  temporary file, an upload being moved into place, a cache being cleared — backups could fail while
-  `borg` was in fact producing correct archives. The archive still matches the volume in that case,
-  because the file is gone from the volume too, so the task now completes, `last_backup` advances, and
-  the file `borg` named is reported in the `backup_warning` field. **Archives from backups reported
-  failed this way are valid and restorable** — the backup itself succeeded and only the reported
-  outcome was wrong, so there is nothing to re-run. A warning that means a file is still on the volume
-  but absent from the archive — `borg` being unable to read it, for example — continues to fail the
-  backup, unchanged.
+- [FIX] **A restore whose preparation failed partway no longer destroys the volume's contents.**
+  Before extracting an archive, a restore stops the service and moves the volume's current contents
+  aside into the backup container, so that a restore which fails can be undone. That move is a copy
+  followed by a delete rather than a rename, so a failure partway through it leaves part of the
+  volume in the container and the rest still in place — and the agent then tore that container down,
+  taking the moved part with it, and returned without restarting the service. The contents are now
+  put back before the container is torn down, and the service is started again. The put-back never
+  overwrites a file the volume still has, so a half-copied file cannot displace the volume's own
+  intact copy. Where the put-back itself cannot complete, the service is deliberately left stopped
+  and the reported reason says so: a volume that may be missing data is not one to start an
+  application over.
+- [CHANGE] **WordPress's filesystem write-probe is no longer backed up.** WordPress writes
+  `temp-write-test-<uniqid>` beside the directory it is testing, stats it, and deletes it
+  milliseconds later, on every install. `borg` lists a directory and then reads each entry in turn,
+  and a file removed between those two steps is recorded as a warning — so on WordPress volumes this
+  probe could fail a backup daily while naming a file that had no business being in an archive. It
+  is now excluded, so `borg` never walks it and no warning is raised. Files and directories whose
+  names merely begin with `temp-write-test-` are unaffected: the exclusion matches the probe's exact
+  shape, not the prefix.
+- [CHANGE] **A restore no longer creates a repository.** On the `ssh` backend a restore used to run
+  `borg init` when `borg` reported the repository missing, on the belief that the missing repository
+  was the destination's. It is the source's — the volume the archive is read from — so that verdict
+  means there is nothing to restore from. A restore whose source has never been backed up now fails
+  immediately with `borg`'s own reason, instead of creating an empty repository on the backup server
+  and then failing at the archive lookup anyway.
+- [CHANGE] **Only a backup creates a repository directory on the `ssh` backup server.** Every
+  operation that opened a repository — restores, exports, prunes, archive deletes — used to `mkdir`
+  its directory on the backup server on the way past, including for volumes that had never been
+  backed up. Creating a repository is now a backup's job alone. An existing backup server may hold
+  empty `b-<volume>/backup` directories left behind by those operations; they are inert, and no more
+  will appear.
+- [CHANGE] **A node publishes repository state only for its own volumes.** The `repositories` row a
+  node reports is keyed on the repository's name, and an archive delete can name a repository
+  belonging to a different volume than the task does. A node no longer publishes a row for a
+  repository it does not own.
+- [FIX] **A short pull no longer publishes an apt index that drops every older version.** A release
+  publishes by downloading the existing package pool, rebuilding the index from whatever that
+  download left on disk, and uploading the result — so a download that quietly came back short
+  published an index listing only the release being cut, silently un-installing every version before
+  it. The pool download now checks each object against the size the store reported, retries a
+  connection reset that happens while the response body is being read (which the AWS SDK's own
+  retryer cannot cover, because the request itself already succeeded), gives each attempt a deadline
+  so a stalled transfer cannot hang the job with the release already cut, refuses an empty listing,
+  and fails the whole pull rather than one object. Re-running a release tag is idempotent now too.
+  This matters because the rollback instructions further down these notes depend on older versions
+  staying installable.
+- [FIX] **A failed backup now reports the warning worth acting on, not the loudest one.** `borg`
+  logs one record per file it warned about, and a failed backup reports one of them — the rest are
+  only in the node's debug log. It reported whichever came first, and on a volume with an active
+  application the files that vanished while `borg` walked them are the overwhelming majority, so the
+  one record that says a file could not be READ — the file that is missing from the archive and
+  still sitting on the volume — was buried behind a path that had simply been deleted. A warning
+  that means data was left out of the archive is now reported ahead of one that only means a file
+  went away. Which warnings fail a backup is unchanged; only which of them is quoted.
 - [FIX] **Repository names are validated before they are used in commands on the backup server.** The
   agent builds a small number of commands that run on the backup server over SSH — creating and
   removing a repository's directory — and a repository name reached those commands without being
