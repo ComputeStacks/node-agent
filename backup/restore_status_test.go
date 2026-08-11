@@ -459,6 +459,157 @@ func TestRestoreReturnsTheCarriedReason(t *testing.T) {
 	}
 }
 
+// TestPreRestoreFailureRecoversBeforeTheContainerGoes guards the ordering that is the whole
+// of the pre-restore failure branch's value.
+//
+// takeRestoreSnapshot moves /mnt/data into /root/.snapshot, and that is a cross-device
+// copy-and-unlink because the snapshot lives on the backup container's own writable layer
+// (see restore_hooks.go). So a preRestore that fails there fails with the volume's contents
+// split between the two, and the container is created with AutoRemove: repo.StopContainer()
+// destroys everything already moved. This branch used to call it on its first line, which
+// turned a partial move into permanent loss of exactly the part that had moved.
+//
+// SCOPED to the `if !preRestoreSuccess` block deliberately. Restore has a deferred
+// repo.StopContainer() near the top plus three more direct calls in the failure branches
+// above this one, so a guard phrased as "the first StopContainer call in Restore" would pass
+// no matter what this branch does — and would then get loosened rather than fixed the day it
+// started failing.
+func TestPreRestoreFailureRecoversBeforeTheContainerGoes(t *testing.T) {
+	fset, body := parseRestoreBody(t)
+	branch := preRestoreFailureBranch(t, body)
+
+	recoveries := callPositions(branch.Body, "recoverPartialSnapshot")
+	if len(recoveries) == 0 {
+		t.Fatal("the `if !preRestoreSuccess` branch does not call recoverPartialSnapshot; a snapshot " +
+			"move that failed partway leaves the volume's contents in /root/.snapshot, and the " +
+			"AutoRemove backup container is stopped moments later with them still inside it")
+	}
+	stops := callPositions(branch.Body, "repo.StopContainer")
+	if len(stops) == 0 {
+		t.Fatal("the `if !preRestoreSuccess` branch no longer calls repo.StopContainer; the branch " +
+			"returns before Restore's deferred stop is the only one left, which is fine — but this " +
+			"guard's ordering assertion has nothing to hold, so re-express it against whatever " +
+			"reaps the container now")
+	}
+
+	if recoveries[0] > stops[0] {
+		t.Errorf("recoverPartialSnapshot (%s) runs after repo.StopContainer (%s); the container is "+
+			"AutoRemove and /root/.snapshot is inside it, so by then whatever the failed snapshot "+
+			"move had already copied out of the volume is gone for good",
+			fset.Position(recoveries[0]), fset.Position(stops[0]))
+	}
+}
+
+// TestPreRestoreFailureRestartsOnlyWhenRecovered guards the other half of the branch, which
+// no test of the returned error can see: whether the customer's service comes back up.
+//
+// Before the fix this branch returned early, ahead of Restore's tail restart loop, so a
+// failed pre-restore left every container of the service stopped indefinitely — nothing in
+// the reported reason says so.
+//
+// The restart is conditional and that is not an accident either. If the put-back did not
+// complete, /mnt/data can be materially emptier than the customer left it, and a
+// mysql/mariadb entrypoint reads an empty datadir as a first run: it initialises a fresh
+// empty database into the volume and the application may take writes on top of it, while
+// the only complete copy is in a container that has just been reaped. So this asserts both
+// that startServiceContainers is reached AND that every call to it sits under the recovery's
+// own result — an unconditional restart passes the first half and is the more dangerous of
+// the two mistakes.
+func TestPreRestoreFailureRestartsOnlyWhenRecovered(t *testing.T) {
+	fset, body := parseRestoreBody(t)
+	branch := preRestoreFailureBranch(t, body)
+
+	// The name the recovery's result is bound to, so the guard is about that value rather
+	// than about a variable that happens to be spelled "recovered".
+	recovered := ""
+	ast.Inspect(branch.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 || recovered != "" {
+			return true
+		}
+		if len(callPositions(assign.Rhs[0], "recoverPartialSnapshot")) == 0 {
+			return true
+		}
+		if id, isIdent := assign.Lhs[0].(*ast.Ident); isIdent {
+			recovered = id.Name
+		}
+		return true
+	})
+	if recovered == "" {
+		t.Fatal("the `if !preRestoreSuccess` branch does not bind recoverPartialSnapshot's result to " +
+			"a variable; its bool is the only report there is that the volume's contents came back, " +
+			"and both the reason this branch returns and whether the service is restarted depend on it")
+	}
+
+	starts := callPositions(branch.Body, "startServiceContainers")
+	if len(starts) == 0 {
+		t.Fatal("the `if !preRestoreSuccess` branch never calls startServiceContainers; it returns " +
+			"before Restore's tail restart, so the customer's service stays stopped indefinitely " +
+			"after a failed pre-restore — and nothing in the reported reason says so")
+	}
+
+	guarded := 0
+	ast.Inspect(branch.Body, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok {
+			return true
+		}
+		if id, isIdent := ifStmt.Cond.(*ast.Ident); !isIdent || id.Name != recovered {
+			return true
+		}
+		guarded += len(callPositions(ifStmt.Body, "startServiceContainers"))
+		return true
+	})
+
+	if guarded != len(starts) {
+		t.Errorf("the `if !preRestoreSuccess` branch calls startServiceContainers %d time(s) but only "+
+			"%d of those are under `if %s` (%s); starting the service over a volume the recovery could "+
+			"not put back lets a mysql entrypoint initialise a fresh empty datadir into it and take "+
+			"writes, on top of the customer's data, while the only complete copy is being reaped",
+			len(starts), guarded, recovered, fset.Position(branch.Pos()))
+	}
+}
+
+// preRestoreFailureBranch returns Restore's `if !preRestoreSuccess { … }` block, which is
+// what the two guards above are scoped to. Matching the condition rather than a statement
+// index keeps them attached to the branch through edits above it, and fails loudly rather
+// than vacuously if the branch is renamed or restructured away.
+func preRestoreFailureBranch(t *testing.T, body *ast.BlockStmt) *ast.IfStmt {
+	t.Helper()
+
+	var found *ast.IfStmt
+	ast.Inspect(body, func(n ast.Node) bool {
+		ifStmt, ok := n.(*ast.IfStmt)
+		if !ok || found != nil {
+			return true
+		}
+		if types.ExprString(ifStmt.Cond) == "!preRestoreSuccess" {
+			found = ifStmt
+		}
+		return true
+	})
+	if found == nil {
+		t.Fatalf("Restore has no `if !preRestoreSuccess` branch; preRestore's failure is what leaves " +
+			"the volume's contents split between /mnt/data and the AutoRemove backup container, and " +
+			"the branch that handles it is where the recovery and the restart live")
+	}
+	return found
+}
+
+// callPositions collects the position of every call to name under n, where name is the
+// rendered callee — so it matches a method call like "repo.StopContainer" as well as a plain
+// function. countCalls below is the ident-only counter the escalation guard uses.
+func callPositions(n ast.Node, name string) []token.Pos {
+	var out []token.Pos
+	ast.Inspect(n, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok && types.ExprString(call.Fun) == name {
+			out = append(out, call.Pos())
+		}
+		return true
+	})
+	return out
+}
+
 // countCalls counts calls to a plain (non-method) function named name anywhere under n.
 func countCalls(n ast.Node, name string) int {
 	count := 0

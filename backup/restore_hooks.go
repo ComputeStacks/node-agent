@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/spf13/viper"
@@ -122,6 +123,73 @@ func moveEntriesCommand(src, dst string) string {
 	return cmd
 }
 
+// mergeEntriesCommand builds a shell command that copies every entry of src into dst
+// WITHOUT overwriting anything dst already has, and without removing anything from src.
+//
+// It is the recovery primitive for a snapshot move that failed partway, and every part of
+// its shape is answering one of the two ways that move can break. Both were measured
+// against the borg image (Debian 13, GNU coreutils 9.7):
+//
+//   - The COPY phase fails — ENOSPC being the motivating case. `mv` leaves the original
+//     intact in src and a TRUNCATED copy in dst, so on the way back the volume's own copy
+//     is the good one and must not be overwritten. That is what `-n` is for.
+//   - The REMOVAL phase fails — an immutable flag, a busy path, EPERM. GNU `mv` across
+//     devices copies the whole tree and only then unlinks the source, so a failure there
+//     leaves the snapshot COMPLETE and the volume missing whatever was already unlinked.
+//     Those files have to come back, and only the ones the volume no longer has.
+//
+// A copy, therefore, and never a move. `mv -n` handles the first shape and SILENTLY fails
+// the second: it cannot merge directories, so when the volume still has the top-level
+// directory it skips the whole subtree — every file under it included — and exits 0.
+// Measured: the put-back reports success, nothing escalates, and the only complete copy is
+// then reaped with the AutoRemove container. `cp -a -n src/. dst/` merges recursively and
+// skips at the level of the individual file, which is the granularity both shapes need.
+//
+// It copies ENTRIES, one at a time, and never `src/.` — which is the whole reason this
+// walks entryGlobs rather than issuing a single cp. `cp -a src/. dst/` copies the `.` entry,
+// and `.` IS the directory, so cp applies the SNAPSHOT directory's ownership, mode and mtime
+// to dst. /root/.snapshot is created by moveEntriesCommand's `mkdir -p` as root:root 0755,
+// so a single-cp recovery handed /mnt/data back as root:root 0755. Measured on a mariadb
+// datadir: 750 999:999 in, 755 0:0 out, with every byte correctly restored — and the caller
+// then restarts the service onto a datadir its own uid can no longer write. An EMPTY
+// snapshot did it too, so the case needed no data to be at risk to break the volume. Copying
+// entries touches dst's own metadata not at all, which is safe by construction rather than
+// by repairing the damage afterwards.
+//
+// No `&&` chain — the opposite of moveEntriesCommand, deliberately. Each pattern's loop runs
+// whatever the last one did, and a per-entry failure only records itself in $s. Fail-fast on
+// the visible entries would abandon exactly the `.env`/`.htaccess`/`.git` set entryGlobs
+// exists for, at the moment they are the only copy left.
+//
+// The status must still SURVIVE. `find -mindepth 1 -maxdepth 1 -exec cp …` expresses the
+// per-entry copy far more neatly and is why it is not used here: measured under ENOSPC it
+// exits 0 while the copy fails, so recoverPartialSnapshot would report a clean recovery over
+// a volume that never got its data back. That is the exact silent-success this whole change
+// exists to remove. The `[ "$s" -eq 0 ]` tail is what carries the verdict out, as the last
+// command in the `if`, so the status needs no `exit` and does not depend on how the caller
+// wraps the string.
+//
+// The `[ -d ]` guard is load-bearing, not defensive. recoverPartialSnapshot is called
+// unconditionally, and /root/.snapshot does not exist when preRestore failed before
+// takeRestoreSnapshot ever ran; cp would then exit 1 with "cannot stat", escalating a
+// restore that never touched the volume.
+//
+// `-n` is marked deprecated in coreutils 9.7 in favour of `--update=none`. It stays: it is
+// far more portable (busybox has it), and backups.borg.image is a floating tag on an image
+// this repo does not build, so the base's coreutils version is not a contract. The
+// behavioural tests in snapshot_command_test.go are what pin the semantics.
+//
+// Nothing is quoted, so src and dst carry entryGlobs' constraint on shell metacharacters.
+// Both call sites pass the two constants above.
+func mergeEntriesCommand(src, dst string) string {
+	cmd := "if [ -d " + src + " ]; then s=0"
+	for _, pattern := range entryGlobs(src) {
+		cmd += `; for p in ` + pattern + `; do { [ -e "$p" ] || [ -L "$p" ]; } || continue; cp -a -n "$p" ` + dst + `/ || s=1; done`
+	}
+	cmd += `; [ "$s" -eq 0 ]; fi`
+	return cmd
+}
+
 // snapshotCommand moves the contents of src into dst. It is the single implementation of
 // the snapshot move, in both of its directions: preRestore uses it to set the volume
 // aside, rollbackRestore uses it with src and dst swapped to put the volume back.
@@ -209,6 +277,35 @@ func rollbackRestoreSnapshot(event *progress, repo *borg.Repository, volume stri
 	return true
 }
 
+// recoverPartialSnapshot puts back whatever a FAILED takeRestoreSnapshot managed to move
+// out of the volume, and it is the only thing standing between that failure and permanent
+// data loss: preRestore's caller stops the backup container immediately afterwards, and
+// /root/.snapshot lives inside it (see the constants above).
+//
+// It is NOT rollbackRestore, and the difference is the whole point. rollbackCommand clears
+// /mnt/data before the put-back, which is correct after an extract has scribbled over the
+// volume — but after a partial snapshot move, /mnt/data holds precisely the entries the
+// move never reached. Clearing them deletes data that the snapshot does not have a copy of,
+// turning a partial loss into a total one. This only ever adds.
+//
+// Safe to call UNCONDITIONALLY, which is why its call site needs no test of how far
+// preRestore got. mergeEntriesCommand's `[ -d ]` guard makes an absent snapshot a no-op
+// success, and that is the state whenever preRestore failed before takeRestoreSnapshot ran
+// — the vol.PreRestore hook, the strategy hooks, or stopServiceContainers.
+//
+// volume is the TARGET volume's name, for the reason takeRestoreSnapshot's is: /mnt/data
+// belongs to the target while repo.Name is the source's repository, and this is the line an
+// operator reads when a customer's data may not have made it back into the volume.
+func recoverPartialSnapshot(event *progress, repo *borg.Repository, volume string) bool {
+	res := repo.RunShell("restore snapshot recovery", []string{mergeEntriesCommand(snapshotPath, dataPath)})
+	if res.Failure != nil {
+		backupLogger().Warn("Failed to recover a partial restore snapshot", "volume", volume, "exitCode", res.ExitCode, "error", res.Failure.Message)
+		event.PostEventUpdate("agent-8d2e948a54277bcd", withOutput("Failed to put the volume's contents back after the pre-restore step failed: "+res.Failure.Message, res.Response))
+		return false
+	}
+	return true
+}
+
 // stopServiceContainers stops every container belonging to the volume's service, so that
 // the snapshot and the extract which follow it do not run underneath a live writer. It is
 // all-or-nothing: if any container refuses to stop, every one of them is started again and
@@ -290,6 +387,34 @@ func stopServiceContainers(vol *types.Volume, event *progress) bool {
 		return false
 	}
 	return true
+}
+
+// startServiceContainers starts the container list Restore captured before preRestore ran.
+// It is the counterpart of stopServiceContainers and lives beside it for that reason; the
+// list is passed in rather than looked up again so that what comes back up is exactly what
+// went down, and not whatever the docker daemon happens to report now.
+//
+// A container that refuses to start is reported and the loop carries on. Stopping at the
+// first failure would leave the rest of the service down over one container's problem, and
+// there is nothing left to protect at this point — every path that reaches here has already
+// finished with the volume.
+//
+// The one-second pause is not politeness: this restarts every container of a service at
+// once, on a node running many of them, and letting a whole service's worth of entrypoints
+// hit the disk simultaneously is what it avoids.
+// volume is the TARGET volume's name, carried for the log line alone. It is the key an
+// operator greps a restore by, and the lifted loop had it; the signature takes it rather
+// than reading repo.Name, which on a cross-volume restore names the source's repository
+// and not the volume whose containers these are.
+func startServiceContainers(containers []*containermgr.Container, event *progress, volume string) {
+	for _, c := range containers {
+		backupLogger().Debug("Finalize Restore: Start Container", "volume", volume, "container", c.ID)
+		if !c.Start() {
+			backupLogger().Warn("Failed to start container", "function", "Restore")
+			event.PostEventUpdate("agent-a15b6d18583615a1", "Failed to start container")
+		}
+		time.Sleep(time.Second) // give each container a second to boot to avoid thrashing the disk
+	}
 }
 
 func preRestore(vol *types.Volume, event *progress, repo *borg.Repository) (preRestoreSuccess bool) {

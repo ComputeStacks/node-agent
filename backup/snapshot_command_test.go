@@ -530,6 +530,222 @@ func TestRollbackCommandRestoresDotfiles(t *testing.T) {
 	}
 }
 
+// mergeDirs returns an existing snapshot and an existing volume directory, which is the
+// state mergeEntriesCommand recovers from: takeRestoreSnapshot has created /root/.snapshot
+// and moved some of /mnt/data into it before failing. Both are free of shell
+// metacharacters, as the production paths are and as the command requires.
+func mergeDirs(t *testing.T) (snapshot, data string) {
+	t.Helper()
+	base := t.TempDir()
+	snapshot = filepath.Join(base, "snapshot")
+	data = filepath.Join(base, "data")
+	for _, dir := range []string{snapshot, data} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+	}
+	return snapshot, data
+}
+
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(content)
+}
+
+// Failure shape 1: the snapshot move's COPY phase failed, ENOSPC being the motivating case.
+// GNU mv writes the destination first, so the volume still holds the intact original and
+// the snapshot holds a truncated copy of it. The put-back must therefore never overwrite a
+// file the volume still has — recovering here would mean replacing the customer's data with
+// the fragment of it that fitted on the container's writable layer.
+//
+// `-n` is the whole of what makes that true, and nothing else in this file would notice its
+// removal.
+func TestMergeEntriesCommandKeepsTheVolumesOwnCopy(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	writeFile(t, filepath.Join(data, "big.bin"), "the whole of the customer's file")
+	writeFile(t, filepath.Join(snapshot, "big.bin"), "the whole of")
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if got, want := readFile(t, filepath.Join(data, "big.bin")), "the whole of the customer's file"; got != want {
+		t.Errorf("volume's file = %q, want %q — the truncated snapshot copy overwrote the intact original", got, want)
+	}
+}
+
+// Failure shape 2: the snapshot move's REMOVAL phase failed — an immutable flag, a busy
+// path, EPERM. Across devices GNU mv copies the whole tree and only then unlinks the
+// source, so the snapshot is COMPLETE and the volume is missing whatever was already
+// unlinked. Those files are the ones that have to come back, and only those.
+//
+// This is the case `mv -n` cannot serve and the reason the command is a copy: mv sees the
+// destination directory `d` already exists, skips the entire subtree, and exits 0 — a
+// recovery that reports success while a.txt stays in a container about to be reaped.
+// Merging has to happen per file, not per top-level entry, which is what this asserts.
+func TestMergeEntriesCommandRestoresWhatTheVolumeIsMissing(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	for _, dir := range []string{filepath.Join(snapshot, "d", "sub"), filepath.Join(data, "d", "sub")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("creating %s: %v", dir, err)
+		}
+	}
+	// a.txt was already unlinked from the volume; b.txt had not been reached yet.
+	writeFile(t, filepath.Join(snapshot, "d", "a.txt"), "from the snapshot")
+	writeFile(t, filepath.Join(snapshot, "d", "sub", "b.txt"), "the snapshot's copy")
+	writeFile(t, filepath.Join(data, "d", "sub", "b.txt"), "the volume's copy")
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	if got, want := readFile(t, filepath.Join(data, "d", "a.txt")), "from the snapshot"; got != want {
+		t.Errorf("a.txt = %q, want %q — the file the volume was missing did not come back; a "+
+			"top-level merge (mv -n) skips the whole subtree and exits 0", got, want)
+	}
+	if got, want := readFile(t, filepath.Join(data, "d", "sub", "b.txt")), "the volume's copy"; got != want {
+		t.Errorf("b.txt = %q, want %q — the merge overwrote a file the volume still had", got, want)
+	}
+	// Nothing is taken out of the snapshot: it is not a move, and the caller may have to
+	// report a failure over a snapshot that is still the only complete copy.
+	if got, want := names(t, filepath.Join(snapshot, "d")), []string{"a.txt", "sub"}; !equalNames(got, want) {
+		t.Errorf("snapshot = %v, want %v — the recovery removed from the snapshot", got, want)
+	}
+}
+
+// Dotfiles and doubly-dotted names have to come back too. `src/.` names the directory
+// itself rather than globbing it, so one cp covers all three of the sets entryGlobs needs
+// three patterns for — and a rewrite that reintroduced the globs would have to reintroduce
+// all three.
+func TestMergeEntriesCommandRestoresDotfilesAndDoubleDotNames(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	writeFile(t, filepath.Join(snapshot, ".env"), "DB_PASSWORD=hunter2")
+	writeFile(t, filepath.Join(snapshot, ".htaccess"), "RewriteEngine On")
+	writeFile(t, filepath.Join(snapshot, "..stray"), "two dots")
+	writeFile(t, filepath.Join(snapshot, "visible.txt"), "not dot")
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, out)
+	}
+	want := []string{"..stray", ".env", ".htaccess", "visible.txt"}
+	if got := names(t, data); !equalNames(got, want) {
+		t.Fatalf("volume = %v, want %v", got, want)
+	}
+	if got, want := readFile(t, filepath.Join(data, ".env")), "DB_PASSWORD=hunter2"; got != want {
+		t.Errorf(".env = %q, want %q", got, want)
+	}
+}
+
+// The regression test for the `&&`-join trap, and the reason this command must not be built
+// the way moveEntriesCommand is. There, joining the three glob groups with `&&` is correct:
+// a failed move of the visible entries must stop the snapshot from reporting success. In
+// the recovery direction the same join would abandon the dotted groups after a visible-entry
+// failure — leaving `.env`, `.htaccess` and `.git/` in a container that is reaped seconds
+// later, at the one moment it holds the only copy of them.
+//
+// A snapshot directory whose destination in the volume is a regular file is a failure no uid
+// can walk past ("cannot overwrite non-directory … with directory"), which is what makes
+// this provable in CI, where the suite runs as uid 0. It is also a real shape: the volume
+// keeps whatever the failed move did not reach, and an interrupted restore can leave the
+// two disagreeing about a name's type.
+//
+// Both halves are asserted. The failure IS reported — the caller escalates on it and leaves
+// the service down — and everything the copy could still do, it did.
+func TestMergeEntriesCommandRestoresDotfilesWhenAVisibleEntryFails(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	if err := os.Mkdir(filepath.Join(snapshot, "vis"), 0o755); err != nil {
+		t.Fatalf("creating the snapshot directory: %v", err)
+	}
+	writeFile(t, filepath.Join(snapshot, "vis", "inner.txt"), "inside")
+	writeFile(t, filepath.Join(data, "vis"), "a regular file where the snapshot has a directory")
+	writeFile(t, filepath.Join(snapshot, ".env"), "DB_PASSWORD=hunter2")
+	writeFile(t, filepath.Join(snapshot, "..stray"), "two dots")
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code == 0 {
+		t.Fatalf("a failed entry must be reported, got exit 0: %s", out)
+	}
+	want := []string{"..stray", ".env", "vis"}
+	if got := names(t, data); !equalNames(got, want) {
+		t.Fatalf("volume = %v, want %v — the dotted entries were abandoned after the visible "+
+			"entry failed, which is what an `&&` chain does and what this command must not do", got, want)
+	}
+	if got, want := readFile(t, filepath.Join(data, ".env")), "DB_PASSWORD=hunter2"; got != want {
+		t.Errorf(".env = %q, want %q", got, want)
+	}
+}
+
+// A snapshot directory that does not exist must SUCCEED, and this is the `[ -d ]` guard's
+// whole job. recoverPartialSnapshot is called unconditionally, and preRestore fails before
+// takeRestoreSnapshot ever runs on several of its paths — a non-zero PreRestore hook, a
+// strategy hook, a container that would not stop. Without the guard, cp exits 1 on "cannot
+// stat", and a restore that never touched the volume reports that the customer's data was
+// not put back.
+func TestMergeEntriesCommandMissingSnapshot(t *testing.T) {
+	_, data := mergeDirs(t)
+	writeFile(t, filepath.Join(data, "untouched.txt"), "customer data")
+
+	code, out := runSh(t, mergeEntriesCommand(filepath.Join(filepath.Dir(data), "absent"), data))
+
+	if code != 0 {
+		t.Fatalf("a missing snapshot must succeed, got exit %d: %s", code, out)
+	}
+	if got, want := names(t, data), []string{"untouched.txt"}; !equalNames(got, want) {
+		t.Errorf("volume = %v, want %v", got, want)
+	}
+}
+
+// An empty snapshot is the same non-failure, and it is reachable in its own right: the move
+// can fail on its very first entry, and a volume that was empty when the snapshot was taken
+// leaves an empty snapshot behind either way.
+func TestMergeEntriesCommandEmptySnapshot(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	writeFile(t, filepath.Join(data, "untouched.txt"), "customer data")
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code != 0 {
+		t.Fatalf("an empty snapshot must succeed, got exit %d: %s", code, out)
+	}
+	if got, want := names(t, data), []string{"untouched.txt"}; !equalNames(got, want) {
+		t.Errorf("volume = %v, want %v", got, want)
+	}
+}
+
+// A dangling symlink must come back as a symlink, and must not fail the recovery.
+// `current -> releases/gone` is an ordinary shape for an application volume, and it is the
+// shape that catches a `-L`/`-H` or a plain `-r` in place of `-a`: dereferencing it turns
+// the copy into an error on a link that was never broken as far as the customer's
+// deployment is concerned.
+func TestMergeEntriesCommandPreservesDanglingSymlinks(t *testing.T) {
+	snapshot, data := mergeDirs(t)
+	if err := os.Symlink("releases/gone", filepath.Join(snapshot, "current")); err != nil {
+		t.Fatalf("creating dangling symlink: %v", err)
+	}
+
+	code, out := runSh(t, mergeEntriesCommand(snapshot, data))
+
+	if code != 0 {
+		t.Fatalf("a dangling symlink must not fail the recovery, got exit %d: %s", code, out)
+	}
+	info, err := os.Lstat(filepath.Join(data, "current"))
+	if err != nil {
+		t.Fatalf("the symlink did not come back: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("`current` came back as %s, not a symlink", info.Mode())
+	}
+}
+
 // The rollback's rm is the one command here that deletes, and `dst/.*` would hand it
 // `dst/..` — the parent of the docker volume. GNU coreutils refuse, but the borg image tag
 // floats and an rm that does not refuse takes the parent directory with it, so the pattern
@@ -556,5 +772,52 @@ func TestRollbackCommandNeverRemovesTheParent(t *testing.T) {
 	content, err := os.ReadFile(filepath.Join(parent, "sibling.txt"))
 	if err != nil || string(content) != "outside the volume" {
 		t.Errorf("the sibling outside the volume did not survive: %q, %v", content, err)
+	}
+}
+
+// TestMergeEntriesCommandLeavesTheVolumeDirectoryAlone is the regression guard for the
+// defect that made the recovery worse than the failure it recovers from.
+//
+// `cp -a src/. dst/` copies the `.` entry, and `.` is the directory — so cp stamps the
+// SNAPSHOT directory's ownership and mode onto the volume. /root/.snapshot is created by
+// moveEntriesCommand's `mkdir -p` as root:root 0755, so the recovery handed a mariadb
+// datadir back as 0755 root-owned with every byte correctly restored, and Restore then
+// started the service onto a datadir its own uid could no longer write.
+//
+// Ownership needs root to set up and the suite does not run as root, so this pins MODE,
+// which the same single cp destroyed in the same way and which needs no privilege to
+// observe. The empty-snapshot case is here for a reason: it broke the volume without any
+// data being at risk at all, so a test that only ever merges real files would miss it.
+func TestMergeEntriesCommandLeavesTheVolumeDirectoryAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		populate bool
+	}{
+		{"with entries to merge", true},
+		{"empty snapshot", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot, data := mergeDirs(t)
+			if err := os.Chmod(data, 0o750); err != nil {
+				t.Fatalf("chmod data: %v", err)
+			}
+			if tc.populate {
+				writeFile(t, filepath.Join(snapshot, ".env"), "SNAP")
+			}
+
+			if code, out := runSh(t, mergeEntriesCommand(snapshot, data)); code != 0 {
+				t.Fatalf("merge exited %d: %s", code, out)
+			}
+
+			info, err := os.Stat(data)
+			if err != nil {
+				t.Fatalf("stat data: %v", err)
+			}
+			if got := info.Mode().Perm(); got != 0o750 {
+				t.Errorf("volume directory mode = %#o, want 0750 — the merge stamped the "+
+					"snapshot directory's attributes onto the volume, which is what leaves a "+
+					"restored datadir unwritable by the service that owns it", got)
+			}
+		})
 	}
 }

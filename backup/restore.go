@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
-	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/getsentry/sentry-go"
@@ -226,13 +225,38 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 	preRestoreSuccess := preRestore(&destVol, projectEvent, repo)
 
 	if !preRestoreSuccess {
-		repo.StopContainer()
 		backupLogger().Warn("Failed to restore volume", "volume", vol.Name, "archive", archive.Name, "error", "PreRestore hook failed.")
 		projectEvent.EventLog.Status = "failed"
 		// No PostEventUpdate: preRestore and the hooks it calls post their own detail
 		// (rollbackRestoreSnapshot, ServiceExec, the per-strategy hooks), so this is the
 		// one reason the task result would otherwise be missing.
-		return errors.New("pre-restore hook failed")
+		reason := errors.New("pre-restore hook failed")
+
+		// The recovery runs BEFORE repo.StopContainer(), and that ordering is the entire
+		// value of this branch. preRestore fails here with the snapshot move possibly
+		// half done — it is a cross-device copy-and-unlink into the backup container's own
+		// filesystem — so whatever it did move is sitting in /root/.snapshot inside a
+		// container created with AutoRemove. Stopping first destroys it, which is what this
+		// branch used to do on its first line. recoverPartialSnapshot only ever adds files
+		// the volume no longer has, so it is safe to call however far preRestore got,
+		// including not far enough to create the snapshot at all.
+		recovered := recoverPartialSnapshot(projectEvent, repo, destVol.Name)
+		if !recovered {
+			reason = snapshotRecoveryFailure(reason)
+		}
+		repo.StopContainer()
+		// The restart is CONDITIONAL, and leaving the service down is the deliberate
+		// outcome of a failed recovery rather than an oversight. If the put-back did not
+		// complete, /mnt/data can be materially emptier than the customer left it, and
+		// starting the service over that is not neutral: a mysql/mariadb entrypoint reads an
+		// empty datadir as a first run, initialises a fresh empty database into the volume,
+		// and the application may then take writes on top of it — while the only complete
+		// copy of the data is in a container that has just been reaped. Down is loud, keeps
+		// the operator's options open, and is what this path did in every case before.
+		if recovered {
+			startServiceContainers(containers, projectEvent, destVol.Name)
+		}
+		return reason
 	}
 
 	// restoreFailure carries the reason out to the return for the three branches below
@@ -358,14 +382,7 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 		}
 	}
 
-	for _, c := range containers {
-		backupLogger().Debug("Finalize Restore: Start Container", "volume", destVol.Name, "container", c.ID)
-		if !c.Start() {
-			backupLogger().Warn("Failed to start container", "function", "Restore")
-			projectEvent.PostEventUpdate("agent-a15b6d18583615a1", "Failed to start container")
-		}
-		time.Sleep(time.Second) // give each container a second to boot to avoid thrashing the disk
-	}
+	startServiceContainers(containers, projectEvent, destVol.Name)
 
 	return restoreFailure
 }
@@ -385,4 +402,23 @@ func Restore(ctx context.Context, st *store.Store, task store.Task, projectEvent
 // the restore in the first place.
 func rollbackFailure(cause error) error {
 	return fmt.Errorf("restore rollback failed, the volume's contents were not put back: %w", cause)
+}
+
+// snapshotRecoveryFailure is rollbackFailure's sibling for the pre-restore path, and it is a
+// separate function rather than a reuse of it for two reasons, one mechanical and one about
+// what the operator is being told.
+//
+// Mechanically, TestOnlyALostSnapshotEscalatesTheReason counts every rollbackFailure call in
+// Restore and requires each to sit inside a `case rollbackSnapshotLost:` clause, so calling
+// it from a branch that has no rollbackOutcome at all fails that suite over an unrelated
+// concern. Substantively, the two states are not the same one: rollbackFailure means an
+// extract ran and the volume was not put back over what it wrote, while this means the
+// volume was moved aside and the move itself came apart, so nothing was ever restored and
+// the service is deliberately left down (see the branch).
+//
+// It names the state plainly, for the reason rollbackFailure does: it is reached only when
+// the put-back genuinely did not complete, so there is nothing to hedge about. The original
+// reason is wrapped rather than replaced, so the result still says what failed first.
+func snapshotRecoveryFailure(cause error) error {
+	return fmt.Errorf("the volume's contents were not fully put back after the pre-restore step failed: %w", cause)
 }
