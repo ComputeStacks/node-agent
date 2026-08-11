@@ -198,18 +198,21 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 //   - BackupFileNotFoundError, which is where "files deleted" above is too coarse to be
 //     load-bearing. A delete borg never sees does exit 0, but borg lists a directory and
 //     then stat()s each entry, and a delete landing inside THAT window exits 1 with one
-//     WARNING per vanished file. It does not reproduce on a hand-made delete for the same
+//     WARNING per vanished path. It does not reproduce on a hand-made delete for the same
 //     reason FileChangedWarning does not — the window has to be hit — and it happens on
 //     any volume an application is writing to. Measured on borg 1.4.4: 1,181 records and
-//     nfiles 18,648 of 20,000 over a directory losing its tail mid-walk.
+//     nfiles 18,648 of 20,000 over a directory losing its tail mid-walk. It reads benign
+//     and is not: the same record covers a renamed DIRECTORY, whose whole subtree is then
+//     missing from the archive and still on the volume, indistinguishably. Its verdict is
+//     settled in benignCreateWarnings, which is where that measurement lives.
 //   - BackupRaceConditionError, where a path's type or inode changed between borg's
 //     name-based stat and its fd-based fstat. borg skips the file and commits an archive
 //     without it, while the path still holds a file on the volume — so it shares this tier
 //     with the three above and its VERDICT with BackupPermissionError.
 //
 // Those four are why a downgrade must turn on borg's msgid and never on the exit code
-// alone, and why the msgid alone is not enough either: two of the four exit 1 with a
-// complete archive and two exit 1 with a file missing from it.
+// alone, and why the msgid alone is not enough either: all four exit 1 at WARNING, and
+// only ONE of them — FileChangedWarning — leaves an archive that still holds the volume.
 func classify(label string, borgJSON bool, exitCode int, response string) *LogMessage {
 	if exitCode == 0 {
 		return nil

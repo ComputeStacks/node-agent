@@ -186,7 +186,7 @@ func TestWroteCompleteArchive(t *testing.T) {
 		mixedWarnings     = fileChangedWarningRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		vanished          = backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		vanishedAndDenied = backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
-		bothBenign        = fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
+		tornAndVanished   = fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		raced             = backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 		vanishedAndRaced  = backupFileNotFoundErrorRecord + "\r\n" + backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY + "\r\n"
 	)
@@ -208,17 +208,18 @@ func TestWroteCompleteArchive(t *testing.T) {
 			want: true,
 		},
 		{
-			// The file is gone from the archive because it is gone from the volume, so the
-			// archive still matches what was there to back up.
+			// Reads like the archive still matches the volume, and on a plain file it does.
+			// The same record is what a renamed directory raises, and there the subtree is
+			// gone from the archive and still on the volume. See TestFileNotFoundIsNotBenign.
 			name: "vanished file over a committed archive",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: vanished},
-			want: true,
+			want: false,
 		},
 		{
-			// Both benign, and for different reasons — neither has to vouch for the other.
+			// The one genuinely benign warning cannot vouch for the ambiguous one beside it.
 			name: "a torn file and a vanished file together",
-			res:  ExecResult{ExitCode: borgWarningExit, Response: bothBenign},
-			want: true,
+			res:  ExecResult{ExitCode: borgWarningExit, Response: tornAndVanished},
+			want: false,
 		},
 		{
 			// Container.Exec hardcodes 1 on a docker fault and one of those paths returns
@@ -261,14 +262,16 @@ func TestWroteCompleteArchive(t *testing.T) {
 			want: false,
 		},
 		{
-			// Same rule for the newer benign entry: a file that vanished says nothing about
-			// the file borg could not read, which IS still on the volume.
+			// Two disqualifying records rather than one, which must still refuse — the loop
+			// has to reject on the first, not require unanimity.
 			name: "vanished and data-affecting warnings together",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: vanishedAndDenied},
 			want: false,
 		},
 		{
-			// borg's error tier is never downgradeable, whatever the records say.
+			// borg's error tier is never downgradeable, whatever the records say. Kept at the
+			// error tier so it stays a statement about the exit code even once
+			// BackupFileNotFoundError becomes benign again.
 			name: "vanished file at the error tier",
 			res:  ExecResult{ExitCode: 2, Response: vanished},
 			want: false,
@@ -281,7 +284,7 @@ func TestWroteCompleteArchive(t *testing.T) {
 			want: false,
 		},
 		{
-			// And it is not vouched for by the benign record beside it.
+			// The two records a live volume in flux produces, and neither is downgradeable.
 			name: "vanished and raced together",
 			res:  ExecResult{ExitCode: borgWarningExit, Response: vanishedAndRaced},
 			want: false,
@@ -315,7 +318,7 @@ func TestWroteCompleteArchive(t *testing.T) {
 // TestRaceConditionIsNotBenign pins the one create warning that reads benign and is not,
 // because the argument for adding it is going to be made again.
 //
-// BackupRaceConditionError tells the same story as the two entries that ARE benign: a live
+// BackupRaceConditionError tells the same story as the one entry that IS benign: a live
 // volume changed under the backup. borg raises it from stat_update_check when a path's type
 // or inode changed between the name-based stat in its walk and the fd-based fstat in the
 // type handler — an application atomically replacing a file, which is the normal shape of a
@@ -341,6 +344,47 @@ func TestRaceConditionIsNotBenign(t *testing.T) {
 	if benignCreateWarnings[quoted.MsgID] {
 		t.Error("BackupRaceConditionError is on the benign allowlist; borg skips the raced file and the volume still has it, " +
 			"so a backup downgraded on this warning is short of the volume — the false green the allowlist exists to prevent")
+	}
+}
+
+// TestFileNotFoundIsNotBenign pins the create warning that WAS on the allowlist for a
+// release, because putting it back is the plan and this is the condition on doing so.
+//
+// The reading that put it there is right for a plain file: borg lists a directory and then
+// stat()s each entry, so a delete landing in that window leaves the file absent from the
+// archive AND from the volume, and the archive still matches what was there to back up.
+//
+// What it misses is that borg raises the identical record for a DIRECTORY renamed while it
+// walks. Measured on borg 1.4.4: the whole subtree is then missing from the archive under
+// either name — borg walks a snapshot of the parent's entries taken by scandir_inorder,
+// which orders by inode, so both rename directions lost 50 files — and it is still on the
+// volume, which is BackupPermissionError's verdict, not this list's. borg emits ONE record
+// for the directory and none for its contents, so the warning count says nothing about how
+// much was lost: 170 warnings hid 8,500 absent files, reported green.
+//
+// And nothing separates the two. A benign `rm -rf` mid-walk produces a byte-identical
+// normalised record stream — same exit code, same single record, same nfiles — and --list,
+// --stats, --json nfiles, --progress, --debug, BORG_EXIT_CODES=modern, `borg info`, `borg
+// diff`, `borg check` and re-stat'ing the warned path were each measured and none of them
+// discriminates. Structurally borg cannot help: _rec_walk raises at the stat, before the
+// item's type is known.
+//
+// So this stays off the list until something OUTSIDE the record can rule — a post-create
+// verification that checks the warned path against the volume. Until then the false green
+// is the worse failure, and createCommand's exclude for WordPress's write probe is what
+// keeps failing on it from costing a backup a day.
+func TestFileNotFoundIsNotBenign(t *testing.T) {
+	quoted, ok := failureRecord(backupFileNotFoundErrorRecord + "\r\n")
+	if !ok {
+		t.Fatal("the captured record was not read back as a record")
+	}
+	if quoted.MsgID != "BackupFileNotFoundError" || quoted.LevelName != "WARNING" {
+		t.Fatalf("Received msgid %q at %q, wanted BackupFileNotFoundError at WARNING — the fixture no longer carries the measured shape", quoted.MsgID, quoted.LevelName)
+	}
+	if benignCreateWarnings[quoted.MsgID] {
+		t.Error("BackupFileNotFoundError is on the benign allowlist; borg raises the same record for a directory renamed " +
+			"mid-walk, whose subtree is then missing from the archive and still on the volume, and no borg output tells " +
+			"the two apart — put it back only alongside a post-create verification that can")
 	}
 }
 
@@ -398,11 +442,18 @@ func TestCreateWarnings(t *testing.T) {
 // --error to match the other subcommands: --error filters the WARNING record that says
 // which file warned and why, which is both the reason a successful backup reported "no
 // diagnostic output" and the input wroteCompleteArchive rules on.
+//
+// The command is asserted as ONE joined string because that is how it is actually run:
+// Repository.run joins the slice with spaces and hands it to `sh -c`, so the shell quoting
+// around the exclude pattern is part of what has to be right. The pattern itself is
+// verified against real borg — see wpWriteProbeExclude for the measurements.
 func TestCreateCommand(t *testing.T) {
 	cmd := strings.Join(createCommand("::auto-1", "zstd", "600"), " ")
 
 	want := "cd /mnt/data && borg --log-json --lock-wait 600 " +
-		"create --one-file-system --json --numeric-ids --exclude-caches --compression zstd ::auto-1 ."
+		"create --one-file-system --json --numeric-ids --exclude-caches " +
+		`--exclude 're:(^|/)temp-write-test-[0-9a-f]+-[0-9]+$' ` +
+		"--compression zstd ::auto-1 ."
 	if cmd != want {
 		t.Errorf("Received %q, wanted %q", cmd, want)
 	}
@@ -413,6 +464,16 @@ func TestCreateCommand(t *testing.T) {
 		if !strings.Contains(cmd, flag) {
 			t.Errorf("Received %q, wanted it to carry %q", cmd, flag)
 		}
+	}
+	// borg's default --exclude style is fnmatch anchored at the archive root, where a bare
+	// prefix glob misses the probe at every path that is not the volume root. Measured: it
+	// left html/wordpress/wp-content/temp-write-test-… in the archive.
+	if !strings.Contains(cmd, "re:") {
+		t.Errorf("Received %q, wanted the exclude in regex style: an unprefixed pattern is fnmatch anchored at the archive root and misses a nested probe", cmd)
+	}
+	// Unquoted, the shell expands the pattern's [] and * before borg ever sees it.
+	if !strings.Contains(cmd, "--exclude '") {
+		t.Errorf("Received %q, wanted the exclude pattern single-quoted: run joins the command and passes it to sh -c", cmd)
 	}
 }
 
@@ -431,16 +492,28 @@ func TestNonBenignCreateWarning(t *testing.T) {
 			response:  fileChangedWarningRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + createJSONPayloadTTY,
 			wantMsgID: "",
 		},
-		{name: "vanished only", response: backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY, wantMsgID: ""},
 		{
-			name:      "both benign kinds",
+			// A vanished path is the offender in its own right now, so it is what the
+			// operator is quoted rather than nothing at all.
+			name:      "vanished only",
+			response:  backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY,
+			wantMsgID: "BackupFileNotFoundError",
+		},
+		{
+			// The benign record comes first, so a severity-based pick would have quoted it.
+			name:      "vanished after benign",
 			response:  fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + createJSONPayloadTTY,
-			wantMsgID: "",
+			wantMsgID: "BackupFileNotFoundError",
 		},
 		{name: "non-benign only", response: backupPermissionErrorRecord + "\r\n", wantMsgID: "BackupPermissionError"},
 		{
-			// The reason a busy volume must still report the real offender: the vanished
-			// files are the loud majority and the unreadable file is the one that matters.
+			// The unreadable file wins over the vanished ones ahead of it. Both disqualify, but
+			// only one record reaches the operator, and these two do not mean the same thing:
+			// the vanished paths are ambiguous (a plain delete leaves the archive matching the
+			// volume), while BackupPermissionError means the file is absent from the archive
+			// and STILL ON THE VOLUME. On a live volume the vanished records are the loud
+			// majority — 1,181 of them in exec.go's measurement — so first-wins reported one of
+			// those essentially every time and buried the one worth acting on.
 			name:      "vanished before non-benign",
 			response:  backupFileNotFoundErrorRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + backupPermissionErrorRecord + "\r\n" + createJSONPayloadTTY,
 			wantMsgID: "BackupPermissionError",
@@ -449,7 +522,7 @@ func TestNonBenignCreateWarning(t *testing.T) {
 			// A raced file is the offender in its own right, and it must be the reason the
 			// operator is shown rather than the benign record borg happened to log first.
 			name:      "raced after benign",
-			response:  fileChangedWarningRecord + "\r\n" + backupFileNotFoundErrorRecord + "\r\n" + backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY,
+			response:  fileChangedWarningRecord + "\r\n" + fileChangedWarningRecord + "\r\n" + backupRaceConditionErrorRecord + "\r\n" + createJSONPayloadTTY,
 			wantMsgID: "BackupRaceConditionError",
 		},
 		{
@@ -822,4 +895,59 @@ func mustRecord(t *testing.T, fixture string) *LogMessage {
 		t.Fatalf("fixture did not parse as a record: %s", fixture)
 	}
 	return &record
+}
+
+// TestNonBenignCreateWarningPrefersDefiniteLoss pins which record a refused create reports
+// when several disqualifying ones are present.
+//
+// Only one record reaches result_json; the rest are DEBUG-only. borg emits one record per
+// warned file, and on a live volume the vanished-path records are the loud majority, so
+// first-disqualifying-wins meant the operator was shown a vanished path essentially every
+// time — burying the BackupPermissionError that says a file is absent from the archive and
+// still on the volume, which is the one that needs acting on.
+func TestNonBenignCreateWarningPrefersDefiniteLoss(t *testing.T) {
+	rec := func(msgid, msg string) string {
+		return `{"type":"log_message","levelname":"WARNING","name":"borg.archiver","msgid":"` +
+			msgid + `","message":"` + msg + `"}`
+	}
+
+	for _, tc := range []struct {
+		name     string
+		response string
+		want     string
+	}{
+		{
+			name: "a definite-loss record outranks earlier ambiguous ones",
+			response: strings.Join([]string{
+				rec("BackupFileNotFoundError", "cache/a: stat: [Errno 2] No such file or directory: 'a'"),
+				rec("BackupFileNotFoundError", "cache/b: stat: [Errno 2] No such file or directory: 'b'"),
+				rec("BackupPermissionError", "wp-config.php: open: [Errno 13] Permission denied"),
+			}, "\n"),
+			want: "BackupPermissionError",
+		},
+		{
+			name: "and outranks a benign one ahead of it too",
+			response: strings.Join([]string{
+				rec("FileChangedWarning", "big.bin: file changed while we backed it up"),
+				rec("BackupIOError", "x.dat: read: [Errno 5] Input/output error"),
+			}, "\n"),
+			want: "BackupIOError",
+		},
+		{
+			name:     "ambiguous only still reports, rather than reporting nothing",
+			response: rec("BackupFileNotFoundError", "cache/a: stat: [Errno 2] No such file or directory: 'a'"),
+			want:     "BackupFileNotFoundError",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nonBenignCreateWarning(tc.response)
+			if got == nil {
+				t.Fatalf("nonBenignCreateWarning returned nil, want msgid %q", tc.want)
+			}
+			if got.MsgID != tc.want {
+				t.Errorf("reported msgid = %q, want %q — the record an operator is shown is the "+
+					"whole diagnosis, so quoting the ambiguous one hides the actionable one", got.MsgID, tc.want)
+			}
+		})
+	}
 }

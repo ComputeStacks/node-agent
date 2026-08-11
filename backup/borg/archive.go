@@ -33,18 +33,12 @@ func lockWait(op string) string {
 // benignCreateWarnings are the `borg create` warning msgids that do NOT mean the archive
 // came out short of the volume. Measured on borg 1.4.4:
 //
-//	FileChangedWarning       "<file>: file changed while we backed it up" — the file IS
-//	                         in the archive; its content may be a torn read.
-//	BackupFileNotFoundError  "<file>: stat: [Errno 2] No such file or directory:
-//	                         '<file>'" — the file was deleted between borg listing its
-//	                         directory and stat'ing it, so it is absent from the archive
-//	                         AND from the volume.
+//	FileChangedWarning  "<file>: file changed while we backed it up" — the file IS in the
+//	                    archive; its content may be a torn read.
 //
 // What the set encodes is not "harmless" but the narrower thing the customer is owed: the
-// archive still matches the volume. That is why the second entry qualifies even though a
-// file is missing from the archive — it is missing from the volume too, and an active
-// volume loses files under a backup constantly. By that test it is the safer of the two:
-// FileChangedWarning leaves a possibly-torn copy IN the archive.
+// archive still matches the volume. FileChangedWarning qualifies because the file is in
+// the archive at all; what it cannot promise is that the copy is not torn.
 //
 // Still an allowlist rather than a denylist, and every entry is a captured record rather
 // than an assumption about what borg "probably" means. What stays OFF the list, and why:
@@ -56,22 +50,46 @@ func lockWait(op string) string {
 //   - BackupRaceConditionError is the one that looks like it belongs here and does not.
 //     borg raises it when a path's type or inode changed between its name-based stat and
 //     the fd-based fstat in the type handler, which reads like the same "live volume in
-//     flux" story as the two entries above — but borg SKIPS the file (measured: nfiles came
-//     back exactly as short as the record count), and the path still holds a file on the
-//     volume. Absent from the archive, present on the volume: that is the permission
-//     error's category, not this set's.
+//     flux" story as the entry above — but borg SKIPS the file (measured: nfiles came back
+//     exactly as short as the record count), and the path still holds a file on the volume.
+//     Absent from the archive, present on the volume: that is the permission error's
+//     category, not this set's.
+//   - BackupFileNotFoundError ("<file>: stat: [Errno 2] No such file or directory:
+//     '<file>'") is the one this set carried for a release and no longer does. For a plain
+//     file it is genuinely benign — deleted between borg listing its directory and stat'ing
+//     it, so absent from the archive AND from the volume. The measurement that took it back
+//     off is a DIRECTORY renamed mid-walk, which raises the same record and lands squarely
+//     in BackupRaceConditionError's category: absent from the archive, present on the
+//     volume. Three facts, all measured on borg 1.4.4:
+//     (a) the whole subtree is lost from the archive under EITHER name, in either rename
+//     direction (50 files each way). borg snapshots the parent's entry list with
+//     scandir_inorder — ordered by INODE, not by name — and walks that snapshot, so
+//     whether the new name "sorts earlier" has nothing to do with it;
+//     (b) borg emits exactly ONE record, for the directory itself, and none for the
+//     entries under it. So the blast radius is one warning per lost directory and
+//     unbounded in files: at scale, 170 warnings over 8,500 files silently absent, with
+//     the backup reported green;
+//     (c) nothing in the output tells it apart from a benign delete. An `rm -rf` of a
+//     directory mid-walk produces a BYTE-IDENTICAL normalised record stream — same exit
+//     code, same single record, same nfiles. --list, --stats, --json nfiles, --progress,
+//     --debug, BORG_EXIT_CODES=modern, `borg info`, `borg diff`, `borg check` and
+//     re-stat'ing the warned path were each tried and none of them separates the two.
+//     The structural reason: borg's _rec_walk raises at the stat, before the item's type
+//     is known, the parent's DirEntry (which carries d_type) is never passed into the
+//     recursion, and the JSON record schema is a fixed four-field whitelist.
+//     This is a staged decision, not a verdict on the idea. The entry should come back
+//     once a post-create verification exists to back it — something that can look at the
+//     committed archive and say the warned path is absent from the volume too — because
+//     failing on it costs a real backup for every file an application legitimately deletes
+//     mid-walk. What makes failing on it affordable in the meantime is createCommand's
+//     exclude for WordPress's write probe: that probe was the dominant producer of this
+//     warning in production, and borg no longer walks it.
 //
 // An unrecognised warning must fail rather than be assumed harmless. When one does, the
 // task carries borg's own message, so widening this set is a deliberate, evidenced decision
 // rather than a silent default.
-//
-// One case this cannot separate, and accepts knowingly: a DIRECTORY renamed mid-walk
-// raises the same ENOENT for the entries under it, and that subtree does still exist on
-// the volume under its new name — absent from the archive if borg had already walked past
-// the destination. Nothing in the record tells that apart from a plain delete.
 var benignCreateWarnings = map[string]bool{
-	"FileChangedWarning":      true,
-	"BackupFileNotFoundError": true,
+	"FileChangedWarning": true,
 }
 
 func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
@@ -159,6 +177,67 @@ func (a *Archive) createFailure(res ExecResult) *LogMessage {
 	return failure
 }
 
+// wpWriteProbeExclude is the `borg create` --exclude argument for WordPress's filesystem
+// write probe, quoted for the shell.
+//
+// get_filesystem_method() in wp-admin/includes/file.php writes
+// `<context>/temp-write-test-<uniqid>`, stat()s it and deletes it milliseconds apart, to
+// decide whether PHP may write directly. Every install does it.
+//
+// Provenance, separated deliberately, because the three kinds of claim below are not
+// equally strong and a later reader should not have to guess which is which:
+//
+//   - REPORTED (operator, 2026-08-10): backups failing daily on this fleet, with the
+//     captured record naming
+//     `html/wordpress/wp-content/temp-write-test-6a7a669ec0ba20-05577252`. That is one
+//     captured example plus the operator's statement of frequency.
+//   - MEASURED (borg 1.4.4, this image, see below): the pattern's matching behaviour and
+//     the fact that an excluded path raises no record at all.
+//   - NOT ESTABLISHED: what share of BackupFileNotFoundError across the fleet this probe
+//     accounts for. It is plausibly most of it on WordPress volumes and nobody has counted.
+//     Do not let this comment become the citation for a number it does not contain.
+//
+// The reason it matters: BackupFileNotFoundError is deliberately NOT in
+// benignCreateWarnings, so without this exclude a WordPress volume loses a backup over a
+// file that is worthless in an archive.
+//
+// Excluding is better than judging after the fact: borg tests the pattern BEFORE it stats
+// the entry, so the probe raises no record at all and there is no verdict to make.
+// Measured on borg 1.4.4 against a directory whose entries cannot be stat'ed (mode r--,
+// so readdir works and stat gets EACCES): without the pattern both entries produce a
+// record, with it only the un-excluded one does.
+//
+// Regex style, and end-anchored, on measurement rather than taste. Same borg, fixture
+// carrying the captured path plus customer files that merely share the prefix:
+//
+//   - borg's DEFAULT --exclude style is fnmatch, anchored at the archive root. A bare
+//     `temp-write-test-*` matched only a probe sitting at the top of the volume and left
+//     `html/wordpress/wp-content/temp-write-test-…` — the real one — in the archive.
+//   - `sh:**/temp-write-test-*` matched at every depth, but its trailing `*` also matches
+//     names the probe never has: it dropped `temp-write-test-data/keep.txt` and
+//     `temp-write-test-notes.txt`, customer files this has no business touching. Note the
+//     subtree loss is not a property of shell-style patterns — in borg 1.x ANY exclude that
+//     matches a directory prunes everything under it, this one included. What was wrong
+//     with the shell pattern is its breadth, not its style.
+//   - This pattern matches the shape WordPress actually generates and nothing else — a
+//     no-prefix uniqid() with more_entropy, its dot replaced by a dash: hex, a dash,
+//     digits. It removed all three probes and kept both of those files.
+//
+// The classes are matched, not counted: PHP's uniqid() length is not a contract, and a
+// pattern that quietly stopped matching after a PHP upgrade would bring the daily failure
+// back with no signal.
+//
+// Residual risk, stated plainly because an exclude is the one thing that cannot be caught
+// later: a DIRECTORY whose name happens to fit hex-dash-digits is pruned with everything
+// under it, and because borg never walks an excluded path there is no warning, no record,
+// and nothing for any post-create check to notice. This is the deliberate cost of removing
+// the verdict rather than judging it — narrower than the prefix glob, but not zero, and it
+// is invisible by construction rather than merely unreported.
+//
+// Single-quoted here because Repository.run joins the command with spaces and hands the
+// whole string to `sh -c` — unquoted, the shell would try to glob it.
+const wpWriteProbeExclude = `'re:(^|/)temp-write-test-[0-9a-f]+-[0-9]+$'`
+
 // createCommand builds the `borg create` command.
 //
 // NO --error, deliberately: it filters the WARNING record that says which file warned
@@ -174,6 +253,7 @@ func createCommand(archivePath, compression, lockWaitSecs string) []string {
 	cmd := []string{"cd /mnt/data && borg --log-json"}
 	cmd = append(cmd, "--lock-wait "+lockWaitSecs)
 	cmd = append(cmd, "create --one-file-system --json --numeric-ids --exclude-caches")
+	cmd = append(cmd, "--exclude "+wpWriteProbeExclude)
 	cmd = append(cmd, "--compression "+compression)
 	cmd = append(cmd, archivePath)
 	cmd = append(cmd, ".")
@@ -201,18 +281,57 @@ func createWarnings(response string) []LogMessage {
 	return warnings
 }
 
-// nonBenignCreateWarning returns the first record that is NOT in benignCreateWarnings, or
-// nil when every record is benign (or there are none).
+// definiteLossCreateMsgIDs are the create warnings whose meaning is unambiguous: borg could
+// not read the file, logged it, skipped it, and committed an archive without it — so the
+// file is absent from the archive and STILL ON THE VOLUME. That is the shape an operator has
+// to act on, because the data exists and the backup does not have it.
 //
-// It exists so that a create refused by wroteCompleteArchive reports the warning that
-// disqualified it. failureRecord cannot do that job: it picks by severity, and every
-// create warning is levelname WARNING with a msgid, so its tie-break never fires and the
-// FIRST record wins — whichever file borg happened to walk first. On a volume with both a
-// busy file and an unreadable one, that reported "file changed while we backed it up" (the
-// harmless one) for a backup that failed because a different file was missing from the
-// archive entirely, telling the operator the opposite of what happened.
+// BackupFileNotFoundError is deliberately absent, and that is the whole point of the set.
+// It is disqualifying but AMBIGUOUS: the path vanished between borg's readdir and its stat,
+// which is a plain delete (the archive still matches the volume) far more often than it is a
+// directory renamed mid-walk (a subtree lost). Nothing borg emits tells those apart — see
+// benignCreateWarnings — so it must fail the backup, but it is the worst of the candidates
+// to QUOTE when a better-defined one is also present.
+var definiteLossCreateMsgIDs = map[string]bool{
+	"BackupPermissionError":    true,
+	"BackupIOError":            true,
+	"BackupRaceConditionError": true,
+	"BackupError":              true,
+}
+
+// nonBenignCreateWarning returns the record to report for a create that wroteCompleteArchive
+// refused, or nil when every record is benign (or there are none).
+//
+// It exists so that a refused create reports the warning that disqualified it. failureRecord
+// cannot do that job: it picks by severity, and every create warning is levelname WARNING
+// with a msgid, so its tie-break never fires and the FIRST record wins — whichever file borg
+// happened to walk first. On a volume with both a busy file and an unreadable one, that
+// reported "file changed while we backed it up" (the harmless one) for a backup that failed
+// because a different file was missing from the archive entirely, telling the operator the
+// opposite of what happened.
+//
+// Two passes rather than one, and the reason is a matter of scale rather than taste. A
+// create emits ONE record per warned file, and on a live volume the vanished-path records
+// are the loud majority — 1,181 of them in the measurement quoted in exec.go. Reporting the
+// first disqualifying record therefore means reporting a vanished path essentially every
+// time, burying the single BackupPermissionError that says a file is missing from the
+// archive while still sitting on the volume. Only ONE record reaches result_json; the rest
+// are DEBUG-only, so whatever this picks is the entire diagnosis the operator gets.
+//
+// The fallback is the first non-benign record, so a response carrying only ambiguous ones
+// still reports the truthful reason it failed. Same preference-for-which-record-to-quote
+// that extractFailure applies on the restore path, and it never changes the VERDICT: the
+// backup fails either way, and this only decides which of its records is worth the operator's
+// attention.
 func nonBenignCreateWarning(response string) *LogMessage {
-	for _, w := range createWarnings(response) {
+	records := createWarnings(response)
+	for _, w := range records {
+		if definiteLossCreateMsgIDs[w.MsgID] {
+			offender := w
+			return &offender
+		}
+	}
+	for _, w := range records {
 		if !benignCreateWarnings[w.MsgID] {
 			offender := w
 			return &offender

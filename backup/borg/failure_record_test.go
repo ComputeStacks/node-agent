@@ -24,13 +24,18 @@ const (
 // protected — which is the whole reason benignCreateWarnings keys on the msgid. What
 // separates them is whether the archive still matches the volume:
 //
-//   - FileChangedWarning's file IS in the archive (its content may be a torn read);
-//   - BackupFileNotFoundError's file is absent from the archive AND from the volume;
+//   - FileChangedWarning's file IS in the archive (its content may be a torn read), and it
+//     is the only one of the four that is benign;
 //   - BackupPermissionError's file is silently absent while still sitting on the volume —
 //     verified with `borg list`;
 //   - BackupRaceConditionError's file is ALSO absent while still sitting on the volume,
-//     which is why it groups with the permission error and not with the two above it,
+//     which is why it groups with the permission error and not with the one above it,
 //     despite reading like a benign flux warning. See TestRaceConditionIsNotBenign.
+//   - BackupFileNotFoundError is the ambiguous one, and therefore also not benign. On a
+//     plain file it means absent from the archive AND from the volume, which is harmless;
+//     on a DIRECTORY renamed mid-walk it means the whole subtree is absent from the archive
+//     and still on the volume, which is the permission error's verdict. borg emits the same
+//     single record either way. See TestFileNotFoundIsNotBenign.
 //
 // One record is emitted per warned file, before the --json payload.
 //
