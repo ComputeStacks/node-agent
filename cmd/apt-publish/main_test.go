@@ -223,21 +223,45 @@ func TestLocalPathStripsThePrefix(t *testing.T) {
 	}
 }
 
+// "apt-publish pull ." is the natural local invocation, and a bare relative dir is
+// the case a joined-path prefix test gets wrong: filepath.Join cleans the "./" away,
+// so every ordinary key looked like an escape and the whole pull failed.
+func TestLocalPathAcceptsARelativeDirectory(t *testing.T) {
+	for _, dir := range []string{".", "", "./", "aptrepo", "./aptrepo"} {
+		got, err := localPath(dir, "public/", "public/pool/main/c/cs-agent/cs-agent_3.1.2_amd64.deb")
+		if err != nil {
+			t.Errorf("localPath(%q): %v", dir, err)
+			continue
+		}
+		want := filepath.Join(dir, "pool", "main", "c", "cs-agent", "cs-agent_3.1.2_amd64.deb")
+		if got != want {
+			t.Errorf("localPath(%q) = %q, want %q", dir, got, want)
+		}
+	}
+}
+
 // Object keys come from the store, so a key with ".." must fail the pull rather
 // than write outside the working directory.
 func TestLocalPathRejectsAKeyThatEscapesTheDirectory(t *testing.T) {
-	for _, key := range []string{
-		"public/pool/../../../etc/cron.d/x",
-		"public/pool/../../outside.deb",
-		"public/../secrets",
-	} {
-		if got, err := localPath("/work/aptrepo", "public/", key); err == nil {
-			t.Errorf("localPath(%q) = %q, want an error", key, got)
+	// Every dir shape, including the relative ones: the containment check must not
+	// have been loosened into an accept-anything test to make "." work.
+	for _, dir := range []string{"/work/aptrepo", ".", "", "./", "aptrepo", "./aptrepo"} {
+		for _, key := range []string{
+			"public/pool/../../../etc/cron.d/x",
+			"public/pool/../../outside.deb",
+			"public/../secrets",
+			"public/..",
+		} {
+			if got, err := localPath(dir, "public/", key); err == nil {
+				t.Errorf("localPath(%q, %q) = %q, want an error", dir, key, got)
+			}
 		}
 	}
 	// A key that merely contains ".." inside a segment name is fine.
-	if _, err := localPath("/work/aptrepo", "public/", "public/pool/a..b.deb"); err != nil {
-		t.Errorf("localPath on a harmless '..' substring: %v", err)
+	for _, dir := range []string{"/work/aptrepo", ".", "aptrepo"} {
+		if _, err := localPath(dir, "public/", "public/pool/a..b.deb"); err != nil {
+			t.Errorf("localPath(%q) on a harmless '..' substring: %v", dir, err)
+		}
 	}
 }
 

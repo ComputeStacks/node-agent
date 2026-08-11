@@ -22,8 +22,8 @@ Because step 3 rebuilds the index from whatever step 2 left on disk, a pull that
 quietly comes back short would publish an index listing only the release being
 cut — silently un-installing every older version. So `pull`:
 
-- **refuses an empty listing** (`--allow-empty` overrides, for bootstrapping a
-  genuinely new repo);
+- **refuses an empty listing.** `--allow-empty` overrides it, but deliberately
+  cannot be reached from CI — see "Bootstrapping a new pool" below;
 - **fails the whole pull if any single object fails**, after retrying it;
 - writes each object to a `.part` file and renames on success, and checks the
   bytes received against the size the listing reported — so a file present in the
@@ -48,6 +48,41 @@ cut — silently un-installing every older version. So `pull`:
 
 Re-running a tag is safe: `replace_existing_artifacts` lets GoReleaser overwrite
 assets it already uploaded, so a failure in steps 2–4 can simply be retried.
+
+## Bootstrapping a new pool
+
+Neither workflow can pass `--allow-empty`, and that is on purpose. `release.yml`
+holds the signing credentials behind a protected Environment with required
+reviewers, and an accidental `--allow-empty` there would publish an index built
+from an empty pool — listing only the release being cut and silently
+un-installing every older version, which is the failure the refusal exists to
+prevent. Widening that workflow's trigger surface to carry an escape hatch costs
+more than the rare manual step below.
+
+So an empty pool — a brand-new bucket, or a changed `APT_S3_PREFIX` — is seeded by
+hand, once, before the first release. With the same `APT_S3_*` variables and AWS
+credentials the workflows use, exported locally:
+
+```sh
+mkdir -p aptrepo
+go run ./cmd/apt-publish pull aptrepo --allow-empty   # confirms creds; downloads nothing
+mkdir -p aptrepo/pool/main/c/cs-agent                 # pull created no pool/ — it was empty
+cp /path/to/cs-agent_X.Y.Z_*.deb aptrepo/pool/main/c/cs-agent/
+APT_GPG_KEY_ID=... ./scripts/build-apt-repo.sh aptrepo
+go run ./cmd/apt-publish push aptrepo
+```
+
+After that the pool is non-empty and both workflows run unmodified — `pull` finds
+objects and never needs the flag again.
+
+Two things to know if you are doing this:
+
+- **`--allow-empty` applies to `pull` only.** `parseArgs` rejects it on `push`, so
+  a mistyped command fails rather than doing something adjacent to what was meant.
+- **A relative directory works**, including `.` — `apt-publish pull .` is a valid
+  invocation. It was not always: until v3.2.0 the containment check rejected every
+  key when the target directory was `.` or empty, which broke exactly this
+  bootstrap path while leaving CI (which passes `aptrepo`) unaffected.
 
 ## One-time setup
 

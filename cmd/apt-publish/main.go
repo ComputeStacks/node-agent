@@ -267,11 +267,23 @@ func listPool(ctx context.Context, client s3API, bucket, poolPrefix string) ([]p
 // store, not input we generate, and the pool is planned to be shared with other
 // packages' CI — so a key carrying ".." segments must fail the pull rather than
 // write somewhere in the runner's filesystem.
+//
+// The containment test is filepath.Rel, not a string prefix on the joined path.
+// filepath.Join cleans its result, so a bare relative dir loses the "./" that a
+// prefix test would need: with dir ".", "" or "./" every ordinary key produced a
+// path like "pool/..." that does not start with "./", and the prefix form rejected
+// the entire pull. Rel compares the two as paths instead of as text, so "." and ""
+// behave like any other directory. Escapes are exactly the results that walk up out
+// of dir — "..", or ".." followed by a separator — and the separator is required so
+// a sibling name such as "..foo" is not mistaken for one. filepath.Abs would also
+// work, but it resolves against the process's working directory, which would make
+// this function's result depend on where the test happens to run.
 func localPath(dir, prefix, key string) (string, error) {
 	rel := strings.TrimPrefix(key, prefix) // e.g. pool/main/c/cs-agent/...
 	dst := filepath.Join(dir, filepath.FromSlash(rel))
 	cleanDir := filepath.Clean(dir)
-	if dst != cleanDir && !strings.HasPrefix(dst, cleanDir+string(filepath.Separator)) {
+	inside, err := filepath.Rel(cleanDir, dst)
+	if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("key %q resolves outside %s", key, cleanDir)
 	}
 	return dst, nil
