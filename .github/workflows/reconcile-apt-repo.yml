@@ -42,8 +42,22 @@ jobs:
         with:
           go-version: "1.24"
 
-      - name: Install apt-ftparchive
-        run: sudo apt-get update && sudo apt-get install -y apt-utils
+      # apt-ftparchive ships in apt-utils, which the runner image already carries ("apt-utils
+      # is already the newest version" in every successful run), so the install is a fallback
+      # for an image that ever drops it and the apt-get update behind it does not run at all
+      # in the normal case. It was not a free no-op: on 2026-08-19 the Ubuntu mirror hung
+      # mid-fetch with no timeout of its own and the step sat silent for 29 minutes, until the
+      # job timeout killed a reconcile that had not yet reached the pool. A stall here is
+      # expensive out of proportion to the step, because the job holds the shared apt-publish
+      # concurrency group while it burns: releases and every later reconcile queue behind it.
+      # The step timeout bounds the fallback so a bad mirror fails fast and names itself.
+      - name: Ensure apt-ftparchive is available
+        timeout-minutes: 3
+        run: |
+          if ! command -v apt-ftparchive >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y apt-utils
+          fi
 
       - name: Import GPG signing key
         id: gpg
