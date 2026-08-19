@@ -5,14 +5,16 @@ import (
 	"cs-agent/containermgr"
 	"cs-agent/sshremote"
 	"cs-agent/types"
+	"encoding/json"
 	"errors"
+	"io"
 	"math/rand"
 	"reflect"
 	"strconv"
 	"time"
 
-	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	volumeTypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
@@ -46,10 +48,14 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	// Ensure image exists
 	_, _, missingImage := cli.ImageInspectWithRaw(ctx, viper.GetString("backups.borg.image"))
 	if missingImage != nil {
-		_, err := cli.ImagePull(ctx, viper.GetString("backups.borg.image"), image.PullOptions{})
-		if err != nil {
-			borgLogger().Error("Fatal error pulling image", "error", clientErr.Error())
-			return false, err
+		body, pullErr := cli.ImagePull(ctx, viper.GetString("backups.borg.image"), image.PullOptions{})
+		if pullErr != nil {
+			borgLogger().Error("Fatal error pulling image", "error", pullErr.Error())
+			return false, pullErr
+		}
+		if streamErr := drainImagePull(body); streamErr != nil {
+			borgLogger().Error("Fatal error pulling image", "error", streamErr.Error())
+			return false, streamErr
 		}
 	}
 
@@ -110,6 +116,41 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// drainImagePull consumes an image pull to completion and reports the failure it carried.
+//
+// Two things make this necessary rather than tidy. ImagePull's error covers the REQUEST
+// only: the pull itself streams its outcome back in the body, so a pull that could not
+// authenticate or could not find the tag returns a nil error and reports it as an `error`
+// record partway through the stream. And the body is the caller's to close — discarding it
+// leaks the connection and lets the create below race ahead of a pull that has not
+// finished, which is the shape of the "wait 1 second to make sure image is available"
+// sleep in the mysql strategy.
+//
+// Reading to EOF is therefore both the close and the wait. The first error record is
+// returned, because everything after it describes a pull that is already lost.
+func drainImagePull(body io.ReadCloser) error {
+	if body == nil {
+		return nil
+	}
+	defer body.Close()
+
+	decoder := json.NewDecoder(body)
+	for {
+		var record struct {
+			Error string `json:"error"`
+		}
+		if err := decoder.Decode(&record); err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if record.Error != "" {
+			return errors.New(record.Error)
+		}
+	}
 }
 
 // containerSpec is the decided-by-configuration part of InitBackupContainer: the labels,

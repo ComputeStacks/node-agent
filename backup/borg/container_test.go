@@ -2,6 +2,7 @@ package borg
 
 import (
 	"cs-agent/types"
+	"io"
 	"strings"
 	"testing"
 
@@ -256,4 +257,84 @@ func TestSSHRepoRemoveCommand(t *testing.T) {
 	if _, ok := sshRepoRemoveCommand("bad;name"); ok {
 		t.Error("expected an unsafe repository name to be rejected")
 	}
+}
+
+// TestDrainImagePullReportsTheStreamsOwnError is the regression guard for a pull whose
+// failure never reaches the caller. ImagePull returns a nil error for a pull that the
+// daemon then abandons — the reason arrives as an `error` record inside the body — so a
+// caller that only checks the returned error treats "manifest not found" as a successful
+// pull and fails microseconds later on a create that cannot find the image.
+//
+// The records below are the shape docker streams: newline-delimited JSON objects, progress
+// first, and the error (when there is one) partway through rather than at the end.
+func TestDrainImagePullReportsTheStreamsOwnError(t *testing.T) {
+	cases := []struct {
+		name   string
+		stream string
+		want   string // "" means the pull is to be reported as having succeeded
+	}{
+		{
+			name:   "a pull that completed carries no error",
+			stream: `{"status":"Pulling from computestacks/cs-docker-borg","id":"1.6"}` + "\n" + `{"status":"Digest: sha256:abc"}` + "\n" + `{"status":"Status: Downloaded newer image"}`,
+		},
+		{
+			name:   "an empty stream is not a failure",
+			stream: "",
+		},
+		{
+			name:   "the error record is reported",
+			stream: `{"status":"Pulling from computestacks/cs-docker-borg","id":"1.6"}` + "\n" + `{"errorDetail":{"message":"manifest for cs-docker-borg:1.6 not found"},"error":"manifest for cs-docker-borg:1.6 not found"}`,
+			want:   "manifest for cs-docker-borg:1.6 not found",
+		},
+		{
+			name:   "a truncated stream is reported rather than read as success",
+			stream: `{"status":"Pulling from computestacks/cs-docker-borg","id":"1.6"}` + "\n" + `{"status":"Downloa`,
+			want:   "unexpected EOF",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := drainImagePull(io.NopCloser(strings.NewReader(tc.stream)))
+
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("drainImagePull reported %q for a pull that carried no error", err.Error())
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("drainImagePull reported success for a stream carrying %q", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("drainImagePull reported %q, want it to carry %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// TestDrainImagePullClosesTheBody pins the close, which is the other half of why this
+// function exists: the body is the caller's to close, and a pull whose body is discarded
+// leaks the connection. Reading to EOF is also what makes the create that follows wait for
+// a pull that has not finished.
+func TestDrainImagePullClosesTheBody(t *testing.T) {
+	body := &closeRecorder{Reader: strings.NewReader(`{"status":"Status: Downloaded newer image"}`)}
+
+	if err := drainImagePull(body); err != nil {
+		t.Fatalf("drainImagePull reported %q for a pull that carried no error", err.Error())
+	}
+	if !body.closed {
+		t.Fatal("drainImagePull returned without closing the body")
+	}
+}
+
+// closeRecorder is a body that remembers whether it was closed.
+type closeRecorder struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeRecorder) Close() error {
+	c.closed = true
+	return nil
 }
