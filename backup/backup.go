@@ -60,9 +60,10 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			// Build backup container
 			repoErr := repo.Setup(&vol)
 			if repoErr != nil {
+				reason := borgFailure(repoErr)
 				projectEvent.EventLog.Status = "failed"
-				projectEvent.PostEventUpdate("agent-d4c34f1d89c20aa6", repoErr.ToYaml())
-				return errors.New(repoErr.Message)
+				projectEvent.PostEventUpdate("agent-d4c34f1d89c20aa6", reason)
+				return errors.New(reason)
 			}
 		} else if findRepoMsg.MsgID == borg.MsgIDRepositoryInvalid && viper.GetBool("backups.borg.ssh.enabled") {
 			// An SSH repository whose directory exists but was never initialized: borg
@@ -78,14 +79,23 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 			// Build backup container
 			repoErr := repo.Setup(&vol)
 			if repoErr != nil {
+				reason := borgFailure(repoErr)
 				projectEvent.EventLog.Status = "failed"
-				projectEvent.PostEventUpdate("agent-7fad20a06cbd26a2", repoErr.ToYaml())
-				return errors.New(repoErr.Message)
+				projectEvent.PostEventUpdate("agent-7fad20a06cbd26a2", reason)
+				return errors.New(reason)
 			}
 		} else {
+			// borgFailure, not ToYaml(), and the SAME value in both places. ToYaml renders
+			// the whole LogMessage, so a docker-level failure — which carries no msgid or
+			// levelname — reached the controller as five empty fields wrapped around one
+			// line of text. The controller reads the accumulated output ahead of the task
+			// error, so the struct dump was what an operator actually saw; posting the
+			// reason and returning it keeps those two the same, as the create path below
+			// and the delete path already do.
+			reason := borgFailure(findRepoMsg)
 			projectEvent.EventLog.Status = "failed"
-			projectEvent.PostEventUpdate("agent-c4087f229d50d4dc", findRepoMsg.ToYaml())
-			return errors.New(borgFailure(findRepoMsg))
+			projectEvent.PostEventUpdate("agent-c4087f229d50d4dc", reason)
+			return errors.New(reason)
 		}
 	}
 
