@@ -1,5 +1,77 @@
 # Changelog
 
+## v3.2.1
+
+Patch release for v3.2.0. **No migrations (`control.db` stays at schema `v4`), no config
+changes, no API changes.** Three fixes in the path every borg operation goes through to open
+a repository: a transient kernel `ENOMEM` on the repository volume's mount is now retried
+rather than failing the operation, a failed image pull reports its reason instead of
+panicking, and a repository that cannot be opened reports a readable reason rather than a
+rendered log structure. **Upgrade if backups intermittently fail with `cannot allocate
+memory`**, or if a failed backup's reported reason arrives as a block of mostly-empty fields.
+
+One change alters behaviour rather than only reporting: a container start that fails on
+`ENOMEM` is attempted three times over ten seconds before the failure is reported, so a
+backup that is going to fail that way takes ten seconds longer to say so.
+
+- [FIX] **A backup container whose volume mount fails on kernel `ENOMEM` is retried.** The
+  volume mount happens inside `ContainerStart`, in the daemon, so a kernel that cannot
+  allocate memory for it fails the whole operation — a backup, a prune, an export. Under
+  memory pressure that refusal can come in windows of a few seconds, with mounts a second
+  either side succeeding, which makes it exactly the shape a short retry converts into a
+  success. Create-and-start is now attempted up to three times, five seconds apart.
+  It is the **pair** that is re-attempted, not the start: the container runs with
+  `AutoRemove`, and the daemon force-removes an `AutoRemove` container as soon as its start
+  fails — before the start call returns — so re-starting the same container reports
+  `No such container` and replaces the reason the operation actually failed. A named volume
+  is exempt from that removal, so neither the daemon's nor the agent's cleanup can take the
+  repository's cache volume with it. The gate is deliberately narrow, matching only the
+  kernel's own `cannot allocate memory`: every other start failure is reported exactly as
+  before, because a gate that matched more would spend the delay per volume across a whole
+  sweep re-attempting conditions a retry cannot fix — an unreachable backup server, an image
+  that is not there. Matched on the message text because there is no errno left to compare
+  against by the time the daemon's error reaches the agent. **A retry logs at `WARN`** with
+  the repository and the attempt, so a failure the retry absorbs still leaves a trace;
+  without it a host that stopped producing the condition and a retry quietly covering for one
+  cannot be told apart.
+- [FIX] **A failed image pull reports its reason instead of panicking.** The pull-failure
+  branch logged a variable that is guaranteed nil where it stands — the function has already
+  returned on it — so a pull whose request failed took the agent into a nil dereference.
+  `prune`'s `recover` caught it, which meant the whole maintenance sweep aborted and what was
+  logged was a panic rather than the pull error. The branch also discarded the pull's response
+  body, and that is the half that matters more often: `ImagePull`'s returned error covers the
+  REQUEST only, so a pull the daemon then abandons — an unauthenticated registry, a tag that
+  is not there — comes back with a nil error and reports the reason as an `error` record
+  inside the stream. That stream is now read to completion, its first error record reported,
+  and the body closed rather than leaked. Reading to completion is also what makes the
+  container create that follows wait for a pull that has not finished.
+- [FIX] **A repository that cannot be opened reports a readable reason.** The three paths
+  that report a failed repository lookup or a failed `borg init` rendered the whole
+  `LogMessage` structure, so a docker-level failure — which carries no msgid, levelname or
+  timestamp — reached the controller as one line of text wrapped in five empty fields. The
+  returned error had the opposite problem: it used the bare message, dropping the msgid. Both
+  now carry the same `(msgid) reason`, matching the archive-create, restore and delete paths.
+  This is what a consumer reading the task's accumulated output sees, so it is the reason an
+  operator actually reads.
+
+**Operator note — the kernel's own free-memory reserve.** The retry above is a fallback, not
+a cure: the condition it covers is host-side memory pressure. `vm.min_free_kbytes` is
+auto-computed at boot and **capped at 64 MB regardless of how much RAM the machine has**, so
+on a large node with no swap and tens of gigabytes in page cache the global reserve is thin,
+and an allocation that cannot wait fails at the watermark instead of stalling in reclaim.
+Raising it — 512 MB is a reasonable starting point on a node with 64 GB or more, at the cost
+of roughly that much page cache — is the host-side half of the first fix, and is worth doing
+whether or not this release is installed:
+
+```
+# /etc/sysctl.d/99-computestacks-memory.conf
+vm.min_free_kbytes = 524288
+```
+
+Upgrading is a plain `apt-get install cs-agent` per node — no `agent.yml` changes, no
+controller coordination, and no maintenance window. Because there is no migration,
+downgrading is a normal `apt-get install --allow-downgrades cs-agent=3.2.0`.
+
 ## v3.2.0
 
 Diagnosability release for the restore path — **no migrations (`control.db` stays at schema `v4`)**,
