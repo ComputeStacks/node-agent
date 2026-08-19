@@ -2,9 +2,11 @@ package borg
 
 import (
 	"cs-agent/types"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/mount"
 	"github.com/spf13/viper"
@@ -337,4 +339,65 @@ type closeRecorder struct {
 func (c *closeRecorder) Close() error {
 	c.closed = true
 	return nil
+}
+
+// TestIsTransientMountFailure pins the gate that decides whether a backup container's
+// failure to start is worth re-attempting. The strings are what the docker API actually
+// returns — the first is a captured production failure, kernel ENOMEM on the NFSv4 mount of
+// a repository volume — because the ENOMEM has no errno left by the time it arrives here
+// and the only thing available to match on is this text.
+//
+// The non-matching cases are the point of the test as much as the matching one: each is a
+// failure a retry cannot fix, and each would otherwise cost the retry delay on every volume
+// of a sweep before reporting a condition that was true immediately.
+func TestIsTransientMountFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "kernel ENOMEM mounting the repository volume",
+			err:  errors.New(`error while mounting volume '/var/lib/docker/volumes/b-26a53da6-8b3c-4105-8f96-1ac1e1b246f3/_data': failed to mount local volume: mount :/mnt/backup005/node005/b-26a53da6-8b3c-4105-8f96-1ac1e1b246f3:/var/lib/docker/volumes/b-26a53da6-8b3c-4105-8f96-1ac1e1b246f3/_data, flags: 0x400, data: addr=172.16.2.2,nfsvers=4,rsize=32768,wsize=32768: cannot allocate memory`),
+			want: true,
+		},
+		{
+			name: "an unreachable backup server is not retried",
+			err:  errors.New(`error while mounting volume: failed to mount local volume: mount :/mnt/backups/b-vol:/var/lib/docker/volumes/b-vol/_data: connection timed out`),
+		},
+		{
+			name: "a missing image is not retried",
+			err:  errors.New("Error response from daemon: No such image: ghcr.io/computestacks/cs-docker-borg:1.6"),
+		},
+		{
+			name: "a container that vanished is not retried",
+			err:  errors.New("Error response from daemon: No such container: 4f1a"),
+		},
+		{
+			name: "no error is not a failure",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isTransientMountFailure(tc.err); got != tc.want {
+				t.Fatalf("isTransientMountFailure = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMountRetryOutlastsTheObservedWindow guards the sizing of the retry against the
+// condition it exists for. The kernel refused the mount in windows of roughly three
+// seconds; if the attempts and the delay are ever retuned so that they span less than
+// that, the retry stops covering the thing it was added for and every failure it was
+// meant to absorb comes back.
+func TestMountRetryOutlastsTheObservedWindow(t *testing.T) {
+	const observedWindow = 3 * time.Second
+
+	spanned := time.Duration(mountFailureAttempts-1) * mountFailureDelay
+	if spanned <= observedWindow {
+		t.Fatalf("%d attempts %s apart span %s, which does not outlast the observed %s failure window",
+			mountFailureAttempts, mountFailureDelay, spanned, observedWindow)
+	}
 }

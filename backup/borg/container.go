@@ -11,6 +11,7 @@ import (
 	"math/rand"
 	"reflect"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -59,44 +60,33 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 		}
 	}
 
-	// Generate Container Name
-	t := time.Now()
-	rand.New(rand.NewSource(time.Now().UnixNano())) // Seed for random container name
-	randNumber := 10 + rand.Intn(1000-10)
-	containerName := "backup-" + strconv.Itoa(randNumber) + string(t.Format("150405"))
-
-	labels, borgEnv, mounts := r.containerSpec(target)
-
-	hostConfig := container.HostConfig{
-		NetworkMode: "none",
-		Binds:       []string{},
-		Mounts:      mounts,
-		AutoRemove:  true,
-		Privileged:  viper.GetBool("docker.privileged"),
+	var containerID string
+	for attempt := 1; ; attempt++ {
+		id, startErr := r.createAndStartContainer(ctx, cli, target)
+		if startErr == nil {
+			containerID = id
+			break
+		}
+		if attempt >= mountFailureAttempts || !isTransientMountFailure(startErr) {
+			return false, startErr
+		}
+		// Logged, and at WARN, because a retry that works is otherwise invisible: the
+		// operation completes, nothing is captured, and the condition that needed two
+		// attempts leaves no trace. That matters for a failure the host is expected to
+		// stop producing — without this line "the host was fixed" and "the retry is
+		// absorbing it" cannot be told apart, and neither can a window that has grown
+		// long enough to outlast every attempt.
+		borgLogger().Warn("Retrying the backup container after a transient mount failure",
+			"repository", r.Name, "attempt", attempt, "attempts", mountFailureAttempts, "error", startErr.Error())
+		time.Sleep(mountFailureDelay)
 	}
 
-	hostConfig.NetworkMode = "host"
-
-	resp, err := cli.ContainerCreate(ctx, &container.Config{
-		Image:  viper.GetString("backups.borg.image"),
-		Labels: labels,
-		Env:    borgEnv,
-	}, &hostConfig, nil, nil, containerName)
-
-	if err != nil {
-		return false, err
-	}
-
-	if err := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
-		return false, err
-	}
-
-	r.Container = &containermgr.Container{ID: resp.ID}
+	r.Container = &containermgr.Container{ID: containerID}
 
 	// time.Sleep(250 * time.Millisecond)
 	isReady := false
 	for counter := 1; counter < 12; counter++ {
-		c, errRunning := cli.ContainerInspect(ctx, resp.ID)
+		c, errRunning := cli.ContainerInspect(ctx, containerID)
 		if errRunning == nil && c.State.Running {
 			isReady = true
 			break
@@ -116,6 +106,93 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// mountFailureAttempts is how many times a backup container is created and started before
+// a mount failure is reported, and mountFailureDelay is the wait between attempts.
+//
+// Sized from the observed condition rather than taste: the kernel refuses the NFS mount in
+// windows of roughly three seconds, with mounts succeeding within a second either side, and
+// each refusal comes back in well under a second. Two retries five seconds apart therefore
+// span a window comfortably longer than any that has been measured. The cost of the wait is
+// paid only on a failure, and it is bounded — a backup that is going to fail anyway takes
+// ten seconds longer to say so.
+const (
+	mountFailureAttempts = 3
+	mountFailureDelay    = 5 * time.Second
+)
+
+// isTransientMountFailure reports whether a container failed to start because the kernel
+// could not allocate memory while mounting the repository volume.
+//
+// It matches on the message text, which is not a preference: the ENOMEM is raised by the
+// kernel inside the daemon's own mount call, and by the time it reaches this process it has
+// been rendered into the API's error string. There is no errno left for errors.Is to
+// compare against.
+//
+// Deliberately narrow. A gate that matched more would spend mountFailureDelay per volume
+// across a whole sweep re-attempting failures a retry cannot fix — a wrong nfs_host, an
+// image that is not there, a repository name the server rejects — and would turn a node
+// that is simply misconfigured into one that takes minutes to say so. Matching too little
+// only means a retryable failure is reported as it is today, which is why this is the safer
+// direction to be wrong in.
+func isTransientMountFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "cannot allocate memory")
+}
+
+// createAndStartContainer creates one attempt's backup container and starts it, returning
+// the container's id.
+//
+// Create and start are ONE unit, and that is the whole reason this is a function. The
+// container runs with AutoRemove, and the daemon force-removes an AutoRemove container as
+// soon as its start fails — before the start call even returns. So the container a retry
+// would want to start again no longer exists: retrying the start alone reports "No such
+// container" and replaces the reason the operation actually failed. The NFS mount is
+// performed by the daemon inside that same start, which is what makes the pair the smallest
+// thing worth re-attempting.
+//
+// The name is generated per attempt, so two attempts cannot collide on it.
+func (r *Repository) createAndStartContainer(ctx context.Context, cli *client.Client, target *types.Volume) (string, error) {
+	t := time.Now()
+	randNumber := 10 + rand.Intn(1000-10)
+	containerName := "backup-" + strconv.Itoa(randNumber) + t.Format("150405")
+
+	labels, borgEnv, mounts := r.containerSpec(target)
+
+	hostConfig := container.HostConfig{
+		NetworkMode: "host",
+		Binds:       []string{},
+		Mounts:      mounts,
+		AutoRemove:  true,
+		Privileged:  viper.GetBool("docker.privileged"),
+	}
+
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image:  viper.GetString("backups.borg.image"),
+		Labels: labels,
+		Env:    borgEnv,
+	}, &hostConfig, nil, nil, containerName)
+
+	if err != nil {
+		return "", err
+	}
+
+	if startErr := cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); startErr != nil {
+		// Normally a no-op: the daemon has already removed it. But a removal the daemon
+		// could not complete is only LOGGED on its side, so this covers the case where the
+		// container is left behind holding the mount it failed to make. The b-<name> cache
+		// volume is a named mount and is never removed with a container, so neither the
+		// daemon's removal nor this one can take the repository with it.
+		if rmErr := cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true}); rmErr != nil && !client.IsErrNotFound(rmErr) {
+			borgLogger().Debug("Could not remove a backup container that failed to start", "container", resp.ID, "error", rmErr.Error())
+		}
+		return "", startErr
+	}
+
+	return resp.ID, nil
 }
 
 // drainImagePull consumes an image pull to completion and reports the failure it carried.
