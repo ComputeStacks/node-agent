@@ -25,7 +25,7 @@ func Reconcile(ctx context.Context, st *store.Store) {
 
 	// Cross-project isolation stays iptables-based in DOCKER-USER and is
 	// independent of the published-port table; always apply it.
-	ensureProjectIsolation()
+	ensureProjectIsolation(ctx)
 
 	populated, err := st.IsPopulated(ctx, store.MetaFirewallPopulated)
 	if err != nil {

@@ -29,6 +29,13 @@ func ConfigureApp() {
 	// For docker environments using the older legacy iptables, switch to: iptables-legacy
 	viper.SetDefault("host.iptables-cmd", "iptables")
 
+	////
+	// Specify which ip6tables command to use for the cross-project isolation
+	// rules. Independent of host.iptables-cmd; setting one does not imply the
+	// other. For docker environments using the older legacy iptables, switch
+	// to: ip6tables-legacy
+	viper.SetDefault("host.ip6tables-cmd", "ip6tables")
+
 	// For testing purposes only, dont set `true` in production environments.
 	viper.SetDefault("docker.privileged", false)
 

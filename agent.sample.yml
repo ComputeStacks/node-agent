@@ -3,6 +3,9 @@ host:
   # If using the docker container in an older environment, set to: iptables-legacy
   # All others, including non-docker installations, should use iptables.
   iptables-cmd: iptables
+  # IPv6 counterpart, used by the cross-project isolation rules. Independent of
+  # iptables-cmd. In an older legacy-iptables environment, set to: ip6tables-legacy
+  ip6tables-cmd: ip6tables
 computestacks:
   host: http://localhost:3000
 store:

@@ -151,6 +151,13 @@ func buildPlan(rules *NatRules) *renderPlan {
 // parseIPv4 returns the 4-byte representation of s, or nil if s is not a valid
 // IPv4 address. (net.ParseIP returns a 16-byte form for IPv4 literals; To4
 // normalises and also rejects IPv6.)
+//
+// Rejecting IPv6 here is deliberate and stays correct even where a project
+// bridge network is dual-stack: this is the published-port NAT layer, and
+// published ports are IPv4-only (the cs_agent nftables table is
+// TableFamilyIPv4). A container's IPv6 connectivity is egress-only, so there is
+// no v6 destination to DNAT to. Not an oversight -- do not "fix" it by
+// accepting v6 here without a v6 table to render into.
 func parseIPv4(s string) net.IP {
 	ip := net.ParseIP(s)
 	if ip == nil {
