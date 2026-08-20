@@ -1320,3 +1320,30 @@ func TestSentryCaptureFiresOnTheFailingEdge(t *testing.T) {
 		t.Errorf("unordered after apply: captured %v, want %v", captured, want)
 	}
 }
+
+// The jump check must not accept a jump to a chain whose name merely starts with
+// DOCKER-USER. A Contains-based test would, and the D7 blind spot would reopen
+// silently on a host where such a chain exists and the real jump is gone.
+func TestForwardJumpPresent(t *testing.T) {
+	cases := []struct {
+		name   string
+		lines  []string
+		expect bool
+	}{
+		{"plain jump", []string{"-P FORWARD DROP", "-A FORWARD -j " + isoChain}, true},
+		{"conditional jump still counts", []string{"-A FORWARD -i eth0 -j " + isoChain}, true},
+		{"jump among other daemons' jumps", []string{"-A FORWARD -j DOCKER-FORWARD", "-A FORWARD -j " + isoChain, "-A FORWARD -j ts-forward"}, true},
+		{"no jump at all", []string{"-P FORWARD DROP", "-A FORWARD -j DOCKER-FORWARD"}, false},
+		{"empty listing", []string{}, false},
+		{"policy line only", []string{"-P FORWARD ACCEPT"}, false},
+		{"prefix-collision chain is not our jump", []string{"-A FORWARD -j " + isoChain + "2"}, false},
+		{"prefix-collision with our jump absent", []string{"-A FORWARD -j DOCKER-FORWARD", "-A FORWARD -j " + isoChain + "-EXTRA"}, false},
+		{"our chain named as a source, not a target", []string{"-A " + isoChain + " -j RETURN"}, false},
+		{"trailing whitespace tolerated", []string{"-A FORWARD -j " + isoChain + " "}, true},
+	}
+	for _, c := range cases {
+		if got := forwardJumpPresent(c.lines); got != c.expect {
+			t.Errorf("%s: forwardJumpPresent = %v, want %v", c.name, got, c.expect)
+		}
+	}
+}

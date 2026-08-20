@@ -282,3 +282,75 @@ func TestIPv6BridgeStateString(t *testing.T) {
 		}
 	}
 }
+
+// ConfigOnly networks are placeholders that hold configuration for other
+// networks to inherit; docker cannot run containers on one, so it has no bridge
+// interface on this host and no DOCKER-CT conntrack rule of its own. Counting
+// one would make the agent's -m conntrack insert the FIRST IPv6 conntrack
+// registration on the host -- the side effect gating on docker state exists to
+// prevent. Deleting the ConfigOnly guard in classifyIPv6Bridges must fail here.
+func TestClassifyIPv6BridgesIgnoresConfigOnly(t *testing.T) {
+	cases := []struct {
+		name   string
+		nets   []network.Summary
+		expect ipv6BridgeState
+	}{
+		{
+			"config-only IPv6 bridge alone is not presence",
+			[]network.Summary{{Name: "cfg", Driver: "bridge", EnableIPv6: true, ConfigOnly: true}},
+			ipv6BridgeNone,
+		},
+		{
+			"config-only alongside an IPv4-only real bridge is not presence",
+			[]network.Summary{
+				{Name: "cfg", Driver: "bridge", EnableIPv6: true, ConfigOnly: true},
+				{Name: "proj_1", Driver: "bridge", EnableIPv6: false},
+			},
+			ipv6BridgeNone,
+		},
+		{
+			"a real IPv6 bridge still counts when a config-only one is present",
+			[]network.Summary{
+				{Name: "cfg", Driver: "bridge", EnableIPv6: true, ConfigOnly: true},
+				{Name: "proj_1", Driver: "bridge", EnableIPv6: true},
+			},
+			ipv6BridgePresent,
+		},
+		{
+			"config-only listed after a real IPv6 bridge does not undo presence",
+			[]network.Summary{
+				{Name: "proj_1", Driver: "bridge", EnableIPv6: true},
+				{Name: "cfg", Driver: "bridge", EnableIPv6: true, ConfigOnly: true},
+			},
+			ipv6BridgePresent,
+		},
+	}
+	for _, c := range cases {
+		got, unreachable := classifyIPv6Bridges(c.nets)
+		if got != c.expect {
+			t.Errorf("%s: classifyIPv6Bridges = %v, want %v", c.name, got, c.expect)
+		}
+		if len(unreachable) != 0 {
+			t.Errorf("%s: unexpected unreachable %v", c.name, unreachable)
+		}
+	}
+}
+
+// A config-only network with an unmatchable custom bridge name must not be
+// reported as unreachable either: it has no interface at all, so warning about
+// its interface name would be noise about a network nothing was going to reach.
+func TestClassifyIPv6BridgesConfigOnlyNotReportedUnreachable(t *testing.T) {
+	nets := []network.Summary{
+		{
+			Name: "cfg", Driver: "bridge", EnableIPv6: true, ConfigOnly: true,
+			Options: map[string]string{bridgeNameOption: "cs0"},
+		},
+	}
+	got, unreachable := classifyIPv6Bridges(nets)
+	if got != ipv6BridgeNone {
+		t.Errorf("classifyIPv6Bridges = %v, want %v", got, ipv6BridgeNone)
+	}
+	if len(unreachable) != 0 {
+		t.Errorf("config-only network reported as unreachable: %v", unreachable)
+	}
+}

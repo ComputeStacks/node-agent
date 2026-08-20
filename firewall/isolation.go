@@ -264,7 +264,7 @@ func ensureProjectIsolationFamily(f isoFamily) {
 		// so a container-start burst can lose the lock.
 		csFirewallLog().Warn("could not read FORWARD to verify the DOCKER-USER jump", "family", f.name, "err", err.Error())
 	} else {
-		missing := ruleIndex(forward, isoJumpSpec) < 0
+		missing := !forwardJumpPresent(forward)
 		if missing {
 			csFirewallLog().Error("FORWARD does not jump to DOCKER-USER; cross-project isolation rules are not being evaluated", "family", f.name, "forward", strings.Join(forward, " | "))
 		}
@@ -506,6 +506,23 @@ func chainRules(bin, chain string) ([]string, error) {
 func chainHasRules(lines []string) bool {
 	for _, l := range lines {
 		if strings.HasPrefix(strings.TrimSpace(l), "-A ") {
+			return true
+		}
+	}
+	return false
+}
+
+// forwardJumpPresent reports whether any FORWARD rule jumps to isoChain.
+//
+// The match is an exact terminal one, NOT a substring: "-j DOCKER-USER" is a
+// prefix of "-j DOCKER-USER2", so a Contains test would accept a jump to an
+// unrelated chain whose name merely starts with ours and report the isolation
+// rules as reachable while nothing evaluates them. A jump target is terminal in
+// `-S` output, so anchoring at the end of the line is sufficient and still
+// accepts a conditional jump ("-A FORWARD -i eth0 -j DOCKER-USER").
+func forwardJumpPresent(lines []string) bool {
+	for _, l := range lines {
+		if strings.HasSuffix(strings.TrimSpace(l), isoJumpSpec) {
 			return true
 		}
 	}

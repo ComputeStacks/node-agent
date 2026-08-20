@@ -57,9 +57,9 @@ otherwise remove it.
 - [CHANGE] **A failure to install or verify the rules is now reported to Sentry**, once per
   transition into the failed state rather than on every reconcile, so a persistent problem
   produces one report instead of one a minute. It continues to be logged on every pass.
-  A failure to *read* a chain is reported separately and is not treated as evidence that
-  the rules are missing — the agent shares the `xtables` lock with docker, so losing it
-  must not be mistaken for a broken firewall.
+  A failure to *read* a chain is logged but never reported to Sentry, and is not treated as
+  evidence that the rules are missing — the agent shares the `xtables` lock with docker, so
+  losing it must not be mistaken for a broken firewall.
 
   Note for anyone who needs to take the IPv6 rules out by hand: deleting them with
   `ip6tables -D` alone is not enough, because the next reconcile will reinstall them within
