@@ -2,69 +2,35 @@
 
 ## v3.3.0
 
-Minor release. **No migrations (`control.db` stays at schema `v4`), no API changes. One new
-config key: `host.ip6tables-cmd`, defaulting to `ip6tables`.** Cross-project network
-isolation, which until now applied only to IPv4, is now applied to IPv6 as well on a node
-that has an IPv6-enabled docker bridge network, and the agent now verifies that the
-`FORWARD` chain still reaches the isolation rules at all.
+Cross-project network isolation now covers IPv6 as well as IPv4, and the agent verifies that
+the `FORWARD` chain still reaches its rules. **No migrations (`control.db` stays at schema
+`v4`), no API changes.** Upgrading is a plain `apt-get install cs-agent` per node — one new
+`agent.yml` key exists but needs no action unless the host uses legacy iptables. Containers
+in different projects already could not reach each other over IPv6 (docker's default gateway
+mode drops it); this makes that the agent's own guarantee rather than a docker default.
 
-Nothing here closes a gap that was open: on a dual-stack bridge, docker's own default IPv6
-gateway mode already emits a per-bridge cross-bridge `DROP`, so containers in different
-projects could not reach each other over IPv6. These rules make that guarantee the agent's
-own rather than a side effect of a docker default, and they keep it if a bridge is ever
-created with `com.docker.network.bridge.gateway_mode_ipv6=nat-unprotected`, which would
-otherwise remove it.
+- [FEATURE] **Cross-project isolation applied to IPv6.** The three `DOCKER-USER` rules the
+  agent maintains for IPv4 are mirrored into the IPv6 chain, same specs in the same order.
+  They are applied only on a node that has at least one IPv6-enabled docker bridge network,
+  and removed from a node that has none. If docker cannot be reached the rules are left
+  exactly as they are, so a restarting daemon never causes a live rule to be deleted.
+- [FEATURE] **The `FORWARD` jump to `DOCKER-USER` is verified** on every reconcile, for both
+  address families. Previously the rules' contents were checked but never whether the chain
+  was reached, so a `FORWARD` chain rebuilt by something else could leave them in place and
+  unevaluated with nothing reporting it. Presence is checked, not position, and a missing
+  jump is reported rather than repaired.
+- [FEATURE] **New `host.ip6tables-cmd`**, default `ip6tables`, accepting `ip6tables-legacy`.
+  Independent of `host.iptables-cmd` — setting one does not imply the other.
+- [CHANGE] A host with no `ip6tables`, or with IPv6 disabled in the kernel, is unaffected:
+  the IPv6 chain is absent there and skipped, and the IPv4 rules are applied first and
+  independently, so an IPv6 problem cannot delay them.
+- [CHANGE] A failure to install or verify the rules is now reported to Sentry, once per
+  transition into the failed state rather than on every reconcile. A failure to *read* a
+  chain is logged only, never reported — the agent shares the `xtables` lock with docker.
 
-- [FEATURE] **Cross-project isolation is applied to IPv6.** The three `DOCKER-USER` rules
-  the agent maintains for IPv4 — return bridged (same-project) traffic, return
-  cross-project traffic belonging to a published-port connection, drop the rest — are now
-  mirrored into the IPv6 `DOCKER-USER` chain, with the same specs in the same order. The
-  rule specs are interface-wildcard and conntrack-state based, so nothing about them is
-  address-family or subnet specific.
-
-  **They are applied only on a node that has at least one IPv6-enabled docker bridge
-  network, and removed from a node that has none.** This is deliberate rather than
-  incidental: the second rule matches on connection tracking state, and installing an
-  `-m conntrack` rule is what causes the kernel to register IPv6 conntrack hooks in the
-  first place. On a host with no IPv6 bridge that would begin charging the host's own IPv6
-  traffic against the same connection-tracking table as IPv4 — a table whose limit is
-  shared between families — for no benefit. Where an IPv6-enabled bridge does exist, docker
-  has already emitted its own per-network conntrack rule for it, so the agent's rule adds
-  nothing new.
-
-  Detection is a three-state answer, not a boolean: if docker cannot be reached the rules
-  are left exactly as they are. Only a successful answer of "no IPv6-enabled bridges" will
-  remove them, so a restarting docker daemon cannot cause a live isolation rule to be
-  deleted.
-- [FEATURE] **The agent now verifies that `FORWARD` still jumps to `DOCKER-USER`.** The
-  isolation rules live in `DOCKER-USER`, which is only consulted because `FORWARD` jumps to
-  it. Until now the agent checked the rules' contents but never that the chain was reached,
-  so a `FORWARD` chain rebuilt by something else could leave the rules in place and
-  unevaluated, with nothing reporting a problem. The jump is now checked on every reconcile
-  for both address families, and its absence is logged and reported as an error.
-
-  This is a check, not a repair: the agent does not insert or move the jump, and it asserts
-  only that the jump is present, not where it sits — other daemons legitimately write to
-  `FORWARD` and reorder it.
-- [FEATURE] **New `host.ip6tables-cmd` setting**, default `ip6tables`, selecting the binary
-  used for the IPv6 isolation rules. It mirrors `host.iptables-cmd` and accepts
-  `ip6tables-legacy` for an older legacy-iptables environment. The two keys are
-  independent: setting one does not imply the other.
-- [CHANGE] **A host with no `ip6tables`, or with IPv6 disabled in the kernel, is
-  unaffected.** The IPv6 `DOCKER-USER` chain is absent there, which the agent treats as a
-  skip rather than a failure, and the IPv4 rules are applied first and independently — an
-  IPv6 problem cannot prevent or delay them.
-- [CHANGE] **A failure to install or verify the rules is now reported to Sentry**, once per
-  transition into the failed state rather than on every reconcile, so a persistent problem
-  produces one report instead of one a minute. It continues to be logged on every pass.
-  A failure to *read* a chain is logged but never reported to Sentry, and is not treated as
-  evidence that the rules are missing — the agent shares the `xtables` lock with docker, so
-  losing it must not be mistaken for a broken firewall.
-
-  Note for anyone who needs to take the IPv6 rules out by hand: deleting them with
-  `ip6tables -D` alone is not enough, because the next reconcile will reinstall them within
-  a minute. Stop the agent first, or remove the node's IPv6-enabled docker networks and let
-  the agent remove the rules itself.
+  **Operators: to take the IPv6 rules out by hand, stop the agent first** or remove the
+  node's IPv6-enabled docker networks and let the agent remove them. `ip6tables -D` on its
+  own is undone by the next reconcile within a minute.
 
 ## v3.2.1
 
