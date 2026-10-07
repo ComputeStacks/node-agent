@@ -80,6 +80,27 @@ cs-agent -version               # print version / commit / build date
 The agent runs as **root** — it needs the Docker socket and `NET_ADMIN` for firewall
 management.
 
+## Maintenance mode
+
+A node can be put into maintenance from the controller (admin API) or locally on the node.
+Each side places its own **hold**; the node is paused while any hold exists, and each side
+clears only its own. While paused the agent starts no new tasks, skips backup slots and
+prune/compact runs, and cancels restores that had not started yet. Work already running
+finishes. The firewall, the metadata API and desired-state updates keep working.
+
+```bash
+sudo cs-agent maintenance on --reason "docker upgrade" --wait --timeout 2h   # pause and wait until idle
+sudo cs-agent maintenance status --json                                     # read-only status
+sudo cs-agent maintenance off                                               # clear the local hold
+```
+
+`--wait` returns 0 once the local hold is set, nothing is in flight, and the controller has
+acknowledged the hold. Exit codes: `1` usage or the hold was cleared while waiting, `2`
+timed out with work still running, `3` the agent database could not be opened, `4` the
+controller has not acknowledged the hold (`--no-controller` skips that check; avoid it
+while docker is being restarted). Holds persist across restarts and reboots, so clear the
+local hold explicitly when the work is done.
+
 ## Upgrades & rollback
 
 ```bash

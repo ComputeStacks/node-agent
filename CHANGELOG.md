@@ -1,5 +1,31 @@
 # Changelog
 
+## v3.4.0
+
+Node maintenance mode. **No migrations (`control.db` stays at schema `v4`).** New admin API
+routes and a new CLI subcommand; nothing changes until a hold is placed. One new
+`agent.yml` key with a default.
+
+- [FEATURE] **Maintenance holds.** The node can be paused by the controller
+  (`GET/PUT/DELETE /v1/admin/maintenance`) or locally (`cs-agent maintenance on|off|status`).
+  Each source owns its own hold and the node is paused while either exists. Controller
+  writes carry a generation, and a stale one is refused with `409` and the current status.
+- [FEATURE] **While paused** no new task is claimed, scheduled backups and prune/compact
+  skip their slots, and restores that had not started are cancelled. Running work finishes.
+  On exit, missed backup slots are skipped rather than run all at once.
+- [FEATURE] **`cs-agent maintenance on --wait`** blocks until the node is idle and the
+  controller has acknowledged the hold, with distinct exit codes for each way it can fall
+  short. In-flight work includes running tasks, prune/compact, and any running backup
+  container.
+- [FEATURE] **Maintenance state is published on the changelog** as a `node_maintenance`
+  entity, returned only to readers that send `X-CS-Changelog-Types: node_maintenance`.
+  Changelog responses now include `high_water`.
+- [CHANGE] Backup tasks are claimed only once a worker is free, so a task is never marked
+  running while it waits in the queue.
+- [CHANGE] `control.db` now carries a stable `instance_id`, reported by the maintenance API.
+- New `agent.yml` key `maintenance.stale_hold_hours` (default `12`): a hold older than this
+  is logged and reported hourly.
+
 ## v3.3.1
 
 Packaging-only release. **No migrations, no config changes, no API changes.**
