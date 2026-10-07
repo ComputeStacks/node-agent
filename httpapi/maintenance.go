@@ -55,15 +55,16 @@ func (s *Server) handleAdminMaintenancePut(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "gen is required and must be >= 0")
 		return
 	}
-	if strings.TrimSpace(req.Reason) == "" {
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
 		writeError(w, http.StatusBadRequest, "reason is required")
 		return
 	}
-	if len(req.Reason) > maxMaintenanceReasonBytes {
+	if len(reason) > maxMaintenanceReasonBytes {
 		writeError(w, http.StatusBadRequest, "reason too long")
 		return
 	}
-	m, err := s.store.PutControllerHold(r.Context(), req.Reason, *req.Gen)
+	m, err := s.store.PutControllerHold(r.Context(), reason, *req.Gen)
 	s.writeMaintenanceResult(w, r, m, err, "put controller hold")
 }
 

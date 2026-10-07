@@ -133,6 +133,9 @@ func (s *Store) querySchedules(ctx context.Context, query string, args ...any) (
 // in-RAM-cron + separate Consul-KV job write. The caller builds `task` with a
 // fresh unique ID and computes nextFireAt = Next(now). A vanished schedule row
 // (volume removed mid-tick) just advances nothing; the task is still created.
+// If the node is paused for maintenance when the tx runs, no task is created
+// (created=false): the slot is skipped as SkipDueBackup does, advancing
+// next_fire_at and counting the skip.
 func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) (created bool, err error) {
 	if task.ID == "" || task.Name == "" || task.Node == "" || task.Volume == "" {
 		return false, errors.New("store: FireDueBackup requires task id, name, node, volume")
@@ -148,6 +151,13 @@ func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) 
 		return false, fmt.Errorf("store: marshal task %q: %w", task.ID, err)
 	}
 	err = s.withControlTx(ctx, func(tx *sql.Tx) error {
+		paused, err := isPausedTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if paused {
+			return skipDueBackupTx(ctx, tx, task.Volume, nextFireAt, now)
+		}
 		created, err = insertTaskTx(ctx, tx, task, snapshot)
 		if err != nil {
 			return err

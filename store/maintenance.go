@@ -30,6 +30,9 @@ const (
 	metaMaintAdvHighWater  = "maintenance.advertised_high_water"
 	metaMaintAdvAt         = "maintenance.advertised_at"
 	metaMaintLastSample    = "maintenance.last_sample"
+	// metaMaintSampleEmitted is when the last sample-driven entry was appended,
+	// in unix nanoseconds (see RecordMaintenanceSample).
+	metaMaintSampleEmitted = "maintenance.sample_emitted_at"
 
 	// metaMaintJobPrefix + <job name> marks a node maintenance job (prune,
 	// compact) as running; the value is {"started_at":<unix>}.
@@ -43,6 +46,11 @@ const (
 	taskNameRestore        = "volume.restore"
 	restoreCancelledResult = `{"error":"cancelled: node entered maintenance before the restore started"}`
 )
+
+// MaintenanceSampleEmitInterval is the minimum gap between two sample-driven
+// node_maintenance entries, so a flapping quiesce state cannot flood the
+// changelog. A variable so tests can shorten it.
+var MaintenanceSampleEmitInterval = 30 * time.Second
 
 // ErrStaleGen is returned by the controller hold methods when the request's
 // generation is older than the newest one already applied. Nothing is written.
@@ -251,6 +259,9 @@ func (s *Store) mutateMaintenance(ctx context.Context, alwaysAppend bool, fn fun
 			m.SkippedBackups = 0
 			m.Sample = nil // so the first sample after entry always emits
 			if err := deleteMetaTx(ctx, tx, metaMaintLastSample); err != nil {
+				return err
+			}
+			if err := deleteMetaTx(ctx, tx, metaMaintSampleEmitted); err != nil {
 				return err
 			}
 			if err := setMetaTx(ctx, tx, metaMaintPausedSince, strconv.FormatInt(now, 10)); err != nil {
@@ -506,8 +517,16 @@ func (s *Store) ClearLocalHold(ctx context.Context) (MaintenanceState, error) {
 // count or pending count differs from the stored one is stored AND published
 // as a fresh node_maintenance entry (appended=true); an unchanged one only
 // refreshes the stored sampled_at.
+//
+// Sample-driven entries are rate limited to one per
+// MaintenanceSampleEmitInterval (hold changes are not). A differing sample that
+// the limit holds back is NOT stored (only sampled_at is refreshed), so the
+// stored sample stays the last one published and the first sample allowed
+// after the interval still differs and is published. The first sample after
+// entry into maintenance always publishes: entry clears the stored sample and
+// the emit time together.
 func (s *Store) RecordMaintenanceSample(ctx context.Context, smp MaintenanceSample) (appended bool, err error) {
-	now := time.Now().Unix()
+	now := time.Now()
 	err = s.withControlTx(ctx, func(tx *sql.Tx) error {
 		m, err := readMaintenance(ctx, tx)
 		if err != nil {
@@ -515,12 +534,20 @@ func (s *Store) RecordMaintenanceSample(ctx context.Context, smp MaintenanceSamp
 		}
 		prev := m.Sample
 		next := smp
-		if m.Paused() && prev != nil && prev.Quiesce == smp.Quiesce &&
-			prev.RunningCount == smp.RunningCount && prev.Pending == smp.Pending {
-			next = *prev
-			next.SampledAt = smp.SampledAt
-		} else if m.Paused() {
-			appended = true
+		if m.Paused() {
+			differs := prev == nil || prev.Quiesce != smp.Quiesce ||
+				prev.RunningCount != smp.RunningCount || prev.Pending != smp.Pending
+			if differs {
+				allowed, err := sampleEmitAllowedTx(ctx, tx, now)
+				if err != nil {
+					return err
+				}
+				appended = allowed || prev == nil
+			}
+			if !appended {
+				next = *prev
+				next.SampledAt = smp.SampledAt
+			}
 		}
 		b, err := json.Marshal(next)
 		if err != nil {
@@ -532,14 +559,37 @@ func (s *Store) RecordMaintenanceSample(ctx context.Context, smp MaintenanceSamp
 		if !appended {
 			return nil
 		}
+		if err := setMetaTx(ctx, tx, metaMaintSampleEmitted, strconv.FormatInt(now.UnixNano(), 10)); err != nil {
+			return err
+		}
 		m.Sample = &next
-		_, err = appendMaintenanceTx(ctx, tx, m, now)
+		_, err = appendMaintenanceTx(ctx, tx, m, now.Unix())
 		return err
 	})
 	if err != nil {
 		return false, err
 	}
 	return appended, nil
+}
+
+// sampleEmitAllowedTx reports whether the sample rate limit lets an entry be
+// appended at now: no sample entry yet, the interval has passed, or the clock
+// stepped back behind the last emit (so a clock change cannot block it).
+func sampleEmitAllowedTx(ctx context.Context, tx *sql.Tx, now time.Time) (bool, error) {
+	var v string
+	switch err := tx.QueryRowContext(ctx,
+		`SELECT value FROM control_meta WHERE key = ?`, metaMaintSampleEmitted).Scan(&v); {
+	case errors.Is(err, sql.ErrNoRows):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("store: read %s: %w", metaMaintSampleEmitted, err)
+	}
+	ns, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return false, fmt.Errorf("store: parse %s %q: %w", metaMaintSampleEmitted, v, err)
+	}
+	last := time.Unix(0, ns)
+	return now.Before(last) || now.Sub(last) >= MaintenanceSampleEmitInterval, nil
 }
 
 // SkipDueBackup records a backup slot skipped because the node is paused: in one
@@ -551,19 +601,24 @@ func (s *Store) SkipDueBackup(ctx context.Context, volumeName string, nextFireAt
 	}
 	now := time.Now().Unix()
 	return s.withControlTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ?`,
-			nextFireAt, now, volumeName); err != nil {
-			return fmt.Errorf("store: skip schedule %q: %w", volumeName, err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO control_meta (key, value) VALUES (?, '1')
-			ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(control_meta.value AS INTEGER) + 1 AS TEXT)
-		`, metaMaintSkipped); err != nil {
-			return fmt.Errorf("store: count skipped backup: %w", err)
-		}
-		return nil
+		return skipDueBackupTx(ctx, tx, volumeName, nextFireAt, now)
 	})
+}
+
+// skipDueBackupTx is SkipDueBackup inside an existing transaction.
+func skipDueBackupTx(ctx context.Context, tx *sql.Tx, volumeName string, nextFireAt, now int64) error {
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ?`,
+		nextFireAt, now, volumeName); err != nil {
+		return fmt.Errorf("store: skip schedule %q: %w", volumeName, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO control_meta (key, value) VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = CAST(CAST(control_meta.value AS INTEGER) + 1 AS TEXT)
+	`, metaMaintSkipped); err != nil {
+		return fmt.Errorf("store: count skipped backup: %w", err)
+	}
+	return nil
 }
 
 // RecordAdvertisedServe notes that a changelog page was served to a reader that

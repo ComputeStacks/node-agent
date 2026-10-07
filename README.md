@@ -98,8 +98,10 @@ sudo cs-agent maintenance off                                               # cl
 acknowledged the hold. Exit codes: `1` usage or the hold was cleared while waiting, `2`
 timed out with work still running, `3` the agent database could not be opened, `4` the
 controller has not acknowledged the hold (`--no-controller` skips that check; avoid it
-while docker is being restarted). Holds persist across restarts and reboots, so clear the
-local hold explicitly when the work is done.
+while docker is being restarted). If the controller does not support maintenance mode,
+`on --wait` exits `4` before placing a hold. Holds persist across restarts and reboots, so
+clear the local hold explicitly when the work is done. Versions before v3.4.0 ignore holds:
+clear them before rolling back, or they take effect again on the next upgrade.
 
 ## Upgrades & rollback
 

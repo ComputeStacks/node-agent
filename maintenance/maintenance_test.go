@@ -132,6 +132,9 @@ func TestBuildStatus_Unknown(t *testing.T) {
 }
 
 func TestWatch_SamplesWhilePaused(t *testing.T) {
+	orig := store.MaintenanceSampleEmitInterval
+	store.MaintenanceSampleEmitInterval = 0
+	t.Cleanup(func() { store.MaintenanceSampleEmitInterval = orig })
 	st := openStore(t)
 	cl := &fakeLister{out: []InFlight{{ID: "c1", Kind: KindBorgContainer}}}
 	ctx, cancel := context.WithCancel(ctxBG)

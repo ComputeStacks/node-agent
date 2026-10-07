@@ -181,8 +181,15 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			ProjectID: strconv.Itoa(vol.ProjectID),
 			Archive:   "auto",
 		}
-		if _, err := s.st.FireDueBackup(ctx, task, next.Unix()); err != nil {
+		created, err := s.st.FireDueBackup(ctx, task, next.Unix())
+		if err != nil {
 			backupLogger().Warn("Scheduler: fire due backup", "volume", sc.VolumeName, "error", err.Error())
+			continue
+		}
+		if !created {
+			// The node was paused between the check above and the fire tx; the
+			// store skipped the slot.
+			backupLogger().Info("Scheduler: backup not fired (node entered maintenance or task already exists)", "volume", sc.VolumeName, "next", next.UTC().Format(time.RFC3339))
 			continue
 		}
 		fired = true

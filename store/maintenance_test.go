@@ -418,6 +418,33 @@ func TestMaintenance_SkipDueBackup(t *testing.T) {
 	}
 }
 
+// FireDueBackup re-checks the pause inside its tx: a hold placed after the
+// scheduler's own check still stops the task.
+func TestMaintenance_FireDueBackupWhilePaused(t *testing.T) {
+	s := open(t, Options{})
+	if err := s.PutSchedule(ctx, "v1", "0 2 * * *", 10); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutLocalHold(ctx, "l", "root"); err != nil {
+		t.Fatal(err)
+	}
+	created, err := s.FireDueBackup(ctx, Task{
+		ID: "auto-1", Name: "volume.backup", Node: "node-a", Volume: "v1", ProjectID: "proj-1",
+	}, 500)
+	if err != nil || created {
+		t.Fatalf("FireDueBackup while paused: created=%v err=%v", created, err)
+	}
+	if _, found, _ := s.GetTask(ctx, "auto-1"); found {
+		t.Fatal("task created while paused")
+	}
+	if sc, _, _ := s.GetSchedule(ctx, "v1"); sc.NextFireAt != 500 {
+		t.Fatalf("next_fire_at = %d, want 500", sc.NextFireAt)
+	}
+	if m := mustMaint(t, s); m.SkippedBackups != 1 {
+		t.Fatalf("skipped = %d, want 1", m.SkippedBackups)
+	}
+}
+
 func TestChangelogPage_MaintenanceVisibility(t *testing.T) {
 	s := open(t, Options{})
 	if _, err := s.CreateActionRequest(ctx, "a-1", "proj-1", "cdn_purge", nil); err != nil {
@@ -447,10 +474,15 @@ func TestChangelogPage_MaintenanceVisibility(t *testing.T) {
 	if err != nil || len(empty) != 0 || hw != 3 {
 		t.Fatalf("hidden tail: %d entries, hw=%d err=%v", len(empty), hw, err)
 	}
-	// The scan is bounded by limit: high water never passes an unscanned row.
-	_, hw, err = s.ChangelogPage(ctx, 0, "", 2, false)
+	// An advertising scan is bounded by limit: high water never passes an
+	// unscanned row.
+	_, hw, err = s.ChangelogPage(ctx, 0, "", 2, true)
 	if err != nil || hw != 2 {
 		t.Fatalf("limit bound: hw=%d err=%v", hw, err)
+	}
+	// A hiding scan stops right after the row that fills the page.
+	if got, hw, err := s.ChangelogPage(ctx, 0, "", 1, false); err != nil || len(got) != 1 || hw != 1 {
+		t.Fatalf("full hiding page: %d entries, hw=%d err=%v", len(got), hw, err)
 	}
 	// Nothing scanned: high water is since.
 	if _, hw, _ := s.ChangelogPage(ctx, 9, "", 100, false); hw != 9 {
@@ -459,6 +491,71 @@ func TestChangelogPage_MaintenanceVisibility(t *testing.T) {
 	// ChangelogSince hides node_maintenance.
 	if got := mustSince(t, s, 0, "", 100); len(got) != 1 {
 		t.Fatalf("ChangelogSince = %d entries, want 1", len(got))
+	}
+}
+
+// appendHidden appends n node_maintenance changelog rows directly.
+func appendHidden(t *testing.T, s *Store, n int) {
+	t.Helper()
+	err := s.withControlTx(ctx, func(tx *sql.Tx) error {
+		for i := 0; i < n; i++ {
+			if err := appendChangelogTx(ctx, tx, EntityNodeMaintenance, "node", "", "upsert", []byte(`{}`), 1); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A reader that does not advertise node_maintenance support must not be handed
+// an empty page just because hidden rows filled the first limit rows: the scan
+// continues to the next visible row.
+func TestChangelogPage_HiddenRunSkipsToVisible(t *testing.T) {
+	s := open(t, Options{})
+	appendHidden(t, s, 250)
+	if _, err := s.CreateActionRequest(ctx, "a-1", "proj-1", "cdn_purge", nil); err != nil {
+		t.Fatal(err)
+	}
+	got, hw, err := s.ChangelogPage(ctx, 0, "", 100, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].EntityType != "action_request" || got[0].Seq != 251 || hw != 251 {
+		t.Fatalf("page: %d entries %+v, hw=%d", len(got), got, hw)
+	}
+	// ChangelogSince (which ignores the high water) also reaches it.
+	if since := mustSince(t, s, 0, "", 100); len(since) != 1 || since[0].Seq != 251 {
+		t.Fatalf("ChangelogSince = %+v", since)
+	}
+	// An advertising scan is unchanged: bounded by limit.
+	shown, hw, err := s.ChangelogPage(ctx, 0, "", 100, true)
+	if err != nil || len(shown) != 100 || hw != 100 {
+		t.Fatalf("advertising page: %d entries, hw=%d err=%v", len(shown), hw, err)
+	}
+}
+
+// The hiding scan is capped at changelogHiddenScanFactor*limit rows.
+func TestChangelogPage_HiddenScanCap(t *testing.T) {
+	s := open(t, Options{})
+	const limit = 10
+	appendHidden(t, s, changelogHiddenScanFactor*limit+5)
+	if _, err := s.CreateActionRequest(ctx, "a-1", "proj-1", "cdn_purge", nil); err != nil {
+		t.Fatal(err)
+	}
+	got, hw, err := s.ChangelogPage(ctx, 0, "", limit, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 || hw != changelogHiddenScanFactor*limit {
+		t.Fatalf("capped page: %d entries, hw=%d, want 0 and %d", len(got), hw, changelogHiddenScanFactor*limit)
+	}
+	// Resuming from the high water reaches the visible row.
+	got, hw, err = s.ChangelogPage(ctx, hw, "", limit, false)
+	if want := int64(changelogHiddenScanFactor*limit + 6); err != nil || len(got) != 1 || got[0].Seq != want || hw != want {
+		t.Fatalf("resumed page: %+v, hw=%d err=%v", got, hw, err)
 	}
 }
 
@@ -530,7 +627,16 @@ func TestMaintJobMarkers(t *testing.T) {
 	}
 }
 
+// setSampleEmitInterval overrides the sample rate limit for one test.
+func setSampleEmitInterval(t *testing.T, d time.Duration) {
+	t.Helper()
+	orig := MaintenanceSampleEmitInterval
+	MaintenanceSampleEmitInterval = d
+	t.Cleanup(func() { MaintenanceSampleEmitInterval = orig })
+}
+
 func TestRecordMaintenanceSample(t *testing.T) {
+	setSampleEmitInterval(t, 0)
 	s := open(t, Options{})
 	busy := MaintenanceSample{Quiesce: "busy", RunningCount: 2, Pending: 1, SampledAt: 100}
 
@@ -592,6 +698,80 @@ func TestRecordMaintenanceSample(t *testing.T) {
 	}
 	if got := len(maintEntries(t, s)); got != n+2 {
 		t.Fatalf("entries = %d, want %d", got, n+2)
+	}
+}
+
+// A flapping sample emits at most one entry per interval, and the state it
+// settles on is still emitted once the interval has passed.
+func TestRecordMaintenanceSample_RateLimited(t *testing.T) {
+	const window = time.Second
+	setSampleEmitInterval(t, window)
+	s := open(t, Options{})
+	if _, _, err := s.PutLocalHold(ctx, "l", "root"); err != nil {
+		t.Fatal(err)
+	}
+	busy := MaintenanceSample{Quiesce: "busy", RunningCount: 1, SampledAt: 100}
+	quiet := MaintenanceSample{Quiesce: "quiesced", SampledAt: 101}
+
+	start := time.Now()
+	if app, err := s.RecordMaintenanceSample(ctx, busy); err != nil || !app {
+		t.Fatalf("first sample after entry: %v %v", app, err)
+	}
+	n := len(maintEntries(t, s))
+	for i := 0; i < 10; i++ {
+		smp := quiet
+		if i%2 == 1 {
+			smp = busy
+		}
+		smp.SampledAt = int64(200 + i)
+		app, err := s.RecordMaintenanceSample(ctx, smp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if app {
+			t.Fatalf("flap %d emitted inside the window", i)
+		}
+	}
+	if time.Since(start) >= window {
+		t.Skip("flapping took longer than the window; timing assertions do not hold")
+	}
+	if got := len(maintEntries(t, s)); got != n {
+		t.Fatalf("entries = %d, want %d", got, n)
+	}
+	// A held-back sample does not replace the published one; sampled_at moves.
+	if m := mustMaint(t, s); m.Sample == nil || m.Sample.Quiesce != "busy" || m.Sample.SampledAt != 209 {
+		t.Fatalf("stored sample = %+v", m.Sample)
+	}
+	// The node settles while the limit still holds the change back.
+	if app, err := s.RecordMaintenanceSample(ctx, quiet); err != nil || app {
+		t.Fatalf("held-back settle: %v %v", app, err)
+	}
+
+	time.Sleep(window - time.Since(start) + 50*time.Millisecond)
+	if app, err := s.RecordMaintenanceSample(ctx, quiet); err != nil || !app {
+		t.Fatalf("settled sample after the window: %v %v", app, err)
+	}
+	if got := len(maintEntries(t, s)); got != n+1 {
+		t.Fatalf("entries = %d, want %d", got, n+1)
+	}
+	if p := lastMaintPayload(t, s); p["sample"].(map[string]any)["quiesce"] != "quiesced" {
+		t.Fatalf("payload sample = %v", p["sample"])
+	}
+	// The window restarts: an immediate change is held back again.
+	if app, err := s.RecordMaintenanceSample(ctx, busy); err != nil || app {
+		t.Fatalf("change right after an emit: %v %v", app, err)
+	}
+
+	// Hold changes are not rate limited, and re-entry clears the emit time so
+	// the first sample after it emits at once.
+	if _, err := s.ClearLocalHold(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.PutLocalHold(ctx, "again", "root"); err != nil {
+		t.Fatal(err)
+	}
+	if app, err := s.RecordMaintenanceSample(ctx, busy); err != nil || !app {
+		t.Fatalf("first sample after re-entry: %v %v", app, err)
 	}
 }
 

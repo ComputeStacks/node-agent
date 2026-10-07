@@ -26,6 +26,9 @@ routes and a new CLI subcommand; nothing changes until a hold is placed. One new
 - New `agent.yml` key `maintenance.stale_hold_hours` (default `12`): a hold older than this
   is logged and reported hourly.
 
+  **Rollback:** versions before v3.4.0 ignore maintenance holds and run work normally. Clear
+  any holds before downgrading; a hold left in place takes effect again after re-upgrading.
+
 ## v3.3.1
 
 Packaging-only release. **No migrations, no config changes, no API changes.**

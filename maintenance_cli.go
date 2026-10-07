@@ -127,29 +127,42 @@ func maintenanceCLI(ctx context.Context, args []string, stdout, stderr io.Writer
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
 		}
+		if *jsonOut {
+			writeJSONError(stdout, err.Error(), exitUsage)
+		}
+		return exitUsage
+	}
+	usageErr := func(msg string) int {
+		fmt.Fprintf(stderr, "%s\n\n%s", msg, maintenanceUsage)
+		if *jsonOut {
+			writeJSONError(stdout, msg, exitUsage)
+		}
 		return exitUsage
 	}
 	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "unexpected argument %q\n\n%s", fs.Arg(0), maintenanceUsage)
-		return exitUsage
+		return usageErr(fmt.Sprintf("unexpected argument %q", fs.Arg(0)))
 	}
 	if cmd == "on" {
 		if msg := on.validate(fs); msg != "" {
-			fmt.Fprintf(stderr, "%s\n\n%s", msg, maintenanceUsage)
-			return exitUsage
+			return usageErr(msg)
 		}
 	}
 
+	openErr := func(err error) int {
+		fmt.Fprintf(stderr, "error: %v\n", err)
+		if *jsonOut {
+			writeJSONError(stdout, err.Error(), exitControlDB)
+		}
+		return exitControlDB
+	}
 	dataDir, err := resolveDataDir()
 	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return exitControlDB
+		return openErr(err)
 	}
 	fmt.Fprintf(stderr, "control.db: %s\n", filepath.Join(dataDir, "control.db"))
 	st, err := store.OpenExistingControl(dataDir)
 	if err != nil {
-		fmt.Fprintf(stderr, "error: %v\n", err)
-		return exitControlDB
+		return openErr(err)
 	}
 	defer st.Close()
 
@@ -259,6 +272,24 @@ func (c *maintCLI) off(ctx context.Context) int {
 }
 
 func (c *maintCLI) on(ctx context.Context, o onOptions) int {
+	// The controller-support check runs once, before the hold is placed: it
+	// exists to fail fast on a controller that cannot confirm the hold, without
+	// leaving a hold behind. Once waiting, a controller poll that lags is covered
+	// by the timeout rather than aborting a long wait.
+	if o.wait && !o.noController {
+		_, at, err := c.st.GetAdvertised(ctx)
+		if err != nil {
+			return c.storeErr(err)
+		}
+		if age := maintNow().Unix() - at; at == 0 || age > int64(advertisedFreshness/time.Second) {
+			last := "never"
+			if at != 0 {
+				last = fmt.Sprintf("%ds ago", age)
+			}
+			return c.fail(ctx, exitNoController, -1, fmt.Sprintf(
+				"controller has not polled with maintenance support recently (last: %s); no local hold was placed (use --no-controller to wait without it)", last))
+		}
+	}
 	m, mySeq, err := c.st.PutLocalHold(ctx, o.reason, invokingUser())
 	if err != nil {
 		return c.storeErr(err)
@@ -280,53 +311,44 @@ func (c *maintCLI) on(ctx context.Context, o onOptions) int {
 
 // wait polls until the node is quiesced and, unless noController, the
 // controller has acknowledged the changelog entry written by our PutLocalHold
-// (seq mySeq). See the exit codes for the ways it ends.
+// (seq mySeq). A store error while polling is reported and retried on the next
+// poll; if the last poll before the deadline still fails, wait exits
+// exitQuiesceTimeout with that error. See the exit codes for the ways it ends.
 func (c *maintCLI) wait(ctx context.Context, o onOptions, mySeq int64) int {
 	deadline := maintNow().Add(o.timeout)
-	// The controller-support check runs once, up front: it exists to fail fast on a
-	// controller that cannot confirm the hold. Once waiting, a controller poll that
-	// lags is covered by the timeout rather than aborting a long wait.
-	for first := true; ; first = false {
-		if first && !o.noController {
-			_, at, err := c.st.GetAdvertised(ctx)
-			if err != nil {
-				return c.storeErr(err)
+	for {
+		s, acked, err := c.waitSample(ctx, mySeq)
+		if err == nil && s.Local == nil {
+			return c.failWith(ctx, exitUsage, s, acked, "the local hold was cleared while waiting")
+		}
+		if err == nil && done(s, acked, o.noController) && o.settle > 0 {
+			fmt.Fprintf(c.stderr, "quiesced; settling for %s\n", o.settle)
+			if err := maintSleep(ctx, o.settle); err != nil {
+				return c.interrupted(ctx, mySeq)
 			}
-			if age := maintNow().Unix() - at; at == 0 || age > int64(advertisedFreshness/time.Second) {
-				last := "never"
-				if at != 0 {
-					last = fmt.Sprintf("%ds ago", age)
-				}
-				return c.fail(ctx, exitNoController, mySeq, fmt.Sprintf(
-					"controller has not polled with maintenance support recently (last: %s); the local hold stays in place (use --no-controller to wait without it)", last))
+			s, acked, err = c.waitSample(ctx, mySeq)
+			if err == nil && s.Local == nil {
+				return c.failWith(ctx, exitUsage, s, acked, "the local hold was cleared while waiting")
+			}
+			if err == nil && !done(s, acked, o.noController) {
+				fmt.Fprintln(c.stderr, "work appeared during the settle period; waiting again")
 			}
 		}
-
-		s, acked, code := c.waitSample(ctx, o, mySeq)
-		if code >= 0 {
-			return code
+		if err != nil {
+			fmt.Fprintf(c.stderr, "warning: read maintenance state: %v; retrying\n", err)
+		} else if done(s, acked, o.noController) {
+			c.emit(ctx, s, acked)
+			return exitOK
+		} else {
+			fmt.Fprintln(c.stderr, progressLine(s, acked, o.noController))
 		}
-		if done(s, acked, o.noController) {
-			if o.settle > 0 {
-				fmt.Fprintf(c.stderr, "quiesced; settling for %s\n", o.settle)
-				if err := maintSleep(ctx, o.settle); err != nil {
-					return c.interrupted(ctx, mySeq)
-				}
-				if s, acked, code = c.waitSample(ctx, o, mySeq); code >= 0 {
-					return code
-				}
-			}
-			if done(s, acked, o.noController) {
-				c.emit(ctx, s, acked)
-				return exitOK
-			}
-			fmt.Fprintln(c.stderr, "work appeared during the settle period; waiting again")
-		}
-		fmt.Fprintln(c.stderr, progressLine(s, acked, o.noController))
 
 		remaining := deadline.Sub(maintNow())
 		if remaining <= 0 {
-			if s.Quiesce != maintenance.QuiesceQuiesced {
+			switch {
+			case err != nil:
+				return c.fail(ctx, exitQuiesceTimeout, mySeq, fmt.Sprintf("timed out after %s: cannot read maintenance state: %v", o.timeout, err))
+			case s.Quiesce != maintenance.QuiesceQuiesced:
 				return c.failWith(ctx, exitQuiesceTimeout, s, acked, fmt.Sprintf("timed out after %s: node is %s", o.timeout, s.Quiesce))
 			}
 			return c.failWith(ctx, exitNoController, s, acked, fmt.Sprintf("timed out after %s: quiesced, but the controller has not confirmed the hold", o.timeout))
@@ -337,21 +359,17 @@ func (c *maintCLI) wait(ctx context.Context, o onOptions, mySeq int64) int {
 	}
 }
 
-// waitSample builds one status sample for wait. code is -1 to keep waiting,
-// else the exit code wait must return.
-func (c *maintCLI) waitSample(ctx context.Context, o onOptions, mySeq int64) (maintenance.Status, bool, int) {
+// waitSample builds one status sample for wait.
+func (c *maintCLI) waitSample(ctx context.Context, mySeq int64) (maintenance.Status, bool, error) {
 	s, err := maintenance.BuildStatus(ctx, c.st, c.lister)
 	if err != nil {
-		return s, false, c.storeErr(err)
+		return s, false, err
 	}
 	acked, err := c.controllerAcked(ctx, mySeq)
 	if err != nil {
-		return s, false, c.storeErr(err)
+		return s, false, err
 	}
-	if s.Local == nil {
-		return s, acked, c.failWith(ctx, exitUsage, s, acked, "the local hold was cleared while waiting")
-	}
-	return s, acked, -1
+	return s, acked, nil
 }
 
 // done is the --wait completion condition (the local hold is checked by
@@ -379,15 +397,21 @@ func (c *maintCLI) interrupted(ctx context.Context, mySeq int64) int {
 	return c.fail(context.WithoutCancel(ctx), exitUsage, mySeq, "interrupted; the local hold stays in place")
 }
 
-// fail builds a final status (for --json) and exits with code and msg.
+// fail builds a final status (for --json) and exits with code and msg. A
+// non-positive mySeq means no hold was written: acknowledgement is then judged
+// against the latest entry. If the status cannot be read, the --json output is
+// the error object instead.
 func (c *maintCLI) fail(ctx context.Context, code int, mySeq int64, msg string) int {
 	s, err := maintenance.BuildStatus(ctx, c.st, c.lister)
 	if err != nil {
-		return c.storeErr(err)
+		return c.failNoStatus(code, fmt.Sprintf("%s (cannot read maintenance state: %v)", msg, err))
+	}
+	if mySeq <= 0 {
+		mySeq = s.Seq
 	}
 	acked, err := c.controllerAcked(ctx, mySeq)
 	if err != nil {
-		return c.storeErr(err)
+		return c.failNoStatus(code, fmt.Sprintf("%s (cannot read maintenance state: %v)", msg, err))
 	}
 	return c.failWith(ctx, code, s, acked, msg)
 }
@@ -398,9 +422,26 @@ func (c *maintCLI) failWith(ctx context.Context, code int, s maintenance.Status,
 	return code
 }
 
+// failNoStatus exits with code and msg when no status is available; with --json
+// stdout gets the error object.
+func (c *maintCLI) failNoStatus(code int, msg string) int {
+	fmt.Fprintf(c.stderr, "error: %s\n", msg)
+	if c.json {
+		writeJSONError(c.stdout, msg, code)
+	}
+	return code
+}
+
 func (c *maintCLI) storeErr(err error) int {
-	fmt.Fprintf(c.stderr, "error: %v\n", err)
-	return exitControlDB
+	return c.failNoStatus(exitControlDB, err.Error())
+}
+
+// writeJSONError writes the --json document of an exit that has no status.
+func writeJSONError(w io.Writer, msg string, code int) {
+	_ = json.NewEncoder(w).Encode(struct {
+		Error    string `json:"error"`
+		ExitCode int    `json:"exit_code"`
+	}{msg, code})
 }
 
 // emit writes the final output: one JSON object, or a short human summary.

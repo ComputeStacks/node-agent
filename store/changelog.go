@@ -105,25 +105,42 @@ func (s *Store) ChangelogSince(ctx context.Context, since int64, entityType stri
 	return entries, err
 }
 
+// changelogHiddenScanFactor bounds a ChangelogPage read that hides
+// node_maintenance rows: it scans at most this many times limit rows.
+const changelogHiddenScanFactor = 10
+
 // ChangelogPage is ChangelogSince with node_maintenance visibility control. It
-// scans rows with seq > since (optionally of one entityType) ordered by seq, at
-// most limit of them, INCLUDING node_maintenance rows, then drops those from the
-// output unless showMaintenance — so a controller that does not understand the
-// entity never sees it. highWater is the last scanned seq (or since when nothing
-// was scanned): a page whose tail was all hidden still moves the cursor past it.
+// scans rows with seq > since (optionally of one entityType) ordered by seq,
+// INCLUDING node_maintenance rows, and drops those from the output unless
+// showMaintenance — so a controller that does not understand the entity never
+// sees it. highWater is the last scanned seq (or since when nothing was
+// scanned): a page whose tail was all hidden still moves the cursor past it.
+//
+// With showMaintenance the scan covers at most limit rows. Without it, the scan
+// continues past hidden rows until limit visible rows are collected (stopping
+// right after the row that fills the page) or the table ends, bounded at
+// changelogHiddenScanFactor*limit rows. A reader that ignores highWater and
+// advances its cursor only to the last row it received therefore never sees a
+// page left empty only by a run of hidden rows shorter than that bound.
 func (s *Store) ChangelogPage(ctx context.Context, since int64, entityType string, limit int, showMaintenance bool) (entries []ChangelogEntry, highWater int64, err error) {
 	if limit <= 0 {
 		limit = defaultChangelogPull
+	}
+	scanLimit := limit
+	if !showMaintenance {
+		if scanLimit = changelogHiddenScanFactor * limit; scanLimit < limit {
+			scanLimit = limit // overflow
+		}
 	}
 	var rows *sql.Rows
 	if entityType == "" {
 		rows, err = s.control.QueryContext(ctx, `
 			SELECT seq, entity_type, entity_id, project_id, op, payload, created_at
-			  FROM changelog WHERE seq > ? ORDER BY seq LIMIT ?`, since, limit)
+			  FROM changelog WHERE seq > ? ORDER BY seq LIMIT ?`, since, scanLimit)
 	} else {
 		rows, err = s.control.QueryContext(ctx, `
 			SELECT seq, entity_type, entity_id, project_id, op, payload, created_at
-			  FROM changelog WHERE seq > ? AND entity_type = ? ORDER BY seq LIMIT ?`, since, entityType, limit)
+			  FROM changelog WHERE seq > ? AND entity_type = ? ORDER BY seq LIMIT ?`, since, entityType, scanLimit)
 	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: changelog since %d: %w", since, err)
@@ -150,6 +167,9 @@ func (s *Store) ChangelogPage(ctx context.Context, since int64, entityType strin
 			e.Payload = json.RawMessage(payload.String)
 		}
 		out = append(out, e)
+		if len(out) == limit {
+			break // never pass a visible row the page cannot hold
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("store: iterate changelog: %w", err)

@@ -217,6 +217,33 @@ func TestMaintenanceCLI_MissingDB(t *testing.T) {
 	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
 		t.Fatalf("data dir was created: %v", err)
 	}
+	// Under --json the open error is the one JSON object on stdout.
+	code, stdout, _ := runCLI("status", "--json")
+	if code != exitControlDB {
+		t.Fatalf("status --json exit = %d", code)
+	}
+	obj := decodeOne(t, stdout)
+	if msg, _ := obj["error"].(string); msg == "" || obj["exit_code"] != float64(exitControlDB) {
+		t.Fatalf("error object = %v", obj)
+	}
+}
+
+func TestMaintenanceCLI_JSONUsageError(t *testing.T) {
+	newCLIEnv(t)
+	for _, args := range [][]string{
+		{"on", "--json", "--reason", "  "},
+		{"off", "--json", "extra"},
+		{"status", "--json", "--bogus"},
+	} {
+		code, stdout, _ := runCLI(args...)
+		if code != exitUsage {
+			t.Fatalf("%v exit = %d", args, code)
+		}
+		obj := decodeOne(t, stdout)
+		if msg, _ := obj["error"].(string); msg == "" || obj["exit_code"] != float64(exitUsage) {
+			t.Fatalf("%v error object = %v", args, obj)
+		}
+	}
 }
 
 func TestMaintenanceCLI_WaitFailsFastWhenNeverAdvertised(t *testing.T) {
@@ -228,11 +255,18 @@ func TestMaintenanceCLI_WaitFailsFastWhenNeverAdvertised(t *testing.T) {
 	if e.sleeps != 0 {
 		t.Fatalf("slept %d times before failing fast", e.sleeps)
 	}
-	if !strings.Contains(stderr, "has not polled with maintenance support") {
+	if !strings.Contains(stderr, "has not polled with maintenance support") || !strings.Contains(stderr, "no local hold was placed") {
 		t.Fatalf("stderr %q", stderr)
 	}
-	if obj := decodeOne(t, stdout); obj["local"] == nil {
-		t.Fatalf("local hold not kept: %v", obj)
+	if obj := decodeOne(t, stdout); obj["local"] != nil || obj["paused"] != false {
+		t.Fatalf("output after fail-fast: %v", obj)
+	}
+	m, err := e.side(t).GetMaintenance(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Local != nil || m.Paused() || m.Seq != 0 {
+		t.Fatalf("fail-fast left state behind: %+v", m)
 	}
 }
 
@@ -243,6 +277,21 @@ func TestMaintenanceCLI_WaitFailsFastWhenAdvertisedLongAgo(t *testing.T) {
 	}
 	if code, _, stderr := runCLI("on", "--reason", "r", "--wait", "--timeout", "10m"); code != exitNoController {
 		t.Fatalf("exit = %d, want %d (stderr %q)", code, exitNoController, stderr)
+	}
+	if m, err := e.side(t).GetMaintenance(context.Background()); err != nil || m.Local != nil {
+		t.Fatalf("fail-fast placed a hold: %+v %v", m.Local, err)
+	}
+}
+
+// Without --wait no controller check runs: the hold is placed even though the
+// controller has never polled.
+func TestMaintenanceCLI_OnWithoutWaitSkipsControllerCheck(t *testing.T) {
+	e := newCLIEnv(t)
+	if code, _, stderr := runCLI("on", "--reason", "r"); code != exitOK {
+		t.Fatalf("exit = %d, stderr %q", code, stderr)
+	}
+	if m, err := e.side(t).GetMaintenance(context.Background()); err != nil || m.Local == nil {
+		t.Fatalf("hold not placed: %+v %v", m.Local, err)
 	}
 }
 
@@ -370,6 +419,63 @@ func TestMaintenanceCLI_WaitLocalHoldCleared(t *testing.T) {
 	code, _, stderr := runCLI("on", "--reason", "r", "--wait", "--timeout", "1m", "--no-controller")
 	if code != exitUsage || !strings.Contains(stderr, "cleared while waiting") {
 		t.Fatalf("exit = %d, stderr %q", code, stderr)
+	}
+}
+
+// corruptMeta makes every maintenance state read fail until restored.
+func corruptMeta(t *testing.T, st *store.Store, bad bool) {
+	t.Helper()
+	v := "0"
+	if bad {
+		v = "not-a-number"
+	}
+	if err := st.SetMeta(context.Background(), "maintenance.skipped_backups", v); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A store error while polling is reported and retried, not fatal.
+func TestMaintenanceCLI_WaitRetriesStoreError(t *testing.T) {
+	e := newCLIEnv(t)
+	side := e.side(t)
+	e.lister.set([]maintenance.InFlight{{ID: "c1", Kind: maintenance.KindBorgContainer}})
+	e.onSleep = func(time.Duration) {
+		switch e.sleeps {
+		case 1:
+			corruptMeta(t, side, true)
+		case 2:
+			corruptMeta(t, side, false)
+			e.lister.set(nil)
+		}
+	}
+	code, stdout, stderr := runCLI("on", "--reason", "r", "--wait", "--timeout", "1m", "--settle", "0s", "--no-controller", "--json")
+	if code != exitOK {
+		t.Fatalf("exit = %d, stderr %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "retrying") {
+		t.Fatalf("stderr %q does not report the store error", stderr)
+	}
+	if obj := decodeOne(t, stdout); obj["quiesce"] != maintenance.QuiesceQuiesced {
+		t.Fatalf("output = %v", obj)
+	}
+	if e.sleeps != 2 {
+		t.Fatalf("sleeps = %d, want 2", e.sleeps)
+	}
+}
+
+// A store error that lasts to the deadline is a timeout carrying the error.
+func TestMaintenanceCLI_WaitStoreErrorToDeadline(t *testing.T) {
+	e := newCLIEnv(t)
+	side := e.side(t)
+	e.onSleep = func(time.Duration) { corruptMeta(t, side, true) }
+	e.lister.set([]maintenance.InFlight{{ID: "c1", Kind: maintenance.KindBorgContainer}})
+	code, stdout, stderr := runCLI("on", "--reason", "r", "--wait", "--timeout", "5s", "--no-controller", "--json")
+	if code != exitQuiesceTimeout {
+		t.Fatalf("exit = %d, want %d (stderr %q)", code, exitQuiesceTimeout, stderr)
+	}
+	obj := decodeOne(t, stdout)
+	if msg, _ := obj["error"].(string); !strings.Contains(msg, "not-a-number") || obj["exit_code"] != float64(exitQuiesceTimeout) {
+		t.Fatalf("error object = %v", obj)
 	}
 }
 

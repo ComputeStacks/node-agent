@@ -123,6 +123,22 @@ func TestMaintenance_PutGetDelete(t *testing.T) {
 	}
 }
 
+func TestMaintenance_PutTrimsReason(t *testing.T) {
+	e, _ := newMaintEnv(t, &fakeLister{})
+	resp := e.do("PUT", "/v1/admin/maintenance", e.adminTok, []byte(`{"reason":"  kernel update \n","gen":1}`))
+	mustStatus(t, resp, http.StatusOK)
+	if s := decodeStatus(t, resp); s.Controller == nil || s.Controller.Reason != "kernel update" {
+		t.Fatalf("PUT status controller = %+v", s.Controller)
+	}
+	m, err := e.st.GetMaintenance(ctxBG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Controller == nil || m.Controller.Reason != "kernel update" {
+		t.Fatalf("stored controller hold = %+v", m.Controller)
+	}
+}
+
 func TestMaintenance_DeleteAll(t *testing.T) {
 	e, _ := newMaintEnv(t, &fakeLister{})
 	if _, err := e.st.PutControllerHold(ctxBG, "r", 1); err != nil {
