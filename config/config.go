@@ -71,6 +71,10 @@ func ConfigureApp() {
 	viper.SetDefault("metadata.admin_token_hash", "")
 	viper.SetDefault("metadata.max_body_bytes", 10485760) // 10 MiB
 
+	// Node maintenance mode: warn (log + Sentry, hourly) about a maintenance
+	// hold older than this many hours. 0 disables the warning.
+	viper.SetDefault("maintenance.stale_hold_hours", 12)
+
 	viper.SetDefault("backups.enabled", true)
 	viper.SetDefault("backups.prune_freq", "15 1 * * *")
 	// Compaction now runs in-agent (was a host cron on the backup server). Set

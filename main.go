@@ -8,6 +8,7 @@ import (
 	"cs-agent/httpapi"
 	"cs-agent/job"
 	"cs-agent/log"
+	"cs-agent/maintenance"
 	"cs-agent/s3upload"
 	"cs-agent/store"
 	"errors"
@@ -34,6 +35,12 @@ var (
 )
 
 func main() {
+	// `cs-agent maintenance ...` is the local operator CLI, not the daemon. It is
+	// dispatched before flag parsing so its own flags are not seen here.
+	if len(os.Args) > 1 && os.Args[1] == "maintenance" {
+		os.Exit(runMaintenanceCLI(os.Args[2:]))
+	}
+
 	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
 	if *showVersion {
@@ -83,6 +90,13 @@ func main() {
 		},
 	}, st, log.New())
 
+	// No maintenance job (prune, compact) survives a restart; a marker left by
+	// the previous process would otherwise block that job from ever starting.
+	if err := st.ClearMaintJobMarkers(ctx); err != nil {
+		log.New().Error("Failed to clear maintenance job markers", "error", err.Error())
+		sentry.CaptureException(err)
+	}
+
 	// Start order: components (dispatcher runs its boot crash-reconcile before
 	// accepting work) → then the HTTP front door LAST, so the DOWN surface only
 	// opens once the consumers that react to it are running.
@@ -95,6 +109,9 @@ func main() {
 		wg.Add(1)
 		go func() { defer wg.Done(); scheduler.Run(ctx) }()
 	}
+	staleHold := time.Duration(viper.GetInt("maintenance.stale_hold_hours")) * time.Hour
+	wg.Add(1)
+	go func() { defer wg.Done(); maintenance.Watch(ctx, st, staleHold) }()
 
 	go func() {
 		if err := srv.Start(); err != nil && !errors.Is(err, http.ErrServerClosed) {

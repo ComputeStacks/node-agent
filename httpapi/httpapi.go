@@ -38,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"cs-agent/maintenance"
 	"cs-agent/store"
 
 	"github.com/hashicorp/go-hclog"
@@ -62,7 +63,8 @@ type Store interface {
 	ManagedDelete(ctx context.Context, projectID, path string) error
 
 	CreateActionRequest(ctx context.Context, id, projectID, actionType string, params json.RawMessage) (store.ActionRequest, error)
-	ChangelogSince(ctx context.Context, since int64, entityType string, limit int) ([]store.ChangelogEntry, error)
+	ChangelogPage(ctx context.Context, since int64, entityType string, limit int, showMaintenance bool) ([]store.ChangelogEntry, int64, error)
+	RecordAdvertisedServe(ctx context.Context, highWater, now int64) error
 	SetChangelogAcked(ctx context.Context, seq int64) error
 	GetChangelogAcked(ctx context.Context) (int64, error)
 
@@ -76,6 +78,12 @@ type Store interface {
 	DeleteVolume(ctx context.Context, name, projectID string) error
 	PutFirewallRules(ctx context.Context, node string, rules json.RawMessage) error
 	DeleteFirewallRules(ctx context.Context) error
+
+	// Node maintenance holds (controller side) and the status view's reads.
+	maintenance.StatusStore
+	PutControllerHold(ctx context.Context, reason string, gen int64) (store.MaintenanceState, error)
+	ClearControllerHold(ctx context.Context, gen int64) (store.MaintenanceState, error)
+	ClearAllHolds(ctx context.Context, gen int64) (store.MaintenanceState, error)
 }
 
 // Config configures the metadata HTTP server. Populate from viper in main.go.
@@ -104,6 +112,10 @@ type Config struct {
 	OnTaskCreated     func()
 	OnVolumesChanged  func()
 	OnFirewallChanged func()
+
+	// ContainerLister lists running backup containers for the maintenance status
+	// view. nil uses the local docker daemon (maintenance.DockerLister).
+	ContainerLister maintenance.ContainerLister
 }
 
 // fireHook invokes an optional reconcile hook if set.
@@ -162,6 +174,9 @@ func New(cfg Config, st Store, logger hclog.Logger) *Server {
 	}
 	if logger == nil {
 		logger = hclog.NewNullLogger()
+	}
+	if cfg.ContainerLister == nil {
+		cfg.ContainerLister = maintenance.DockerLister()
 	}
 	s := &Server{
 		cfg:     cfg,
@@ -239,6 +254,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("DELETE /v1/admin/nodes/{host}/firewall_rules", s.requireAdmin(s.handleAdminFirewallDelete))
 	s.mux.HandleFunc("PUT /v1/admin/projects/{project_id}/volumes/{name}", s.requireAdmin(s.handleAdminVolumePut))
 	s.mux.HandleFunc("DELETE /v1/admin/projects/{project_id}/volumes/{name}", s.requireAdmin(s.handleAdminVolumeDelete))
+
+	// --- Node maintenance hold (per-node admin Bearer) ---
+	s.mux.HandleFunc("GET /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenanceGet))
+	s.mux.HandleFunc("PUT /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenancePut))
+	s.mux.HandleFunc("DELETE /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenanceDelete))
 }
 
 // authenticate decides the request scope from the Authorization header ALONE.

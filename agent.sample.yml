@@ -38,6 +38,13 @@ changelog:
 tasks:
   retention_sec: 604800 # 7d
 
+# Node maintenance mode. A maintenance hold (from the controller or the local
+# `cs-agent maintenance on` CLI) older than stale_hold_hours is reported hourly
+# (log warning + Sentry), so a forgotten hold does not silently stop backups.
+# 0 disables the warning.
+maintenance:
+  stale_hold_hours: 12
+
 backups:
   enabled: true
 

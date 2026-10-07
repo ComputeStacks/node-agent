@@ -176,8 +176,8 @@ func TestChangelog_EmptyReturnsArray(t *testing.T) {
 	e := newTestEnv(t)
 	resp := e.do("GET", "/v1/admin/changelog", e.adminTok, nil)
 	mustStatus(t, resp, http.StatusOK)
-	if body := strings.TrimSpace(string(readBody(t, resp))); body != `{"entries":[]}` {
-		t.Fatalf("empty changelog body = %q, want {\"entries\":[]}", body)
+	if body := strings.TrimSpace(string(readBody(t, resp))); body != `{"entries":[],"high_water":0}` {
+		t.Fatalf("empty changelog body = %q, want {\"entries\":[],\"high_water\":0}", body)
 	}
 }
 

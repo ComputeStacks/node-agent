@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
+	"time"
 
 	"cs-agent/store"
 
@@ -264,7 +266,15 @@ type actionCreateResponse struct {
 // changelogListResponse is the GET /v1/admin/changelog body.
 type changelogListResponse struct {
 	Entries []store.ChangelogEntry `json:"entries"`
+	// HighWater is the last seq this request scanned (or since when nothing was
+	// scanned). Rows hidden from this reader count as scanned, so a reader should
+	// advance its cursor to HighWater, not to the last entry it received.
+	HighWater int64 `json:"high_water"`
 }
+
+// changelogTypesHeader lists (comma-separated) the optional changelog entity
+// types the reader understands. Only node_maintenance is optional today.
+const changelogTypesHeader = "X-CS-Changelog-Types"
 
 const (
 	maxActionTypeLen   = 128       // action_type sanity bound
@@ -353,15 +363,40 @@ func (s *Server) handleAdminChangelogList(w http.ResponseWriter, r *http.Request
 		limit = n
 	}
 
-	entries, err := s.store.ChangelogSince(r.Context(), since, q.Get("entity_type"), limit)
+	entityType := q.Get("entity_type")
+	showMaint := advertisesType(r, store.EntityNodeMaintenance)
+	entries, highWater, err := s.store.ChangelogPage(r.Context(), since, entityType, limit, showMaint)
 	if err != nil {
 		s.storeError(w, err, "changelog since")
 		return
 	}
+	// Record that a maintenance-aware reader was served up to highWater; the
+	// local CLI uses it to tell that the controller has seen its hold. A page
+	// filtered to another entity type proves nothing about node_maintenance rows,
+	// so only an unfiltered (or node_maintenance-filtered) page counts. A failure
+	// here does not fail the read: the CLI just keeps waiting.
+	if showMaint && (entityType == "" || entityType == store.EntityNodeMaintenance) {
+		if err := s.store.RecordAdvertisedServe(r.Context(), highWater, time.Now().Unix()); err != nil {
+			s.log.Warn("record advertised changelog serve failed", "error", err)
+		}
+	}
 	if entries == nil {
 		entries = []store.ChangelogEntry{} // encode [] not null
 	}
-	writeJSON(w, http.StatusOK, changelogListResponse{Entries: entries})
+	writeJSON(w, http.StatusOK, changelogListResponse{Entries: entries, HighWater: highWater})
+}
+
+// advertisesType reports whether the request's X-CS-Changelog-Types header
+// lists entityType.
+func advertisesType(r *http.Request, entityType string) bool {
+	for _, v := range r.Header.Values(changelogTypesHeader) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.TrimSpace(t) == entityType {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // changelogAckRequest is the body of POST /v1/admin/changelog/ack: the highest seq
