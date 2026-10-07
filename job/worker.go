@@ -13,7 +13,9 @@ import (
 )
 
 // worker pulls claimed tasks off its queue and runs them until ctx is cancelled.
-func (d *Dispatcher) worker(ctx context.Context, wg *sync.WaitGroup, name string, queue <-chan store.Task) {
+// When slots is non-nil (the backup pool) the worker returns its slot token after
+// each task so the dispatcher can claim the next one.
+func (d *Dispatcher) worker(ctx context.Context, wg *sync.WaitGroup, name string, queue <-chan store.Task, slots chan<- struct{}) {
 	defer wg.Done()
 	defer func() { jobEvent().Info("Worker stopping", "queue", name) }()
 	for {
@@ -23,6 +25,9 @@ func (d *Dispatcher) worker(ctx context.Context, wg *sync.WaitGroup, name string
 			return
 		case task := <-queue:
 			d.runTask(ctx, task)
+			if slots != nil {
+				slots <- struct{}{}
+			}
 			if ctx.Err() != nil {
 				jobEvent().Info("[" + name + "] Shutdown")
 				return

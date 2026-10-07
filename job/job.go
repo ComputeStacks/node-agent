@@ -17,6 +17,11 @@ import (
 // signal, or one left pending by an export revert.
 const backstopInterval = 30 * time.Second
 
+// slotRecheckInterval is how often the dispatcher, while waiting for a free
+// backup worker, re-checks whether the node has entered maintenance. A var so
+// tests can shorten it.
+var slotRecheckInterval = 5 * time.Second
+
 // Dispatcher is the in-process replacement for the old Consul jobs/ long-poll. A
 // SINGLE goroutine drains this node's pending tasks and dispatches each into a
 // worker pool; being single-goroutine is load-bearing — it (with the ClaimTask
@@ -32,9 +37,15 @@ type Dispatcher struct {
 	// runner executes a task; nil means backup.RunTask (the production path).
 	// Overridable in tests to exercise the worker's terminal guard directly.
 	runner func(context.Context, *store.Store, store.Task) (json.RawMessage, error)
+	// backupSlots holds one token per idle backup worker. The dispatcher takes a
+	// token BEFORE claiming a backup task and the worker returns it when the task
+	// ends, so a task is only moved to running once a worker is free to start it.
+	backupSlots chan struct{}
 }
 
-// NewDispatcher builds the dispatcher (unbuffered worker queues sized by config).
+// NewDispatcher builds the dispatcher (worker pools sized by config). The backup
+// queue is buffered to the pool size so a claimed task is handed off without
+// blocking; the slot tokens keep it from ever holding more than the idle workers.
 func NewDispatcher(st *store.Store) *Dispatcher {
 	backupWorkers := viper.GetInt("queue.numworkers") + 1
 	if backupWorkers < 1 {
@@ -44,10 +55,15 @@ func NewDispatcher(st *store.Store) *Dispatcher {
 	if exportWorkers < 1 {
 		exportWorkers = 1
 	}
+	slots := make(chan struct{}, backupWorkers)
+	for i := 0; i < backupWorkers; i++ {
+		slots <- struct{}{}
+	}
 	return &Dispatcher{
 		st:            st,
-		backupQ:       make(chan store.Task),
+		backupQ:       make(chan store.Task, backupWorkers),
 		exportQ:       make(chan store.Task),
+		backupSlots:   slots,
 		signal:        make(chan struct{}, 1),
 		backupWorkers: backupWorkers,
 		exportWorkers: exportWorkers,
@@ -72,18 +88,18 @@ func (d *Dispatcher) Start(ctx context.Context, wg *sync.WaitGroup) {
 	// work, so a re-drain can't race a reconcile of the same task.
 	d.bootReconcile(ctx)
 
-	d.startWorkers(ctx, wg, "backup", d.backupWorkers, d.backupQ)
-	d.startWorkers(ctx, wg, "export", d.exportWorkers, d.exportQ)
+	d.startWorkers(ctx, wg, "backup", d.backupWorkers, d.backupQ, d.backupSlots)
+	d.startWorkers(ctx, wg, "export", d.exportWorkers, d.exportQ, nil)
 
 	wg.Add(1)
 	go d.loop(ctx, wg)
 }
 
-func (d *Dispatcher) startWorkers(ctx context.Context, wg *sync.WaitGroup, name string, count int, q <-chan store.Task) {
+func (d *Dispatcher) startWorkers(ctx context.Context, wg *sync.WaitGroup, name string, count int, q <-chan store.Task, slots chan<- struct{}) {
 	wg.Add(count)
 	for i := 1; i <= count; i++ {
 		jobEvent().Info("Starting worker process", "queue", name, "worker-process", i)
-		go d.worker(ctx, wg, name, q)
+		go d.worker(ctx, wg, name, q, slots)
 	}
 }
 
@@ -108,10 +124,18 @@ func (d *Dispatcher) loop(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 // drain claims and dispatches every pending task for this node. It is the ONLY
-// claimer/dispatcher. Exports are dispatched first (non-blocking) so a full backup
-// queue can't head-of-line-block an export; backups then send blocking (the
-// workers are the throughput limiter).
+// claimer/dispatcher. Exports are dispatched first (non-blocking) so a busy backup
+// pool can't head-of-line-block an export; backups then wait for a free worker
+// (the workers are the throughput limiter). While the node is in maintenance
+// nothing is claimed; an un-pause wakes the dispatcher to drain again.
 func (d *Dispatcher) drain(ctx context.Context) {
+	if paused, err := d.st.IsPaused(ctx); err != nil {
+		// ClaimTask still refuses while paused, so carry on.
+		jobEvent().Warn("dispatch: check maintenance", "error", err.Error())
+	} else if paused {
+		jobEvent().Debug("dispatch: node in maintenance; not claiming tasks")
+		return
+	}
 	pending, err := d.st.ListPendingTasks(ctx)
 	if err != nil {
 		jobEvent().Warn("dispatch: list pending tasks", "error", err.Error())
@@ -130,26 +154,66 @@ func (d *Dispatcher) drain(ctx context.Context) {
 			return
 		}
 		if task.Name != "backup.export" {
-			d.dispatchBackup(ctx, task)
+			if !d.dispatchBackup(ctx, task) {
+				return
+			}
 		}
 	}
 }
 
-// dispatchBackup claims (CAS pending->running) then blocking-sends to the backup
-// pool. Only a task we won the CAS on is dispatched, so a signal + backstop can't
-// double-run one task.
-func (d *Dispatcher) dispatchBackup(ctx context.Context, task store.Task) {
+// dispatchBackup waits for a free backup worker, THEN claims (CAS
+// pending->running) and hands the task off, so a task is never running while
+// still waiting for a worker. Only a task we won the CAS on is dispatched, so a
+// signal + backstop can't double-run one task. It returns false when drain should
+// stop: ctx is done or the node entered maintenance while we waited.
+func (d *Dispatcher) dispatchBackup(ctx context.Context, task store.Task) bool {
+	if !d.acquireBackupSlot(ctx) {
+		return false
+	}
 	claimed, err := d.st.ClaimTask(ctx, task.ID)
 	if err != nil {
+		d.backupSlots <- struct{}{}
 		jobEvent().Warn("dispatch: claim task", "task", task.ID, "error", err.Error())
-		return
+		return true
 	}
 	if !claimed {
-		return // already claimed/terminal
+		d.backupSlots <- struct{}{}
+		return true // already claimed/terminal, or paused (ClaimTask refuses)
 	}
+	// Never blocks: the queue is sized to the pool and we hold a slot.
+	d.backupQ <- task
+	return true
+}
+
+// acquireBackupSlot blocks until a backup worker is free. While waiting it wakes
+// every slotRecheckInterval and gives up (false) if the node has entered
+// maintenance, so a paused node doesn't sit holding a pending task; it also gives
+// up when ctx is done.
+func (d *Dispatcher) acquireBackupSlot(ctx context.Context) bool {
 	select {
-	case d.backupQ <- task:
-	case <-ctx.Done():
+	case <-d.backupSlots:
+		return true
+	default:
+	}
+	recheck := time.NewTicker(slotRecheckInterval)
+	defer recheck.Stop()
+	for {
+		select {
+		case <-d.backupSlots:
+			return true
+		case <-ctx.Done():
+			return false
+		case <-recheck.C:
+			paused, err := d.st.IsPaused(ctx)
+			if err != nil {
+				jobEvent().Warn("dispatch: check maintenance", "error", err.Error())
+				continue
+			}
+			if paused {
+				jobEvent().Debug("dispatch: node entered maintenance while waiting for a backup worker")
+				return false
+			}
+		}
 	}
 }
 
