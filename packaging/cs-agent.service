@@ -1,8 +1,11 @@
 [Unit]
 Description=ComputeStacks Node Agent (cs-agent)
 Documentation=https://github.com/computestacks/node-agent
-Requires=docker.service
-After=docker.service
+# Wants=, not Requires=/BindsTo=: the agent does not need docker to start or to serve
+# its API and firewall, and Requires= propagates every docker stop/restart to the agent.
+# After= keeps boot ordering so the first firewall reconcile finds docker's chains.
+Wants=docker.service network-online.target
+After=docker.service network-online.target
 ConditionPathExists=/etc/computestacks/agent.yml
 # Crash-loop backstop: allow brisk restarts, but if it dies >StartLimitBurst times in
 # StartLimitIntervalSec, stop hammering. NOTE: the goal is "alert and keep

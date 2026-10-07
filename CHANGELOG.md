@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.3.1
+
+Packaging-only release. **No migrations, no config changes, no API changes.**
+
+- [CHANGE] **The systemd unit no longer stops the agent when docker stops.**
+  `Requires=docker.service` is now `Wants=`, so stopping or restarting docker leaves the
+  agent running and serving its API. Operations that need docker fail and report while it
+  is down. Boot ordering after docker and `network-online.target` is unchanged.
+
 ## v3.3.0
 
 Cross-project network isolation now covers IPv6 as well as IPv4, and the agent verifies that
