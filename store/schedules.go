@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/robfig/cron/v3"
 )
 
 // Schedule is a volume's durable backup schedule: the cron expression and the
@@ -19,6 +21,17 @@ type Schedule struct {
 	CronExpr   string `json:"cron_expr"`
 	NextFireAt int64  `json:"next_fire_at"`
 	UpdatedAt  int64  `json:"updated_at"`
+}
+
+// NextFire parses a standard 5-field cron expression (robfig, parser only) and
+// returns the next fire time after `from`; a zero time signals an unparseable or
+// never-firing expression.
+func NextFire(expr string, from time.Time) time.Time {
+	sched, err := cron.ParseStandard(expr)
+	if err != nil {
+		return time.Time{}
+	}
+	return sched.Next(from)
 }
 
 func scanSchedule(row interface{ Scan(...any) error }) (Schedule, error) {

@@ -23,7 +23,6 @@ import (
 
 	"github.com/getsentry/sentry-go"
 	"github.com/google/uuid"
-	"github.com/robfig/cron/v3"
 	"github.com/spf13/viper"
 )
 
@@ -93,7 +92,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 			backupLogger().Warn("Maintenance job has no cron; disabled", "job", m.name)
 			continue
 		}
-		m.next = nextFire(m.expr, now)
+		m.next = store.NextFire(m.expr, now)
 		if m.next.IsZero() {
 			backupLogger().Warn("Maintenance job cron unparseable; will not run", "job", m.name, "cron", m.expr)
 		} else {
@@ -131,7 +130,7 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 	}
 	fired := false
 	for _, sc := range due {
-		next := nextFire(sc.CronExpr, now)
+		next := store.NextFire(sc.CronExpr, now)
 		if next.IsZero() {
 			// Unparseable/never-firing cron slipped in — drop the schedule so it
 			// doesn't re-evaluate as due every tick.
@@ -187,13 +186,13 @@ func (s *Scheduler) runMaintenance(ctx context.Context) {
 			continue
 		}
 		if m.next.IsZero() {
-			m.next = nextFire(m.expr, now)
+			m.next = store.NextFire(m.expr, now)
 			continue
 		}
 		if now.Before(m.next) {
 			continue
 		}
-		m.next = nextFire(m.expr, now)
+		m.next = store.NextFire(m.expr, now)
 		if !m.running.CompareAndSwap(false, true) {
 			backupLogger().Warn("Scheduler: skipping maintenance; previous run still in progress", "job", m.name)
 			continue
@@ -273,7 +272,7 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 
 		existing, found, _ := s.st.GetSchedule(ctx, vol.Name)
 		if !found || existing.CronExpr != vol.Freq {
-			next := nextFire(vol.Freq, now)
+			next := store.NextFire(vol.Freq, now)
 			if next.IsZero() {
 				backupLogger().Warn("Scheduler: invalid cron for volume", "volume", vol.Name, "cron", vol.Freq)
 				continue
@@ -300,13 +299,8 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 	}
 }
 
-// nextFire parses a standard 5-field cron expression (robfig, parser only) and
-// returns the next fire time after `from`; a zero time signals an unparseable or
-// never-firing expression.
+// nextFire is store.NextFire, kept as a package-local name for the
+// housekeeper.
 func nextFire(expr string, from time.Time) time.Time {
-	sched, err := cron.ParseStandard(expr)
-	if err != nil {
-		return time.Time{}
-	}
-	return sched.Next(from)
+	return store.NextFire(expr, from)
 }

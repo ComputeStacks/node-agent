@@ -117,12 +117,24 @@ func (s *Store) CreateTask(ctx context.Context, t Task) (created bool, err error
 	}
 	t.CreatedAt = now
 	t.UpdatedAt = now
-	snapshot, err := json.Marshal(t)
-	if err != nil {
-		return false, fmt.Errorf("store: marshal task %q: %w", t.ID, err)
-	}
 
 	err = s.withControlTx(ctx, func(tx *sql.Tx) error {
+		// A restore that arrives while the node is paused is recorded as
+		// cancelled rather than queued, matching the restores cancelled on entry.
+		if t.Name == taskNameRestore && t.Status == TaskPending {
+			paused, err := isPausedTx(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if paused {
+				t.Status = TaskCancelled
+				t.Result = json.RawMessage(restoreCancelledResult)
+			}
+		}
+		snapshot, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Errorf("store: marshal task %q: %w", t.ID, err)
+		}
 		created, err = insertTaskTx(ctx, tx, t, snapshot)
 		return err
 	})
@@ -173,9 +185,29 @@ func (s *Store) UpdateTaskStatus(ctx context.Context, id, status string, result 
 // not pending (already claimed/terminal/cancelled/absent). The dispatcher is the
 // only caller; this CAS is what guarantees a task dispatches at most once even if
 // the in-process wake signal and the backstop drain race on the same row.
+//
+// While the node is paused for maintenance it refuses (claimed=false, no write),
+// checked inside the same tx as the CAS so a hold set concurrently is honored.
 func (s *Store) ClaimTask(ctx context.Context, id string) (claimed bool, err error) {
-	claimed, err = s.casTaskStatus(ctx, id, TaskPending, TaskRunning)
-	return claimed, err
+	if id == "" {
+		return false, errors.New("store: ClaimTask requires id")
+	}
+	now := time.Now().Unix()
+	err = s.withControlTx(ctx, func(tx *sql.Tx) error {
+		paused, err := isPausedTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if paused {
+			return nil
+		}
+		claimed, err = casTaskStatusTx(ctx, tx, id, TaskPending, TaskRunning, now)
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return claimed, nil
 }
 
 // UnclaimTask reverts a task running -> pending. It is used only when the
@@ -199,34 +231,43 @@ func (s *Store) casTaskStatus(ctx context.Context, id, from, to string) (bool, e
 	now := time.Now().Unix()
 	var changed bool
 	err := s.withControlTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-			to, now, id, from)
-		if err != nil {
-			return fmt.Errorf("store: cas task %q %s->%s: %w", id, from, to, err)
-		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return fmt.Errorf("store: task %q rows affected: %w", id, err)
-		}
-		if n == 0 {
-			return nil // not in `from`: no-op, not changelogged
-		}
-		changed = true
-		t, err := getTaskTx(ctx, tx, id)
-		if err != nil {
-			return fmt.Errorf("store: reload task %q: %w", id, err)
-		}
-		snapshot, err := json.Marshal(t)
-		if err != nil {
-			return fmt.Errorf("store: marshal task %q: %w", id, err)
-		}
-		return appendChangelogTx(ctx, tx, "task", t.ID, t.ProjectID, "upsert", snapshot, now)
+		var err error
+		changed, err = casTaskStatusTx(ctx, tx, id, from, to, now)
+		return err
 	})
 	if err != nil {
 		return false, err
 	}
 	return changed, nil
+}
+
+// casTaskStatusTx is the body of casTaskStatus inside an existing transaction.
+func casTaskStatusTx(ctx context.Context, tx *sql.Tx, id, from, to string, now int64) (bool, error) {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		to, now, id, from)
+	if err != nil {
+		return false, fmt.Errorf("store: cas task %q %s->%s: %w", id, from, to, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: task %q rows affected: %w", id, err)
+	}
+	if n == 0 {
+		return false, nil // not in `from`: no-op, not changelogged
+	}
+	t, err := getTaskTx(ctx, tx, id)
+	if err != nil {
+		return false, fmt.Errorf("store: reload task %q: %w", id, err)
+	}
+	snapshot, err := json.Marshal(t)
+	if err != nil {
+		return false, fmt.Errorf("store: marshal task %q: %w", id, err)
+	}
+	if err := appendChangelogTx(ctx, tx, "task", t.ID, t.ProjectID, "upsert", snapshot, now); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // CancelPendingTask flips a task pending -> cancelled (and appends the snapshot)
@@ -320,6 +361,16 @@ func (s *Store) GetTask(ctx context.Context, id string) (Task, bool, error) {
 	default:
 		return t, true, nil
 	}
+}
+
+// CountPendingTasks returns how many of this node's tasks are pending.
+func (s *Store) CountPendingTasks(ctx context.Context) (int, error) {
+	var n int
+	if err := s.control.QueryRowContext(ctx,
+		`SELECT count(*) FROM tasks WHERE status = ?`, TaskPending).Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: count pending tasks: %w", err)
+	}
+	return n, nil
 }
 
 // ListPendingTasks returns this node's pending tasks in creation order. It is

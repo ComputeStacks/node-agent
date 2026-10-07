@@ -57,13 +57,25 @@ func (s *Store) withControlTx(ctx context.Context, fn func(*sql.Tx) error) error
 // binary JSONB rather than JSON text. createdAt is passed in (not read from the
 // clock here) so the changelog row shares its entity row's timestamp exactly.
 func appendChangelogTx(ctx context.Context, tx *sql.Tx, entityType, entityID, projectID, op string, payload []byte, createdAt int64) error {
-	if _, err := tx.ExecContext(ctx, `
+	_, err := appendChangelogSeqTx(ctx, tx, entityType, entityID, projectID, op, payload, createdAt)
+	return err
+}
+
+// appendChangelogSeqTx is appendChangelogTx that also returns the new row's seq,
+// for callers that record or hand back the seq of the entry they wrote.
+func appendChangelogSeqTx(ctx context.Context, tx *sql.Tx, entityType, entityID, projectID, op string, payload []byte, createdAt int64) (int64, error) {
+	res, err := tx.ExecContext(ctx, `
 		INSERT INTO changelog (entity_type, entity_id, project_id, op, payload, created_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-	`, entityType, entityID, nullable(projectID), op, nullableJSON(payload), createdAt); err != nil {
-		return fmt.Errorf("store: append changelog %s/%s: %w", entityType, entityID, err)
+	`, entityType, entityID, nullable(projectID), op, nullableJSON(payload), createdAt)
+	if err != nil {
+		return 0, fmt.Errorf("store: append changelog %s/%s: %w", entityType, entityID, err)
 	}
-	return nil
+	seq, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("store: changelog seq %s/%s: %w", entityType, entityID, err)
+	}
+	return seq, nil
 }
 
 // nullableJSON maps an empty JSON payload to SQL NULL and otherwise binds the
@@ -85,15 +97,25 @@ const defaultChangelogPull = 100
 // ascending, capped at limit. A non-positive limit is clamped to
 // defaultChangelogPull. If entityType is non-empty only that type is returned.
 // This is the controller's pull channel: it tracks a per-node cursor and asks
-// for "changes since" it.
+// for "changes since" it. node_maintenance rows are hidden (see ChangelogPage);
+// a caller that must not stall behind a hidden tail should use ChangelogPage and
+// advance its cursor to the returned high water.
 func (s *Store) ChangelogSince(ctx context.Context, since int64, entityType string, limit int) ([]ChangelogEntry, error) {
+	entries, _, err := s.ChangelogPage(ctx, since, entityType, limit, false)
+	return entries, err
+}
+
+// ChangelogPage is ChangelogSince with node_maintenance visibility control. It
+// scans rows with seq > since (optionally of one entityType) ordered by seq, at
+// most limit of them, INCLUDING node_maintenance rows, then drops those from the
+// output unless showMaintenance — so a controller that does not understand the
+// entity never sees it. highWater is the last scanned seq (or since when nothing
+// was scanned): a page whose tail was all hidden still moves the cursor past it.
+func (s *Store) ChangelogPage(ctx context.Context, since int64, entityType string, limit int, showMaintenance bool) (entries []ChangelogEntry, highWater int64, err error) {
 	if limit <= 0 {
 		limit = defaultChangelogPull
 	}
-	var (
-		rows *sql.Rows
-		err  error
-	)
+	var rows *sql.Rows
 	if entityType == "" {
 		rows, err = s.control.QueryContext(ctx, `
 			SELECT seq, entity_type, entity_id, project_id, op, payload, created_at
@@ -104,10 +126,11 @@ func (s *Store) ChangelogSince(ctx context.Context, since int64, entityType stri
 			  FROM changelog WHERE seq > ? AND entity_type = ? ORDER BY seq LIMIT ?`, since, entityType, limit)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("store: changelog since %d: %w", since, err)
+		return nil, 0, fmt.Errorf("store: changelog since %d: %w", since, err)
 	}
 	defer rows.Close()
 
+	highWater = since
 	var out []ChangelogEntry
 	for rows.Next() {
 		var (
@@ -116,7 +139,11 @@ func (s *Store) ChangelogSince(ctx context.Context, since int64, entityType stri
 			payload sql.NullString
 		)
 		if err := rows.Scan(&e.Seq, &e.EntityType, &e.EntityID, &projID, &e.Op, &payload, &e.CreatedAt); err != nil {
-			return nil, fmt.Errorf("store: scan changelog row: %w", err)
+			return nil, 0, fmt.Errorf("store: scan changelog row: %w", err)
+		}
+		highWater = e.Seq
+		if e.EntityType == EntityNodeMaintenance && !showMaintenance {
+			continue
 		}
 		e.ProjectID = projID.String
 		if payload.Valid {
@@ -125,7 +152,7 @@ func (s *Store) ChangelogSince(ctx context.Context, since int64, entityType stri
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("store: iterate changelog: %w", err)
+		return nil, 0, fmt.Errorf("store: iterate changelog: %w", err)
 	}
-	return out, nil
+	return out, highWater, nil
 }

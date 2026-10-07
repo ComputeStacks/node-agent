@@ -27,12 +27,22 @@ const busyTimeout = 5 * time.Second
 // buys nothing and just multiplies file handles. WAL still gives readers
 // concurrency at the file level.
 func openSQLite(path string, txlockImmediate bool) (*sql.DB, error) {
+	return openSQLiteMode(path, txlockImmediate, false)
+}
+
+// openSQLiteMode is openSQLite with an optional mustExist: when set, the file is
+// opened read-write but never created (SQLite URI mode=rw), so a missing DB is an
+// open error rather than a fresh empty file.
+func openSQLiteMode(path string, txlockImmediate, mustExist bool) (*sql.DB, error) {
 	// Driver-level PRAGMAs via the DSN query so they apply to every pooled
 	// connection the driver opens, not just the first. busy_timeout is in ms.
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(ON)",
 		path, busyTimeout.Milliseconds(),
 	)
+	if mustExist {
+		dsn += "&mode=rw"
+	}
 	// control.db runs multi-statement write transactions (withControlTx); open
 	// them IMMEDIATE so the write lock is taken at BEGIN, not lazily at the first
 	// write. That makes the changelog seq allocation + commit always happen under

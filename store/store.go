@@ -72,6 +72,10 @@ func Open(dataDir string, opts Options) (*Store, error) {
 		_ = controlSQL.Close()
 		return nil, err
 	}
+	if err := ensureInstanceID(controlSQL); err != nil {
+		_ = controlSQL.Close()
+		return nil, err
+	}
 
 	maxOpen := opts.MaxOpenProjectDBs
 	if maxOpen <= 0 {
@@ -92,13 +96,57 @@ func Open(dataDir string, opts Options) (*Store, error) {
 	}, nil
 }
 
+// OpenExistingControl opens an EXISTING <dataDir>/control.db for an out-of-process
+// tool (the maintenance CLI) running beside the agent. Unlike Open it creates
+// nothing (no data dir, no DB file) and runs no migrations; it refuses unless the
+// recorded schema version equals the latest control migration this binary knows,
+// in either direction, so a CLI from a different release never writes a schema it
+// does not match. It uses the same SQLite options as Open (WAL, busy_timeout,
+// IMMEDIATE transactions).
+//
+// The returned Store has no per-project pool: only control.db methods may be
+// called on it (project methods would panic). Close is safe.
+func OpenExistingControl(dataDir string) (*Store, error) {
+	if dataDir == "" {
+		return nil, errors.New("store: OpenExistingControl requires a non-empty data dir")
+	}
+	path := filepath.Join(dataDir, "control.db")
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: open existing control.db: %w", err)
+	}
+	if !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("store: open existing control.db: %s is not a regular file", path)
+	}
+	controlSQL, err := openSQLiteMode(path, true, true)
+	if err != nil {
+		return nil, fmt.Errorf("store: open existing control.db: %w", err)
+	}
+	_, onDisk, err := appliedVersions(controlSQL)
+	if err != nil {
+		_ = controlSQL.Close()
+		return nil, fmt.Errorf("store: read control.db schema version: %w", err)
+	}
+	want := 0
+	if n := len(controlMigrations); n > 0 {
+		want = controlMigrations[n-1].version
+	}
+	if onDisk != want {
+		_ = controlSQL.Close()
+		return nil, fmt.Errorf("store: control.db is schema v%d; this binary expects v%d (run the matching cs-agent version)", onDisk, want)
+	}
+	return &Store{dataDir: dataDir, control: controlSQL}, nil
+}
+
 // Close closes the per-project pool (and its idle sweeper) and control.db.
 // Idempotent: a second call is a safe no-op. The Store must not be used after
 // the first Close.
 func (s *Store) Close() error {
 	var firstErr error
-	if err := s.pool.close(); err != nil {
-		firstErr = err
+	if s.pool != nil { // nil on a control-only Store (OpenExistingControl)
+		if err := s.pool.close(); err != nil {
+			firstErr = err
+		}
 	}
 	if err := s.control.Close(); err != nil && firstErr == nil {
 		firstErr = err

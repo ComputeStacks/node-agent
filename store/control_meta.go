@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -30,6 +32,11 @@ const (
 	// floor). Advanced only forward (monotonic) so a stale/rewound ack can't
 	// resurrect the cursor.
 	MetaChangelogAcked = "changelog_acked_seq"
+
+	// MetaInstanceID is a random 128-bit hex id minted once per control.db (by
+	// Open, if absent). It changes only when control.db is recreated, which lets
+	// the controller tell a rebuilt node from a restarted one.
+	MetaInstanceID = "instance_id"
 )
 
 // GetMeta returns the value for key. found=false on a miss (not an error).
@@ -114,4 +121,26 @@ func (s *Store) GetChangelogAcked(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("store: parse changelog acked %q: %w", v, err)
 	}
 	return seq, nil
+}
+
+// ensureInstanceID mints the control.db instance id if absent. An existing id is
+// never replaced.
+func ensureInstanceID(db *sql.DB) error {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Errorf("store: mint instance id: %w", err)
+	}
+	if _, err := db.Exec(`
+		INSERT INTO control_meta (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO NOTHING
+	`, MetaInstanceID, hex.EncodeToString(b[:])); err != nil {
+		return fmt.Errorf("store: mint instance id: %w", err)
+	}
+	return nil
+}
+
+// InstanceID returns the control.db instance id ("" if never minted).
+func (s *Store) InstanceID(ctx context.Context) (string, error) {
+	v, _, err := s.GetMeta(ctx, MetaInstanceID)
+	return v, err
 }

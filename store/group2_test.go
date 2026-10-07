@@ -9,10 +9,16 @@ import (
 
 func TestControlMigrations_V3_Tables(t *testing.T) {
 	s := open(t, Options{})
-	for _, tbl := range []string{"tasks", "volumes", "firewall_rules", "repositories", "control_meta"} {
+	for _, tbl := range []string{"tasks", "volumes", "firewall_rules", "repositories"} {
 		if got := countTable(t, s, tbl); got != 0 {
 			t.Fatalf("%s not empty on fresh open: %d", tbl, got)
 		}
+	}
+	// control_meta holds only the instance id Open mints.
+	var n int
+	if err := s.control.QueryRowContext(ctx,
+		`SELECT count(*) FROM control_meta WHERE key != ?`, MetaInstanceID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("control_meta not empty on fresh open: %d (%v)", n, err)
 	}
 }
 
