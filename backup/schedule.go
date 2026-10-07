@@ -119,13 +119,24 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // fireDue enqueues a volume.backup task for every schedule whose next_fire_at has
-// passed, advancing next_fire_at in the same transaction (exactly-once).
+// passed, advancing next_fire_at in the same transaction (exactly-once). While the
+// node is paused for maintenance a due slot is skipped instead: next_fire_at moves
+// to the next slot and the skip is counted, so nothing fires on exit.
 func (s *Scheduler) fireDue(ctx context.Context) {
 	defer sentry.Recover()
 	now := time.Now()
 	due, err := s.st.ListDueSchedules(ctx, now.Unix())
 	if err != nil {
 		backupLogger().Warn("Scheduler: list due schedules", "error", err.Error())
+		return
+	}
+	if len(due) == 0 {
+		return
+	}
+	paused, err := s.st.IsPaused(ctx)
+	if err != nil {
+		// Unknown pause state: fire nothing this tick; the slots stay due.
+		backupLogger().Warn("Scheduler: check maintenance state", "error", err.Error())
 		return
 	}
 	fired := false
@@ -154,6 +165,14 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			_ = s.st.DeleteSchedule(ctx, sc.VolumeName)
 			continue
 		}
+		if paused {
+			if err := s.st.SkipDueBackup(ctx, sc.VolumeName, next.Unix()); err != nil {
+				backupLogger().Warn("Scheduler: skip due backup", "volume", sc.VolumeName, "error", err.Error())
+				continue
+			}
+			backupLogger().Info("Scheduler: node in maintenance, skipped backup", "volume", sc.VolumeName, "next", next.UTC().Format(time.RFC3339))
+			continue
+		}
 		task := store.Task{
 			ID:        uuid.New().String(),
 			Name:      "volume.backup",
@@ -178,7 +197,9 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 // job runs in its OWN goroutine so a long prune/compact (incl. its jitter sleep)
 // never blocks backup firing or reconcile on the tick loop; an overlap guard skips
 // a job whose prior run is still in flight, and maintWg lets Run drain them on
-// shutdown before the store closes.
+// shutdown before the store closes. A job starts only once BeginMaintJob has
+// written its running marker; while the node is paused it refuses and the slot is
+// skipped like any other misfire.
 func (s *Scheduler) runMaintenance(ctx context.Context) {
 	now := time.Now()
 	for _, m := range s.maint {
@@ -197,10 +218,29 @@ func (s *Scheduler) runMaintenance(ctx context.Context) {
 			backupLogger().Warn("Scheduler: skipping maintenance; previous run still in progress", "job", m.name)
 			continue
 		}
+		started, err := s.st.BeginMaintJob(ctx, m.name)
+		if err != nil {
+			m.running.Store(false)
+			backupLogger().Warn("Scheduler: begin maintenance job", "job", m.name, "error", err.Error())
+			continue
+		}
+		if !started {
+			m.running.Store(false)
+			backupLogger().Info("Scheduler: skipping maintenance; node paused or job already marked running", "job", m.name)
+			continue
+		}
 		s.maintWg.Add(1)
 		go func(m *maintJob) {
 			defer s.maintWg.Done()
 			defer m.running.Store(false)
+			// Deferred so the marker goes on any exit, panic included. Not bound to
+			// ctx: on shutdown ctx is already cancelled and the delete must still land.
+			defer func() {
+				if err := s.st.EndMaintJob(context.WithoutCancel(ctx), m.name); err != nil {
+					backupLogger().Warn("Scheduler: end maintenance job", "job", m.name, "error", err.Error())
+				}
+			}()
+			defer sentry.Recover() // report, don't crash the agent
 			m.run(ctx)
 		}(m)
 	}
@@ -297,10 +337,4 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 	if trashed && s.dispatch != nil {
 		s.dispatch()
 	}
-}
-
-// nextFire is store.NextFire, kept as a package-local name for the
-// housekeeper.
-func nextFire(expr string, from time.Time) time.Time {
-	return store.NextFire(expr, from)
 }

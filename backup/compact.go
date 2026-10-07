@@ -16,6 +16,8 @@ import (
 // compact reclaims space freed by prune/delete for every backup-enabled volume in
 // this node's control.db. It runs borg compact under the per-repo lock so it never
 // overlaps an export of the same repo. (hostname is used only for the jitter seed.)
+// Stops between volumes if the node enters maintenance; a volume already being
+// compacted finishes.
 func compact(ctx context.Context, st *store.Store) {
 	defer sentry.Recover()
 	hostname, _ := os.Hostname()
@@ -38,8 +40,13 @@ func compact(ctx context.Context, st *store.Store) {
 		return
 	}
 
-	for _, sv := range vols {
+	for i, sv := range vols {
 		if ctx.Err() != nil { // stop the sweep promptly on shutdown
+			return
+		}
+		// Checked here, after the jitter sleep, so a pause taken during the sleep
+		// stops the sweep before its first volume.
+		if sweepPaused(ctx, st, "compact", len(vols)-i) {
 			return
 		}
 		vol, err := types.LoadVolume(sv.Config)
@@ -58,23 +65,25 @@ func compact(ctx context.Context, st *store.Store) {
 				continue
 			}
 
-			// Scoped closure so the lock releases each iteration (and on panic),
-			// and so one repo blocked behind an in-flight export doesn't stall
-			// the rest of the sweep.
-			//
-			// vol.Name is the repository owner: the sweep only ever compacts this
-			// node's own volumes, so the Repository below is built with Name set to
-			// the same value the lock is keyed on.
-			func() {
-				defer borg.AcquireRepoLock(vol.Name)()
-				repo := borg.Repository{Name: vol.Name, Store: st}
-				if log := repo.Compact(); log != nil {
-					backupLogger().Warn("Compact Volume Error", "volume", vol.Name, "error", log.Message)
-				}
-				repo.StopContainer() // no-op for the NFS backend (no container)
-			}()
+			compactVolume(st, vol)
 		}
 	}
+}
+
+// compactVolume compacts one volume's repository. A variable so tests can stand in
+// for the borg run.
+//
+// The lock releases on return (and on panic), so one repo blocked behind an
+// in-flight export doesn't stall the rest of the sweep. vol.Name is the
+// repository owner: the sweep only ever compacts this node's own volumes, so the
+// Repository below is built with Name set to the same value the lock is keyed on.
+var compactVolume = func(st *store.Store, vol types.Volume) {
+	defer borg.AcquireRepoLock(vol.Name)()
+	repo := borg.Repository{Name: vol.Name, Store: st}
+	if log := repo.Compact(); log != nil {
+		backupLogger().Warn("Compact Volume Error", "volume", vol.Name, "error", log.Message)
+	}
+	repo.StopContainer() // no-op for the NFS backend (no container)
 }
 
 // compactAction is what the store says a compact sweep should do with one volume.

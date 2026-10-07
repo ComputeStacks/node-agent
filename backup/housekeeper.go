@@ -32,7 +32,7 @@ func NewHousekeeper(st *store.Store) *Housekeeper {
 // unparseable it falls back to a fixed interval so retention can't be silently
 // turned off.
 func (h *Housekeeper) Run(ctx context.Context) {
-	if nextFire(h.expr, time.Now()).IsZero() {
+	if store.NextFire(h.expr, time.Now()).IsZero() {
 		backupLogger().Warn("Housekeeping cron empty/unparseable; using default interval",
 			"cron", h.expr, "interval", defaultHousekeepingInterval.String())
 	} else {
@@ -51,7 +51,7 @@ func (h *Housekeeper) Run(ctx context.Context) {
 // untilNext returns the delay to the next run: the cron's next fire, or the
 // default interval when the cron is empty/unparseable.
 func (h *Housekeeper) untilNext(now time.Time) time.Duration {
-	next := nextFire(h.expr, now)
+	next := store.NextFire(h.expr, now)
 	if next.IsZero() {
 		return defaultHousekeepingInterval
 	}
