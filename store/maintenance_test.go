@@ -104,12 +104,46 @@ func TestMaintenance_ClearAllHolds(t *testing.T) {
 	if _, _, err := s.PutLocalHold(ctx, "l", "bob"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.ClearAllHolds(ctx, 0); !errors.Is(err, ErrStaleGen) {
+	if _, err := s.ClearAllHolds(ctx, 0, 0); !errors.Is(err, ErrStaleGen) {
 		t.Fatalf("stale ClearAllHolds err = %v", err)
 	}
-	m, err := s.ClearAllHolds(ctx, 1)
+	m, err := s.ClearAllHolds(ctx, 1, 0)
 	if err != nil || m.Paused() || m.Controller != nil || m.Local != nil {
 		t.Fatalf("ClearAllHolds: %+v %v", m, err)
+	}
+}
+
+func TestMaintenance_ClearAllHoldsConditional(t *testing.T) {
+	s := open(t, Options{})
+	if _, err := s.PutControllerHold(ctx, "r", 1); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := s.PutLocalHold(ctx, "l", "bob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(maintEntries(t, s))
+
+	// A cutoff before the local hold's since: refused, nothing written.
+	got, err := s.ClearAllHolds(ctx, 2, m.Local.Since-1)
+	if !errors.Is(err, ErrLocalHoldNewer) {
+		t.Fatalf("err = %v, want ErrLocalHoldNewer", err)
+	}
+	if got.Local == nil || got.Controller == nil {
+		t.Fatalf("returned state = %+v, want both holds", got)
+	}
+	after := mustMaint(t, s)
+	if after.Local == nil || after.Controller == nil || after.ControllerGen != 1 {
+		t.Fatalf("state after refusal = %+v", after)
+	}
+	if n := len(maintEntries(t, s)); n != before {
+		t.Fatalf("entries = %d, want %d", n, before)
+	}
+
+	// A cutoff at the local hold's since: released.
+	got, err = s.ClearAllHolds(ctx, 2, m.Local.Since)
+	if err != nil || got.Paused() {
+		t.Fatalf("conditional clear: %+v %v", got, err)
 	}
 }
 

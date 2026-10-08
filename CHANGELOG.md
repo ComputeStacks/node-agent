@@ -10,6 +10,9 @@ routes and a new CLI subcommand; nothing changes until a hold is placed. One new
   (`GET/PUT/DELETE /v1/admin/maintenance`) or locally (`cs-agent maintenance on|off|status`).
   Each source owns its own hold and the node is paused while either exists. Controller
   writes carry a generation, and a stale one is refused with `409` and the current status.
+  The controller override `DELETE ?all=1` clears both holds, and with
+  `local_since_max=<unix>` it refuses (`412`) to release a local hold placed after that
+  time.
 - [FEATURE] **While paused** no new task is claimed, scheduled backups and prune/compact
   skip their slots, and restores that had not started are cancelled. Running work finishes.
   On exit, missed backup slots are skipped rather than run all at once.

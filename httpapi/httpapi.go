@@ -83,7 +83,7 @@ type Store interface {
 	maintenance.StatusStore
 	PutControllerHold(ctx context.Context, reason string, gen int64) (store.MaintenanceState, error)
 	ClearControllerHold(ctx context.Context, gen int64) (store.MaintenanceState, error)
-	ClearAllHolds(ctx context.Context, gen int64) (store.MaintenanceState, error)
+	ClearAllHolds(ctx context.Context, gen, localSinceMax int64) (store.MaintenanceState, error)
 }
 
 // Config configures the metadata HTTP server. Populate from viper in main.go.

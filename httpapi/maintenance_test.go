@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -152,6 +153,38 @@ func TestMaintenance_DeleteAll(t *testing.T) {
 	s := decodeStatus(t, resp)
 	if s.Paused || s.Controller != nil || s.Local != nil {
 		t.Fatalf("all=1 status = %+v", s)
+	}
+}
+
+func TestMaintenance_DeleteAllConditional(t *testing.T) {
+	e, wakes := newMaintEnv(t, &fakeLister{})
+	if _, err := e.st.PutControllerHold(ctxBG, "r", 1); err != nil {
+		t.Fatal(err)
+	}
+	m, _, err := e.st.PutLocalHold(ctxBG, "l", "root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := wakes.Load()
+
+	resp := e.do("DELETE", "/v1/admin/maintenance?gen=1&all=1&local_since_max="+strconv.FormatInt(m.Local.Since-1, 10), e.adminTok, nil)
+	mustStatus(t, resp, http.StatusPreconditionFailed)
+	if s := decodeStatus(t, resp); !s.Paused || s.Local == nil || s.Controller == nil {
+		t.Fatalf("412 body = %+v", s)
+	}
+	if wakes.Load() != before {
+		t.Fatalf("wake hook fired on 412")
+	}
+
+	resp = e.do("DELETE", "/v1/admin/maintenance?gen=1&local_since_max=5", e.adminTok, nil)
+	mustStatus(t, resp, http.StatusBadRequest)
+	resp = e.do("DELETE", "/v1/admin/maintenance?gen=1&all=1&local_since_max=x", e.adminTok, nil)
+	mustStatus(t, resp, http.StatusBadRequest)
+
+	resp = e.do("DELETE", "/v1/admin/maintenance?gen=1&all=1&local_since_max="+strconv.FormatInt(m.Local.Since, 10), e.adminTok, nil)
+	mustStatus(t, resp, http.StatusOK)
+	if s := decodeStatus(t, resp); s.Paused {
+		t.Fatalf("conditional all=1 status = %+v", s)
 	}
 }
 

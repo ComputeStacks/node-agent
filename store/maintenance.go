@@ -56,6 +56,10 @@ var MaintenanceSampleEmitInterval = 30 * time.Second
 // generation is older than the newest one already applied. Nothing is written.
 var ErrStaleGen = errors.New("store: stale maintenance generation")
 
+// ErrLocalHoldNewer is returned by a conditional ClearAllHolds when the local
+// hold was placed after the override's cutoff. Nothing is written.
+var ErrLocalHoldNewer = errors.New("store: local maintenance hold is newer than the override")
+
 // MaintenanceHold is one source's hold. By is the unix user (local hold only);
 // Gen is the controller generation that last wrote it (controller hold only).
 type MaintenanceHold struct {
@@ -473,11 +477,18 @@ func (s *Store) ClearControllerHold(ctx context.Context, gen int64) (Maintenance
 }
 
 // ClearAllHolds is the controller override: it removes both the controller and
-// the local hold (same gen rule as PutControllerHold).
-func (s *Store) ClearAllHolds(ctx context.Context, gen int64) (MaintenanceState, error) {
+// the local hold. localSinceMax, when > 0, makes the override conditional: if a
+// local hold exists whose since is later than localSinceMax (placed after the
+// operator asked for the override), nothing is written and ErrLocalHoldNewer is
+// returned with the current state. The check and the clear share one tx, so a
+// local hold placed between a caller's read and this write is never released.
+func (s *Store) ClearAllHolds(ctx context.Context, gen, localSinceMax int64) (MaintenanceState, error) {
 	m, _, err := s.mutateMaintenance(ctx, false, func(m *MaintenanceState, _ int64) (bool, error) {
 		if err := checkGen(m, gen); err != nil {
 			return false, err
+		}
+		if localSinceMax > 0 && m.Local != nil && m.Local.Since > localSinceMax {
+			return false, ErrLocalHoldNewer
 		}
 		changed := m.Controller != nil || m.Local != nil
 		m.Controller = nil
