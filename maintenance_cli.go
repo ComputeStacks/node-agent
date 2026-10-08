@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -54,6 +55,9 @@ var (
 	maintPollInterval = 2 * time.Second
 )
 
+// maintenanceUsage is the maintenance help. TestHelpCoversCLI fails when a
+// command in maintenanceCommands or a flag from newMaintenanceFlagSet is
+// missing from it.
 const maintenanceUsage = `Usage: cs-agent maintenance <command> [flags]
 
 Commands:
@@ -107,27 +111,16 @@ type onOptions struct {
 	noController bool
 }
 
-func maintenanceCLI(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, maintenanceUsage)
-		return exitUsage
-	}
-	cmd, rest := args[0], args[1:]
-	switch cmd {
-	case "help", "-h", "-help", "--help":
-		fmt.Fprint(stdout, maintenanceUsage)
-		return exitOK
-	case "on", "off", "status":
-	default:
-		fmt.Fprintf(stderr, "unknown maintenance command %q\n\n%s", cmd, maintenanceUsage)
-		return exitUsage
-	}
+// maintenanceCommands are the `cs-agent maintenance` subcommands besides help.
+var maintenanceCommands = []string{"on", "off", "status"}
 
+// newMaintenanceFlagSet defines the flags for one maintenance command.
+func newMaintenanceFlagSet(cmd string, stderr io.Writer) (*flag.FlagSet, *bool, *onOptions) {
 	fs := flag.NewFlagSet("cs-agent maintenance "+cmd, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() { fmt.Fprint(stderr, maintenanceUsage) }
 	jsonOut := fs.Bool("json", false, "print one JSON object on stdout")
-	var on onOptions
+	on := &onOptions{}
 	if cmd == "on" {
 		fs.StringVar(&on.reason, "reason", "", "why the node is going into maintenance (required)")
 		fs.BoolVar(&on.wait, "wait", false, "wait until the node is quiesced")
@@ -135,6 +128,25 @@ func maintenanceCLI(ctx context.Context, args []string, stdout, stderr io.Writer
 		fs.DurationVar(&on.settle, "settle", 30*time.Second, "after quiescing, wait this long and re-check")
 		fs.BoolVar(&on.noController, "no-controller", false, "do not wait for the controller to acknowledge the hold")
 	}
+	return fs, jsonOut, on
+}
+
+func maintenanceCLI(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprint(stderr, maintenanceUsage)
+		return exitUsage
+	}
+	cmd, rest := args[0], args[1:]
+	switch {
+	case cmd == "help" || cmd == "-h" || cmd == "-help" || cmd == "--help":
+		fmt.Fprint(stdout, maintenanceUsage)
+		return exitOK
+	case !slices.Contains(maintenanceCommands, cmd):
+		fmt.Fprintf(stderr, "unknown maintenance command %q\n\n%s", cmd, maintenanceUsage)
+		return exitUsage
+	}
+
+	fs, jsonOut, on := newMaintenanceFlagSet(cmd, stderr)
 	if err := fs.Parse(rest); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return exitOK
@@ -181,7 +193,7 @@ func maintenanceCLI(ctx context.Context, args []string, stdout, stderr io.Writer
 	c := &maintCLI{st: st, lister: maintLister(), stdout: stdout, stderr: stderr, json: *jsonOut}
 	switch cmd {
 	case "on":
-		return c.on(ctx, on)
+		return c.on(ctx, *on)
 	case "off":
 		return c.off(ctx)
 	default:

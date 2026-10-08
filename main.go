@@ -34,6 +34,8 @@ var (
 	date    = "unknown"
 )
 
+// agentUsage is the top-level help. TestHelpCoversCLI fails when a command in
+// agentCommands or a flag from registerAgentFlags is missing from it.
 const agentUsage = `Usage:
   cs-agent [-version]
         Run the agent daemon (normally started by systemd). With -version,
@@ -51,21 +53,30 @@ Flags:
 The daemon reads agent.yml from /etc/computestacks, then the working directory.
 `
 
+// agentCommands are the subcommands; anything else runs the daemon. Each is
+// dispatched before flag parsing so its own flags are not seen by the daemon.
+var agentCommands = map[string]func(args []string) int{
+	"maintenance": runMaintenanceCLI,
+	"help": func([]string) int {
+		fmt.Fprint(os.Stdout, agentUsage)
+		return 0
+	},
+}
+
+// registerAgentFlags defines the daemon's flags on fs.
+func registerAgentFlags(fs *flag.FlagSet) (showVersion *bool) {
+	return fs.Bool("version", false, "print version information and exit")
+}
+
 func main() {
-	// `cs-agent maintenance ...` is the local operator CLI, not the daemon. It is
-	// dispatched before flag parsing so its own flags are not seen here.
 	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "maintenance":
-			os.Exit(runMaintenanceCLI(os.Args[2:]))
-		case "help":
-			fmt.Fprint(os.Stdout, agentUsage)
-			return
+		if run, ok := agentCommands[os.Args[1]]; ok {
+			os.Exit(run(os.Args[2:]))
 		}
 	}
 
 	flag.Usage = func() { fmt.Fprint(flag.CommandLine.Output(), agentUsage) }
-	showVersion := flag.Bool("version", false, "print version information and exit")
+	showVersion := registerAgentFlags(flag.CommandLine)
 	flag.Parse()
 	// Anything left over is a mistyped subcommand; refuse rather than start a
 	// second daemon.
