@@ -738,7 +738,8 @@ func TestRecordMaintenanceSample_RateLimited(t *testing.T) {
 	if got := len(maintEntries(t, s)); got != n {
 		t.Fatalf("entries = %d, want %d", got, n)
 	}
-	// A held-back sample does not replace the published one; sampled_at moves.
+	// A held-back sample does not replace the published one; sampled_at moves only
+	// for a sample that matches it (the last flap is busy again).
 	if m := mustMaint(t, s); m.Sample == nil || m.Sample.Quiesce != "busy" || m.Sample.SampledAt != 209 {
 		t.Fatalf("stored sample = %+v", m.Sample)
 	}

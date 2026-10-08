@@ -520,7 +520,7 @@ func (s *Store) ClearLocalHold(ctx context.Context) (MaintenanceState, error) {
 //
 // Sample-driven entries are rate limited to one per
 // MaintenanceSampleEmitInterval (hold changes are not). A differing sample that
-// the limit holds back is NOT stored (only sampled_at is refreshed), so the
+// the limit holds back is NOT stored (sampled_at is not refreshed either), so the
 // stored sample stays the last one published and the first sample allowed
 // after the interval still differs and is published. The first sample after
 // entry into maintenance always publishes: entry clears the stored sample and
@@ -546,7 +546,11 @@ func (s *Store) RecordMaintenanceSample(ctx context.Context, smp MaintenanceSamp
 			}
 			if !appended {
 				next = *prev
-				next.SampledAt = smp.SampledAt
+				// sampled_at says when the stored values were last observed, so it
+				// moves only when they still hold; a held-back change leaves it.
+				if !differs {
+					next.SampledAt = smp.SampledAt
+				}
 			}
 		}
 		b, err := json.Marshal(next)

@@ -406,12 +406,13 @@ func (c *maintCLI) fail(ctx context.Context, code int, mySeq int64, msg string) 
 	if err != nil {
 		return c.failNoStatus(code, fmt.Sprintf("%s (cannot read maintenance state: %v)", msg, err))
 	}
-	if mySeq <= 0 {
-		mySeq = s.Seq
-	}
-	acked, err := c.controllerAcked(ctx, mySeq)
-	if err != nil {
-		return c.failNoStatus(code, fmt.Sprintf("%s (cannot read maintenance state: %v)", msg, err))
+	// No entry of ours (the hold was never placed): nothing for the controller to
+	// have acknowledged.
+	acked := false
+	if mySeq > 0 {
+		if acked, err = c.controllerAcked(ctx, mySeq); err != nil {
+			return c.failNoStatus(code, fmt.Sprintf("%s (cannot read maintenance state: %v)", msg, err))
+		}
 	}
 	return c.failWith(ctx, code, s, acked, msg)
 }
