@@ -26,6 +26,8 @@ routes and a new CLI subcommand; nothing changes until a hold is placed. One new
 - [CHANGE] Backup tasks are claimed only once a worker is free, so a task is never marked
   running while it waits in the queue.
 - [CHANGE] `control.db` now carries a stable `instance_id`, reported by the maintenance API.
+- [CHANGE] `cs-agent -h` and `cs-agent help` list every subcommand and flag. An unknown
+  argument is now refused (exit `2`) instead of starting the daemon.
 - New `agent.yml` key `maintenance.stale_hold_hours` (default `12`): a hold older than this
   is logged and reported hourly.
 

@@ -34,15 +34,45 @@ var (
 	date    = "unknown"
 )
 
+const agentUsage = `Usage:
+  cs-agent [-version]
+        Run the agent daemon (normally started by systemd). With -version,
+        print version, commit and build date, then exit.
+  cs-agent maintenance <on|off|status> [flags]
+        Local maintenance mode: pause backups, restores and other agent work
+        on this node. Run "cs-agent maintenance help" for its flags.
+  cs-agent help
+        Show this help.
+
+Flags:
+  -version    print version information and exit
+  -h, -help   show this help
+
+The daemon reads agent.yml from /etc/computestacks, then the working directory.
+`
+
 func main() {
 	// `cs-agent maintenance ...` is the local operator CLI, not the daemon. It is
 	// dispatched before flag parsing so its own flags are not seen here.
-	if len(os.Args) > 1 && os.Args[1] == "maintenance" {
-		os.Exit(runMaintenanceCLI(os.Args[2:]))
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "maintenance":
+			os.Exit(runMaintenanceCLI(os.Args[2:]))
+		case "help":
+			fmt.Fprint(os.Stdout, agentUsage)
+			return
+		}
 	}
 
+	flag.Usage = func() { fmt.Fprint(flag.CommandLine.Output(), agentUsage) }
 	showVersion := flag.Bool("version", false, "print version information and exit")
 	flag.Parse()
+	// Anything left over is a mistyped subcommand; refuse rather than start a
+	// second daemon.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", flag.Arg(0), agentUsage)
+		os.Exit(2)
+	}
 	if *showVersion {
 		fmt.Printf("cs-agent %s (commit %s, built %s)\n", version, commit, date)
 		return

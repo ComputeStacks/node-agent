@@ -65,6 +65,18 @@ Commands:
         Clear the local maintenance hold. A controller hold is left in place.
   status [--json]
         Show the maintenance state and the work still in flight.
+  help
+        Show this help.
+
+Flags:
+  --reason TEXT      why the node is going into maintenance (on; required)
+  --wait             block until the node is quiesced (on)
+  --timeout DUR      how long --wait may block, e.g. 30m or 2h (on; required with --wait)
+  --settle DUR       once quiesced, wait this long and re-check (on; default 30s)
+  --no-controller    with --wait, do not wait for the controller to acknowledge (on)
+  --json             print exactly one JSON object on stdout (all commands)
+
+Reads store.data_dir from /etc/computestacks/agent.yml (default /var/lib/cs-agent).
 
 Exit codes: 0 ok, 1 usage or state error, 2 still busy at --timeout,
 3 control.db could not be opened, 4 controller has not confirmed the hold.
