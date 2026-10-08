@@ -50,9 +50,19 @@ func RunTask(ctx context.Context, st *store.Store, task store.Task) (json.RawMes
 		err = fmt.Errorf("unknown task kind %q", task.Name)
 	}
 	if err == nil && p.Failed() {
-		err = errors.New("task reported failure")
+		err = softFailureError(p)
 	}
 	return p.Result(err), err
+}
+
+// softFailureError is the error for a task that recorded a failure without
+// returning one: the first step that failed, or a generic string when none was
+// posted.
+func softFailureError(p *progress) error {
+	if reason := p.FailureReason(); reason != "" {
+		return errors.New(reason)
+	}
+	return errors.New("task reported failure")
 }
 
 // resolveArchiveName expands the caller-supplied archive name into the

@@ -63,6 +63,9 @@ func loadMysqlMaster(cli *client.Client, serviceID string, event *progress, allo
 
 	if err != nil {
 		backupLogger().Warn("Failed to load MySQL Master", "error", err.Error(), "function", "loadMysqlMaster", "action", "ContainerInspect")
+		if event != nil {
+			event.PostEventUpdate("agent-mysql-inspect-failed", "Unable to inspect the database container: "+err.Error())
+		}
 		return &instance, err
 	}
 
@@ -166,8 +169,13 @@ func loadMysqlMaster(cli *client.Client, serviceID string, event *progress, allo
 	}
 
 	if ipAddr == "" && !allowOff {
-		backupLogger().Warn("Failed to load mySQLMaster IP Address", "serviceID", serviceID)
-		return &instance, errors.New("unable to load ip address of container")
+		backupLogger().Warn("Failed to load mySQLMaster IP Address", "serviceID", serviceID, "container", mysqlContainer.Name)
+		reason := "Unable to find an IP address for database container " + strings.TrimPrefix(mysqlContainer.Name, "/") +
+			": docker reports no attached network endpoint"
+		if event != nil {
+			event.PostEventUpdate("agent-mysql-no-ip", reason)
+		}
+		return &instance, errors.New(reason)
 	} else if ipAddr != "" {
 		instance.IPAddress = ipAddr
 	}

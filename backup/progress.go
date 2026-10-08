@@ -25,6 +25,9 @@ type progress struct {
 	mu     sync.Mutex
 	lines  []string
 	fields map[string]any
+	// firstFailure is the first line of the first PostEventUpdate message: the
+	// step that failed first, before any cleanup hook added its own complaint.
+	firstFailure string
 }
 
 func newProgress() *progress {
@@ -44,7 +47,24 @@ func (p *progress) PostEventUpdate(code, msg string) {
 		return
 	}
 	p.Record(msg)
+	first, _, _ := strings.Cut(strings.TrimSpace(msg), "\n")
+	p.mu.Lock()
+	if p.firstFailure == "" {
+		p.firstFailure = first
+	}
+	p.mu.Unlock()
 	backupLogger().Info("task step", "code", code, "msg", msg)
+}
+
+// FailureReason is the first step message posted with PostEventUpdate, or ""
+// when nothing was posted.
+func (p *progress) FailureReason() string {
+	if p == nil {
+		return ""
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.firstFailure
 }
 
 // Record appends a step message to the task result AND logs it at DEBUG. Use for
