@@ -31,20 +31,15 @@ routes and a new CLI subcommand; nothing changes until a hold is placed. One new
   endpoint says so.
 - [CHANGE] `cs-agent -h` and `cs-agent help` list every subcommand and flag. An unknown
   argument is now refused (exit `2`) instead of starting the daemon.
+- [CHANGE] **The systemd unit no longer stops the agent when docker stops.**
+  `Requires=docker.service` is now `Wants=`, so stopping or restarting docker leaves the
+  agent running and serving its API. Operations that need docker fail and report while it
+  is down. Boot ordering after docker and `network-online.target` is unchanged.
 - New `agent.yml` key `maintenance.stale_hold_hours` (default `12`): a hold older than this
   is logged and reported hourly.
 
   **Rollback:** versions before v3.4.0 ignore maintenance holds and run work normally. Clear
   any holds before downgrading; a hold left in place takes effect again after re-upgrading.
-
-## v3.3.1
-
-Packaging-only release. **No migrations, no config changes, no API changes.**
-
-- [CHANGE] **The systemd unit no longer stops the agent when docker stops.**
-  `Requires=docker.service` is now `Wants=`, so stopping or restarting docker leaves the
-  agent running and serving its API. Operations that need docker fail and report while it
-  is down. Boot ordering after docker and `network-online.target` is unchanged.
 
 ## v3.3.0
 
