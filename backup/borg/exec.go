@@ -96,9 +96,10 @@ func (r *Repository) RunBorgWarnTolerant(label string, cmd []string) ExecResult 
 // Classification is IDENTICAL to RunBorg. The only difference is the log level: a
 // missing-repository verdict is logged at DEBUG rather than WARN, because it is the
 // expected answer on a volume's first backup — backup.Perform reads it and runs `borg
-// init` — and a WARN there wrote "Command failed" ahead of every new repository. Every
-// caller of Info already reports this verdict itself where it is a real failure (restore,
-// export, delete, prune, Sync), so nothing is lost. Every other failure still logs at WARN.
+// init` — and a WARN there wrote "Command failed" ahead of every new repository. Nothing is
+// lost: every other caller of Info reports this verdict itself (restore, export, delete,
+// prune, Sync), and Setup logs at INFO when it initializes a new repository. Every other
+// failure still logs at WARN.
 func (r *Repository) RunBorgRepositoryProbe(label string, cmd []string) ExecResult {
 	return r.run(label, true, quietMissingRepository, cmd)
 }
@@ -188,7 +189,8 @@ func (r *Repository) run(label string, borgJSON bool, logging failureLogging, cm
 		// This is quiet about a verdict the caller may ACCEPT, not about one it rejects —
 		// the caller is responsible for logging at WARN when it decides the verdict was a
 		// real failure, because only it knows. Archive.Create does for the warning tier;
-		// every caller of Repository.Info does for a missing repository.
+		// for a missing repository, every other caller of Repository.Info does, and
+		// backup.Perform's auto-init is logged by Setup at INFO.
 		if loggedQuietly(logging, exitCode, res.Failure) {
 			borgLogger().Debug("Command failed with a verdict the caller reports", "label", label, "exitCode", exitCode, "msgid", res.Failure.MsgID, "message", res.Failure.Message)
 		} else {

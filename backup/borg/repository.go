@@ -214,6 +214,11 @@ func (r *Repository) Setup(target *types.Volume) *LogMessage {
 			return res.Failure
 		}
 		borgLogger().Info("Repository was already initialized", "volume_name", r.Name, "msgid", res.Failure.MsgID)
+	} else {
+		// The only trace above DEBUG that a volume got a brand-new repository: the probe
+		// that found it missing logs at DEBUG (RunBorgRepositoryProbe). Expected on a first
+		// backup; on a volume that already had backups, it marks a repository that vanished.
+		borgLogger().Info("Initialized new repository", "volume_name", r.Name)
 	}
 
 	// Register the (now-initialized) repository's observed state in control.db.
