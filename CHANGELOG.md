@@ -1,5 +1,15 @@
 # Changelog
 
+## v3.4.1
+
+Patch release for v3.4.0. **No migrations (`control.db` stays at schema `v4`), no config
+changes, no API changes.**
+
+- [CHANGE] A volume's first backup no longer logs a `Command failed` warning for its
+  missing repository. The check that finds the repository missing now logs at DEBUG, and
+  creating the new repository logs `Initialized new repository` at INFO. Every other
+  failure of that check still logs at WARN.
+
 ## v3.4.0
 
 Node maintenance mode. **No migrations (`control.db` stays at schema `v4`).** New admin API
