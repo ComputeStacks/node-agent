@@ -90,28 +90,62 @@ func (r *Repository) RunBorgWarnTolerant(label string, cmd []string) ExecResult 
 	return r.run(label, true, quietWarningTier, cmd)
 }
 
+// RunBorgRepositoryProbe is RunBorg for the `borg info` that asks whether a repository
+// exists at all (Repository.Info).
+//
+// Classification is IDENTICAL to RunBorg. The only difference is the log level: a
+// missing-repository verdict is logged at DEBUG rather than WARN, because it is the
+// expected answer on a volume's first backup — backup.Perform reads it and runs `borg
+// init` — and a WARN there wrote "Command failed" ahead of every new repository. Every
+// caller of Info already reports this verdict itself where it is a real failure (restore,
+// export, delete, prune, Sync), so nothing is lost. Every other failure still logs at WARN.
+func (r *Repository) RunBorgRepositoryProbe(label string, cmd []string) ExecResult {
+	return r.run(label, true, quietMissingRepository, cmd)
+}
+
 // RunShell runs a plain shell command in the backup container. Its output is not borg
 // JSON, so the output itself is the reason, verbatim.
 func (r *Repository) RunShell(label string, cmd []string) ExecResult {
 	return r.run(label, false, logEveryFailure, cmd)
 }
 
-// warnTierLogging selects how run() logs a failure whose exit code is borgWarningExit. A
-// named type rather than a bool because it would otherwise be the second of two adjacent
-// same-typed parameters, where a silent transposition compiles.
-type warnTierLogging int
+// failureLogging selects which failures run() logs at DEBUG instead of WARN, because the
+// caller owns the verdict and reports it itself. A named type rather than a bool because it
+// would otherwise be the second of two adjacent same-typed parameters, where a silent
+// transposition compiles.
+type failureLogging int
 
 const (
 	// logEveryFailure logs every failure at WARN. The default, for every command whose
 	// warning tier is a real failure.
-	logEveryFailure warnTierLogging = iota
+	logEveryFailure failureLogging = iota
 
 	// quietWarningTier logs a borgWarningExit failure at DEBUG instead, because the
 	// caller owns the verdict and reports it itself. See RunBorgWarnTolerant.
 	quietWarningTier
+
+	// quietMissingRepository logs a missing-repository verdict at DEBUG instead. See
+	// RunBorgRepositoryProbe.
+	quietMissingRepository
 )
 
-func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, cmd []string) ExecResult {
+// loggedQuietly reports whether run() logs a failure at DEBUG rather than WARN.
+//
+// The missing-repository test mirrors stampMissingRepository: borg's own msgid, or no
+// msgid at all and borg's wording for that verdict. A synthesized failure carries no msgid
+// and does not read as a missing repository, so it can never be quieted.
+func loggedQuietly(mode failureLogging, exitCode int, failure *LogMessage) bool {
+	switch mode {
+	case quietWarningTier:
+		return exitCode == borgWarningExit
+	case quietMissingRepository:
+		return failure.MsgID == missingRepositoryMsgID ||
+			(failure.MsgID == "" && looksLikeMissingRepository(failure.Message))
+	}
+	return false
+}
+
+func (r *Repository) run(label string, borgJSON bool, logging failureLogging, cmd []string) ExecResult {
 	if reflect.ValueOf(r.Container).IsNil() {
 		// DockerFault, because execNoContainer is a sentinel: nothing ran, so ExitCode is
 		// not a command's verdict. That keeps the invariant a caller can rely on —
@@ -146,15 +180,17 @@ func (r *Repository) run(label string, borgJSON bool, warnTier warnTierLogging, 
 
 	res := ExecResult{ExitCode: exitCode, Response: response, Failure: classify(label, borgJSON, exitCode, response)}
 	if res.Failure != nil {
-		// A downgradeable warning tier is logged at DEBUG: the caller reports the
-		// outcome, and a WARN here would say "Command failed" for a backup that
-		// completes. Anything else keeps WARN.
+		// A failure the caller owns is logged at DEBUG: a downgradeable warning tier, so
+		// a WARN does not say "Command failed" for a backup that completes, or a missing
+		// repository on the existence probe, which a first backup expects. Anything else
+		// keeps WARN.
 		//
-		// This is quiet about a warning tier the caller may ACCEPT, not about one it
-		// rejects — the caller is responsible for logging at WARN when it decides the
-		// warning was a real failure, because only it knows. Archive.Create does.
-		if warnTier == quietWarningTier && exitCode == borgWarningExit {
-			borgLogger().Debug("Command exited on borg's warning tier", "label", label, "exitCode", exitCode, "msgid", res.Failure.MsgID, "message", res.Failure.Message)
+		// This is quiet about a verdict the caller may ACCEPT, not about one it rejects —
+		// the caller is responsible for logging at WARN when it decides the verdict was a
+		// real failure, because only it knows. Archive.Create does for the warning tier;
+		// every caller of Repository.Info does for a missing repository.
+		if loggedQuietly(logging, exitCode, res.Failure) {
+			borgLogger().Debug("Command failed with a verdict the caller reports", "label", label, "exitCode", exitCode, "msgid", res.Failure.MsgID, "message", res.Failure.Message)
 		} else {
 			borgLogger().Warn("Command failed", "label", label, "exitCode", exitCode, "msgid", res.Failure.MsgID, "message", res.Failure.Message)
 		}

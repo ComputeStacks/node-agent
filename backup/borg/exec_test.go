@@ -360,3 +360,35 @@ func TestDockerFailure(t *testing.T) {
 		}
 	})
 }
+
+// A missing repository is the expected answer on a volume's first backup, so the
+// existence probe must not log it as "Command failed" — but only that verdict, and only
+// on the probe. An invalid repository, a lock timeout or a synthesized failure stays at
+// WARN, and so does a missing repository on any other command.
+func TestLoggedQuietly(t *testing.T) {
+	missing := &LogMessage{MsgID: missingRepositoryMsgID, Message: "Repository ssh://u@h:2222/x/backup does not exist."}
+	missingNoMsgID := &LogMessage{Message: "Repository /mnt/borg/backup does not exist."}
+	invalid := &LogMessage{MsgID: "Repository.InvalidRepository", Message: "/mnt/borg/backup is not a valid repository. Check repo config."}
+	synthesized := &LogMessage{Message: "borg info exited 2: no diagnostic output"}
+
+	for _, i := range []struct {
+		name     string
+		mode     failureLogging
+		exitCode int
+		failure  *LogMessage
+		want     bool
+	}{
+		{"probe, missing repository", quietMissingRepository, 2, missing, true},
+		{"probe, missing repository without a msgid", quietMissingRepository, 2, missingNoMsgID, true},
+		{"probe, invalid repository", quietMissingRepository, 2, invalid, false},
+		{"probe, synthesized failure", quietMissingRepository, 2, synthesized, false},
+		{"probe, warning tier", quietMissingRepository, borgWarningExit, synthesized, false},
+		{"default, missing repository", logEveryFailure, 2, missing, false},
+		{"warning-tolerant, missing repository", quietWarningTier, 2, missing, false},
+		{"warning-tolerant, warning tier", quietWarningTier, borgWarningExit, synthesized, true},
+	} {
+		if got := loggedQuietly(i.mode, i.exitCode, i.failure); got != i.want {
+			t.Errorf("%s: Received loggedQuietly=%v, wanted %v", i.name, got, i.want)
+		}
+	}
+}

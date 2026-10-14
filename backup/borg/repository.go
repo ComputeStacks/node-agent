@@ -275,7 +275,7 @@ func (r *Repository) Info() (RepositoryResponse, *LogMessage) {
 	cmd = append(cmd, "--lock-wait "+viper.GetString("backups.borg.lock_wait"))
 	cmd = append(cmd, "info --error --json")
 
-	res := r.RunBorg("borg info", cmd)
+	res := r.RunBorgRepositoryProbe("borg info", cmd)
 
 	if res.Failure != nil {
 		return RepositoryResponse{}, res.Failure
