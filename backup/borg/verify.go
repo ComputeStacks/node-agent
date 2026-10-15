@@ -38,7 +38,10 @@ import (
 //     for renamed subtrees: a renamed directory keeps its mtime (measured on borg 1.4.4's
 //     image: a directory moved to a different parent keeps its mtime, only its ctime
 //     moves) even when every file in it is rewritten, unless entries are later added to or
-//     removed from it.
+//     removed from it. Also: paths are compared as borg renders them, with every invalid
+//     UTF-8 byte as "?", so a non-UTF-8 name lost mid-walk reads as present when the
+//     archive holds a literal "?" sibling that renders the same (`caf\351.jpg` beside an
+//     archived `caf?.jpg`).
 //   - False FAIL (today's behavior, the safe direction): a file written mid-walk with an
 //     old mtime (an archive extract, cp -p, rsync -t), and a pre-existing file or
 //     directory MOVED after borg walked it — it is on the volume under a path the archive
