@@ -187,8 +187,8 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			continue
 		}
 		if !created {
-			// The node was paused between the check above and the fire tx; the
-			// store skipped the slot.
+			// The node was paused between the check above and the fire tx, or a
+			// backup for this volume is already pending; the store skipped the slot.
 			backupLogger().Info("Scheduler: backup not fired (node entered maintenance or task already exists)", "volume", sc.VolumeName, "next", next.UTC().Format(time.RFC3339))
 			continue
 		}

@@ -136,6 +136,14 @@ func (s *Store) querySchedules(ctx context.Context, query string, args ...any) (
 // If the node is paused for maintenance when the tx runs, no task is created
 // (created=false): the slot is skipped as SkipDueBackup does, advancing
 // next_fire_at and counting the skip.
+//
+// If a volume.backup for the same volume is already pending, no task is created
+// either (created=false): the schedule still advances, but the maintenance
+// skipped-backups counter is not touched. Per-volume task exclusion makes a backup
+// wait behind a running task on the same volume, so without this an hourly
+// schedule behind a long restore would stack several backups that then run back to
+// back; at most one scheduled backup now waits. A RUNNING backup does not suppress
+// the insert — the new one queues behind it as usual.
 func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) (created bool, err error) {
 	if task.ID == "" || task.Name == "" || task.Node == "" || task.Volume == "" {
 		return false, errors.New("store: FireDueBackup requires task id, name, node, volume")
@@ -158,9 +166,17 @@ func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) 
 		if paused {
 			return skipDueBackupTx(ctx, tx, task.Volume, nextFireAt, now)
 		}
-		created, err = insertTaskTx(ctx, tx, task, snapshot)
-		if err != nil {
-			return err
+		var waiting int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT count(*) FROM tasks WHERE name = 'volume.backup' AND status = ? AND volume = ?`,
+			TaskPending, task.Volume).Scan(&waiting); err != nil {
+			return fmt.Errorf("store: check pending backup %q: %w", task.Volume, err)
+		}
+		if waiting == 0 {
+			created, err = insertTaskTx(ctx, tx, task, snapshot)
+			if err != nil {
+				return err
+			}
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ?`,

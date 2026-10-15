@@ -1,5 +1,20 @@
 # Changelog
 
+## v3.4.2
+
+Patch release for v3.4.1. **No migrations (`control.db` stays at schema `v4`), no config
+changes, no API changes.**
+
+- [FIX] Backup, restore and volume-trash tasks on the same volume no longer run at the same
+  time. A task waits, still `pending` and without holding a worker, until the one running on
+  its volume finishes. The exception is a restore requested while another restore of that
+  volume is running: it fails immediately with
+  `another restore is already in progress on this volume`.
+- [FIX] A backup of a volume marked for deletion is skipped instead of re-creating the
+  volume's backup repository.
+- [CHANGE] A scheduled backup slot is skipped when a backup of that volume is already
+  pending, so a long-running task on the volume no longer queues several backups behind it.
+
 ## v3.4.1
 
 Patch release for v3.4.0. **No migrations (`control.db` stays at schema `v4`), no config

@@ -24,16 +24,34 @@ func (d *Dispatcher) worker(ctx context.Context, wg *sync.WaitGroup, name string
 			jobEvent().Info("[" + name + "] Shutting down")
 			return
 		case task := <-queue:
-			d.runTask(ctx, task)
-			if slots != nil {
-				slots <- struct{}{}
-			}
+			d.runAndRelease(ctx, task, slots)
 			if ctx.Err() != nil {
 				jobEvent().Info("[" + name + "] Shutdown")
 				return
 			}
 		}
 	}
+}
+
+// runAndRelease runs a task, then (even if runTask panics past its own guard)
+// releases the task's volume lock, returns the slot token, and wakes the
+// dispatcher so a task waiting on that volume is picked up now rather than at
+// the backstop. The volume is released BEFORE the slot is returned so a drain
+// woken by the free slot already sees the volume free.
+func (d *Dispatcher) runAndRelease(ctx context.Context, task store.Task, slots chan<- struct{}) {
+	defer func() {
+		key := volumeLockKey(task)
+		if key != "" {
+			d.releaseVolume(key)
+		}
+		if slots != nil {
+			slots <- struct{}{}
+		}
+		if key != "" {
+			d.Signal()
+		}
+	}()
+	d.runTask(ctx, task)
 }
 
 // runTask executes a claimed (running) task and records its terminal status +

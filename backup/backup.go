@@ -42,6 +42,14 @@ func Perform(ctx context.Context, st *store.Store, task store.Task, projectEvent
 		sentry.CaptureException(err)
 		return err
 	}
+	// Perform is the only caller of repo.Setup, so a backup that ran after the
+	// volume's trash task would re-create the repository the trash just destroyed,
+	// leaving an orphan nothing cleans up. The scheduler already refuses to fire for
+	// trash volumes; this covers controller-requested and already-queued backups.
+	if vol.Trash {
+		backupLogger().Info("Skipping backup job for volume marked for deletion", "volume", task.Volume)
+		return nil
+	}
 
 	backupLogger().Info("Backing up volume", "volume", task.Volume)
 

@@ -270,6 +270,59 @@ func casTaskStatusTx(ctx context.Context, tx *sql.Tx, id, from, to string, now i
 	return true, nil
 }
 
+// FailPendingTask flips a task pending -> failed, overwriting result_json with
+// result, and appends the snapshot, only while it is still pending. Returns
+// failed=false (no write, no changelog append) if the task was not pending (or
+// absent). The dispatcher uses it to fail a duplicate restore without ever marking
+// it running. Like ClaimTask it refuses while the node is paused for maintenance
+// (failed=false, no write), checked inside the same tx, so a paused node changes
+// no task state from the dispatcher.
+func (s *Store) FailPendingTask(ctx context.Context, id string, result json.RawMessage) (failed bool, err error) {
+	if id == "" {
+		return false, errors.New("store: FailPendingTask requires id")
+	}
+	now := time.Now().Unix()
+	err = s.withControlTx(ctx, func(tx *sql.Tx) error {
+		paused, err := isPausedTx(ctx, tx)
+		if err != nil {
+			return err
+		}
+		if paused {
+			return nil
+		}
+		res, err := tx.ExecContext(ctx,
+			`UPDATE tasks SET status = ?, result_json = ?, updated_at = ? WHERE id = ? AND status = ?`,
+			TaskFailed, nullableJSON(result), now, id, TaskPending)
+		if err != nil {
+			return fmt.Errorf("store: fail pending task %q: %w", id, err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("store: task %q rows affected: %w", id, err)
+		}
+		if n == 0 {
+			return nil // not pending (or absent): no-op, not changelogged
+		}
+		t, err := getTaskTx(ctx, tx, id)
+		if err != nil {
+			return fmt.Errorf("store: reload task %q: %w", id, err)
+		}
+		snapshot, err := json.Marshal(t)
+		if err != nil {
+			return fmt.Errorf("store: marshal task %q: %w", id, err)
+		}
+		if err := appendChangelogTx(ctx, tx, "task", t.ID, t.ProjectID, "upsert", snapshot, now); err != nil {
+			return err
+		}
+		failed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return failed, nil
+}
+
 // CancelPendingTask flips a task pending -> cancelled (and appends the snapshot)
 // only while it is still pending; a task already dispatched/terminal is left
 // untouched. Returns cancelled=false if the task was not pending (or absent).

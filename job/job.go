@@ -27,6 +27,14 @@ var slotRecheckInterval = 5 * time.Second
 // worker pool; being single-goroutine is load-bearing — it (with the ClaimTask
 // CAS) guarantees a task is dispatched at most once even when a wake signal and
 // the backstop coincide.
+//
+// It also enforces per-volume mutual exclusion for the tasks that touch a
+// volume's data (see volumeLockKey): at most one of them runs per volume at a
+// time. Two restores of one volume running together race their pre-restore
+// snapshot (a cross-filesystem mv is copy-then-unlink, so concurrent movers
+// unlink each other's entries) and then their partial-snapshot recovery copies;
+// a backup walking a volume a restore is moving out from under it is the same
+// class of bug.
 type Dispatcher struct {
 	st            *store.Store
 	backupQ       chan store.Task
@@ -41,6 +49,12 @@ type Dispatcher struct {
 	// token BEFORE claiming a backup task and the worker returns it when the task
 	// ends, so a task is only moved to running once a worker is free to start it.
 	backupSlots chan struct{}
+	// busy maps a volume name to the kind of the task currently running on it.
+	// Only the dispatcher goroutine marks an entry (after a successful claim);
+	// workers only release, so a "not busy" seen by drain cannot turn busy
+	// before drain marks it.
+	busyMu sync.Mutex
+	busy   map[string]string
 }
 
 // NewDispatcher builds the dispatcher (worker pools sized by config). The backup
@@ -67,7 +81,47 @@ func NewDispatcher(st *store.Store) *Dispatcher {
 		signal:        make(chan struct{}, 1),
 		backupWorkers: backupWorkers,
 		exportWorkers: exportWorkers,
+		busy:          make(map[string]string),
 	}
+}
+
+// duplicateRestoreError is the result recorded on a restore rejected because
+// another restore of the same volume is already running.
+const duplicateRestoreError = "another restore is already in progress on this volume"
+
+// volumeLockKey returns the volume a task must hold exclusively while it runs,
+// or "" when the task takes no lock: only backup, restore and trash participate
+// (for a restore that is the target volume), and a task with no volume has
+// nothing to key on.
+func volumeLockKey(task store.Task) string {
+	switch task.Name {
+	case "volume.backup", "volume.restore", "volume.trash":
+		return task.Volume
+	}
+	return ""
+}
+
+// runningOn reports the kind of the task running on volume, if any.
+func (d *Dispatcher) runningOn(volume string) (kind string, busy bool) {
+	d.busyMu.Lock()
+	defer d.busyMu.Unlock()
+	kind, busy = d.busy[volume]
+	return kind, busy
+}
+
+// markBusy records that a task of kind is running on volume. Dispatcher
+// goroutine only.
+func (d *Dispatcher) markBusy(volume, kind string) {
+	d.busyMu.Lock()
+	defer d.busyMu.Unlock()
+	d.busy[volume] = kind
+}
+
+// releaseVolume clears volume's running entry once its task has ended.
+func (d *Dispatcher) releaseVolume(volume string) {
+	d.busyMu.Lock()
+	defer d.busyMu.Unlock()
+	delete(d.busy, volume)
 }
 
 // Signal wakes the dispatcher to drain pending tasks. Non-blocking + coalescing:
@@ -128,6 +182,14 @@ func (d *Dispatcher) loop(ctx context.Context, wg *sync.WaitGroup) {
 // pool can't head-of-line-block an export; backups then wait for a free worker
 // (the workers are the throughput limiter). While the node is in maintenance
 // nothing is claimed; an un-pause wakes the dispatcher to drain again.
+//
+// A backup-pool task whose volume is busy (see volumeLockKey) is skipped without
+// taking a worker slot and stays pending for a later drain; the worker signals
+// the dispatcher when it releases the volume. The one exception is a restore
+// arriving while another restore of that volume runs: it is failed immediately
+// rather than queued behind it. Within one drain, a task claimed earlier counts
+// as running, so of two pending restores of one volume the first runs and the
+// second fails.
 func (d *Dispatcher) drain(ctx context.Context) {
 	if paused, err := d.st.IsPaused(ctx); err != nil {
 		// ClaimTask still refuses while paused, so carry on.
@@ -153,10 +215,21 @@ func (d *Dispatcher) drain(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		if task.Name != "backup.export" {
-			if !d.dispatchBackup(ctx, task) {
-				return
+		if task.Name == "backup.export" {
+			continue
+		}
+		if key := volumeLockKey(task); key != "" {
+			if running, busy := d.runningOn(key); busy {
+				if task.Name == "volume.restore" && running == "volume.restore" {
+					d.rejectDuplicateRestore(ctx, task)
+				} else {
+					jobEvent().Debug("dispatch: volume busy; task waits", "task", task.ID, "kind", task.Name, "volume", key, "running", running)
+				}
+				continue
 			}
+		}
+		if !d.dispatchBackup(ctx, task) {
+			return
 		}
 	}
 }
@@ -166,6 +239,10 @@ func (d *Dispatcher) drain(ctx context.Context) {
 // still waiting for a worker. Only a task we won the CAS on is dispatched, so a
 // signal + backstop can't double-run one task. It returns false when drain should
 // stop: ctx is done or the node entered maintenance while we waited.
+//
+// The task's volume is marked busy only once the claim succeeds, so a refused or
+// failed claim leaves no stale entry. drain's busy check stays valid while this
+// blocks for a slot because only the dispatcher goroutine marks volumes busy.
 func (d *Dispatcher) dispatchBackup(ctx context.Context, task store.Task) bool {
 	if !d.acquireBackupSlot(ctx) {
 		return false
@@ -180,9 +257,27 @@ func (d *Dispatcher) dispatchBackup(ctx context.Context, task store.Task) bool {
 		d.backupSlots <- struct{}{}
 		return true // already claimed/terminal, or paused (ClaimTask refuses)
 	}
+	if key := volumeLockKey(task); key != "" {
+		d.markBusy(key, task.Name)
+	}
 	// Never blocks: the queue is sized to the pool and we hold a slot.
 	d.backupQ <- task
 	return true
+}
+
+// rejectDuplicateRestore fails a pending restore whose volume already has a
+// restore running, without ever marking it running. On a store error (or a
+// paused node, where FailPendingTask refuses) it stays pending for the next drain.
+func (d *Dispatcher) rejectDuplicateRestore(ctx context.Context, task store.Task) {
+	result, _ := json.Marshal(map[string]string{"error": duplicateRestoreError})
+	failed, err := d.st.FailPendingTask(ctx, task.ID, result)
+	if err != nil {
+		jobEvent().Warn("dispatch: fail duplicate restore", "task", task.ID, "volume", task.Volume, "error", err.Error())
+		return
+	}
+	if failed {
+		jobEvent().Warn("dispatch: rejected restore; another restore is running on this volume", "task", task.ID, "volume", task.Volume)
+	}
 }
 
 // acquireBackupSlot blocks until a backup worker is free. While waiting it wakes
