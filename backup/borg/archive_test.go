@@ -348,7 +348,8 @@ func TestRaceConditionIsNotBenign(t *testing.T) {
 }
 
 // TestFileNotFoundIsNotBenign pins the create warning that WAS on the allowlist for a
-// release, because putting it back is the plan and this is the condition on doing so.
+// release. It stays off: the post-create verification (verify.go) is what settles it now,
+// and the allowlist must not short-circuit that verification.
 //
 // The reading that put it there is right for a plain file: borg lists a directory and then
 // stat()s each entry, so a delete landing in that window leaves the file absent from the
@@ -369,10 +370,10 @@ func TestRaceConditionIsNotBenign(t *testing.T) {
 // discriminates. Structurally borg cannot help: _rec_walk raises at the stat, before the
 // item's type is known.
 //
-// So this stays off the list until something OUTSIDE the record can rule — a post-create
-// verification that checks the warned path against the volume. Until then the false green
-// is the worse failure, and createCommand's exclude for WordPress's write probe is what
-// keeps failing on it from costing a backup a day.
+// So the record alone can never rule, and something OUTSIDE it does: Create hands a run
+// whose only disqualifying records are this one to the post-create verification, which
+// compares the committed archive with the volume. Putting the msgid back on this list
+// would skip that comparison and bring back the false green.
 func TestFileNotFoundIsNotBenign(t *testing.T) {
 	quoted, ok := failureRecord(backupFileNotFoundErrorRecord + "\r\n")
 	if !ok {
@@ -384,7 +385,7 @@ func TestFileNotFoundIsNotBenign(t *testing.T) {
 	if benignCreateWarnings[quoted.MsgID] {
 		t.Error("BackupFileNotFoundError is on the benign allowlist; borg raises the same record for a directory renamed " +
 			"mid-walk, whose subtree is then missing from the archive and still on the volume, and no borg output tells " +
-			"the two apart — put it back only alongside a post-create verification that can")
+			"the two apart — the post-create verification settles it, and the allowlist would bypass that")
 	}
 }
 
@@ -450,7 +451,7 @@ func TestCreateWarnings(t *testing.T) {
 func TestCreateCommand(t *testing.T) {
 	cmd := strings.Join(createCommand("::auto-1", "zstd", "600"), " ")
 
-	want := "cd /mnt/data && borg --log-json --lock-wait 600 " +
+	want := "touch /tmp/cs-create-start && cd /mnt/data && borg --log-json --lock-wait 600 " +
 		"create --one-file-system --json --numeric-ids --exclude-caches " +
 		`--exclude 're:(^|/)temp-write-test-[0-9a-f]+-[0-9]+$' ` +
 		"--compression zstd ::auto-1 ."
@@ -459,6 +460,11 @@ func TestCreateCommand(t *testing.T) {
 	}
 	if strings.Contains(cmd, "--error") {
 		t.Errorf("Received %q, wanted no --error: it filters the warning record the success gate reads", cmd)
+	}
+	// The verification's reference time is this file's mtime, so it must be touched in the
+	// same shell, chained with &&, immediately before borg starts.
+	if !strings.HasPrefix(cmd, "touch "+createStartStamp+" && cd /mnt/data && borg ") {
+		t.Errorf("Received %q, wanted it to touch the start stamp immediately before borg", cmd)
 	}
 	for _, flag := range []string{"--json", "--log-json", "--one-file-system", "--numeric-ids", "--exclude-caches"} {
 		if !strings.Contains(cmd, flag) {

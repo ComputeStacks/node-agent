@@ -18,6 +18,12 @@ changes, no API changes.**
   volume's backup repository.
 - [CHANGE] A scheduled backup slot is skipped when a backup of that volume is already
   pending, so a long-running task on the volume no longer queues several backups behind it.
+- [CHANGE] A backup during which files or directories vanished (deleted while borg walked
+  the volume) no longer fails outright. The agent compares the committed archive with the
+  volume: if every file and directory on the volume older than the backup is in the
+  archive, the backup succeeds and the vanished paths are noted in `backup_warning`;
+  otherwise — for example a directory renamed during the backup — it fails and names the
+  first path missing from the archive.
 
 ## v3.4.0
 

@@ -55,12 +55,13 @@ func lockWait(op string) string {
 //     Absent from the archive, present on the volume: that is the permission error's
 //     category, not this set's.
 //   - BackupFileNotFoundError ("<file>: stat: [Errno 2] No such file or directory:
-//     '<file>'") is the one this set carried for a release and no longer does. For a plain
-//     file it is genuinely benign — deleted between borg listing its directory and stat'ing
-//     it, so absent from the archive AND from the volume. The measurement that took it back
-//     off is a DIRECTORY renamed mid-walk, which raises the same record and lands squarely
-//     in BackupRaceConditionError's category: absent from the archive, present on the
-//     volume. Three facts, all measured on borg 1.4.4:
+//     '<file>'") is the one this set carried for a release and no longer does, and it is
+//     now settled by a post-create verification (verify.go) rather than by this set. For a
+//     plain file it is genuinely benign — deleted between borg listing its directory and
+//     stat'ing it, so absent from the archive AND from the volume. The measurement that
+//     took it back off is a DIRECTORY renamed mid-walk, which raises the same record and
+//     lands squarely in BackupRaceConditionError's category: absent from the archive,
+//     present on the volume. Three facts, all measured on borg 1.4.4:
 //     (a) the whole subtree is lost from the archive under EITHER name, in either rename
 //     direction (50 files each way). borg snapshots the parent's entry list with
 //     scandir_inorder — ordered by INODE, not by name — and walks that snapshot, so
@@ -70,20 +71,22 @@ func lockWait(op string) string {
 //     unbounded in files: at scale, 170 warnings over 8,500 files silently absent, with
 //     the backup reported green;
 //     (c) nothing in the output tells it apart from a benign delete. An `rm -rf` of a
-//     directory mid-walk produces a BYTE-IDENTICAL normalised record stream — same exit
+//     directory mid-walk produces a BYTE-IDENTICAL normalized record stream — same exit
 //     code, same single record, same nfiles. --list, --stats, --json nfiles, --progress,
 //     --debug, BORG_EXIT_CODES=modern, `borg info`, `borg diff`, `borg check` and
 //     re-stat'ing the warned path were each tried and none of them separates the two.
 //     The structural reason: borg's _rec_walk raises at the stat, before the item's type
 //     is known, the parent's DirEntry (which carries d_type) is never passed into the
 //     recursion, and the JSON record schema is a fixed four-field whitelist.
-//     This is a staged decision, not a verdict on the idea. The entry should come back
-//     once a post-create verification exists to back it — something that can look at the
-//     committed archive and say the warned path is absent from the volume too — because
-//     failing on it costs a real backup for every file an application legitimately deletes
-//     mid-walk. What makes failing on it affordable in the meantime is createCommand's
-//     exclude for WordPress's write probe: that probe was the dominant producer of this
-//     warning in production, and borg no longer walks it.
+//     So it stays OFF this set — the record alone still proves nothing — and Create hands
+//     a run whose only disqualifying records are this one to verifyVanishedWith, which
+//     compares the committed archive with the volume. What that proves is narrower than
+//     "nothing was lost": every file and directory now on the volume with a timestamp
+//     older than the backup's start is in the archive at the same path. A file renamed
+//     mid-walk and then written carries no old timestamp and is not checked; a renamed
+//     directory keeps its mtime and is (measured). verify.go states the limits in full.
+//     createCommand's exclude for WordPress's write probe still matters: that probe was
+//     the dominant producer of this warning, and borg no longer walks it.
 //
 // An unrecognised warning must fail rather than be assumed harmless. When one does, the
 // task carries borg's own message, so widening this set is a deliberate, evidenced decision
@@ -121,8 +124,28 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 	// only thing that can say whether borg wrote an archive at all.
 	borgResponse, decoded := decodeArchiveMessage(res.Response)
 
+	verifiedVanished := false
 	if res.Failure != nil && !wroteCompleteArchive(res, decoded, borgResponse.Archive.ID) {
-		return ArchiveMessage{}, a.createFailure(res)
+		if !verifiableVanishedCreate(res, decoded, borgResponse.Archive.ID) {
+			return ArchiveMessage{}, a.createFailure(res)
+		}
+		// Only vanished paths (and torn reads) stand between this run and a success. borg
+		// cannot say whether a vanished path was a delete or a renamed directory; the
+		// archive and the volume can. See verify.go for what this proves and what it does
+		// not.
+		verdict, verifyErr := a.verifyVanished()
+		if verifyErr != nil {
+			// Fail closed: no verdict is not a pass. The task reports borg's own record,
+			// exactly as it would have without the verification.
+			borgLogger().Warn("Could not verify a backup with vanished paths", "repo", a.Repository.Name,
+				"archive", borgResponse.Archive.ID, "error", verifyErr.Error())
+			return ArchiveMessage{}, a.createFailure(res)
+		}
+		if verdict.missing > 0 {
+			return ArchiveMessage{}, a.verificationFailure(res, verdict)
+		}
+		res.Failure = vanishedWarning(res)
+		verifiedVanished = true
 	}
 
 	// Sync reports the repository's observed state (size + archive list) up into
@@ -136,6 +159,14 @@ func (a *Archive) Create() (ArchiveMessage, *LogMessage) {
 		// it does not travel in the return value — Create's contract is that a non-nil
 		// *LogMessage means the backup failed. The caller publishes a.Warning.
 		a.Warning = res.Failure
+		if verifiedVanished {
+			// INFO, not WARN: the verification settled the warning, and backup_warning
+			// carries it to the task result.
+			_, vanished, _ := vanishedRecords(res.Response)
+			borgLogger().Info("Completed backup; vanished paths verified", "archive", borgResponse.Archive.ID,
+				"vanished", vanished, "warning", res.Failure.Message)
+			return borgResponse, nil
+		}
 		borgLogger().Warn("Completed backup with warnings", "archive", borgResponse.Archive.ID,
 			"msgid", res.Failure.MsgID, "warning", res.Failure.Message)
 		return borgResponse, nil
@@ -198,8 +229,10 @@ func (a *Archive) createFailure(res ExecResult) *LogMessage {
 //     Do not let this comment become the citation for a number it does not contain.
 //
 // The reason it matters: BackupFileNotFoundError is deliberately NOT in
-// benignCreateWarnings, so without this exclude a WordPress volume loses a backup over a
-// file that is worthless in an archive.
+// benignCreateWarnings. Create now settles a run whose only disqualifying records are that
+// one by comparing the archive with the volume (verify.go), but that costs a full archive
+// listing and volume walk, and it fails closed — so a probe borg never walks is still
+// better than one it has to verify after the fact.
 //
 // Excluding is better than judging after the fact: borg tests the pattern BEFORE it stats
 // the entry, so the probe raises no record at all and there is no verdict to make.
@@ -230,13 +263,20 @@ func (a *Archive) createFailure(res ExecResult) *LogMessage {
 // Residual risk, stated plainly because an exclude is the one thing that cannot be caught
 // later: a DIRECTORY whose name happens to fit hex-dash-digits is pruned with everything
 // under it, and because borg never walks an excluded path there is no warning, no record,
-// and nothing for any post-create check to notice. This is the deliberate cost of removing
-// the verdict rather than judging it — narrower than the prefix glob, but not zero, and it
-// is invisible by construction rather than merely unreported.
+// and nothing for any post-create check to notice (the verification in verify.go skips the
+// same paths, by the same pattern, precisely because borg never archived them). This is
+// the deliberate cost of removing the verdict rather than judging it — narrower than the
+// prefix glob, but not zero, and it is invisible by construction rather than merely
+// unreported.
 //
 // Single-quoted here because Repository.run joins the command with spaces and hands the
 // whole string to `sh -c` — unquoted, the shell would try to glob it.
-const wpWriteProbeExclude = `'re:(^|/)temp-write-test-[0-9a-f]+-[0-9]+$'`
+const wpWriteProbeExclude = `'re:` + wpWriteProbePattern + `'`
+
+// wpWriteProbePattern is the regex body of wpWriteProbeExclude, shared with the
+// post-create verification (wpWriteProbeRE) so the paths borg excludes and the paths the
+// verification skips cannot drift apart.
+const wpWriteProbePattern = `(^|/)temp-write-test-[0-9a-f]+-[0-9]+$`
 
 // createCommand builds the `borg create` command.
 //
@@ -247,10 +287,15 @@ const wpWriteProbeExclude = `'re:(^|/)temp-write-test-[0-9a-f]+-[0-9]+$'`
 // it adds nothing to the clean path — borg 1.4.4 emits zero records on an rc 0 create
 // either way (measured).
 //
+// It touches createStartStamp first, in the same shell and immediately before borg: the
+// stamp's mtime is the reference time the post-create verification measures "older than
+// the backup" against, taken from the filesystem clock that stamps the volume's entries.
+// The && chain means borg never runs without a fresh stamp.
+//
 // A pure function of its inputs, so its flag set is testable without docker or viper;
 // Create reads the configuration and passes it in.
 func createCommand(archivePath, compression, lockWaitSecs string) []string {
-	cmd := []string{"cd /mnt/data && borg --log-json"}
+	cmd := []string{"touch " + createStartStamp + " && cd /mnt/data && borg --log-json"}
 	cmd = append(cmd, "--lock-wait "+lockWaitSecs)
 	cmd = append(cmd, "create --one-file-system --json --numeric-ids --exclude-caches")
 	cmd = append(cmd, "--exclude "+wpWriteProbeExclude)
@@ -287,11 +332,12 @@ func createWarnings(response string) []LogMessage {
 // to act on, because the data exists and the backup does not have it.
 //
 // BackupFileNotFoundError is deliberately absent, and that is the whole point of the set.
-// It is disqualifying but AMBIGUOUS: the path vanished between borg's readdir and its stat,
-// which is a plain delete (the archive still matches the volume) far more often than it is a
-// directory renamed mid-walk (a subtree lost). Nothing borg emits tells those apart — see
-// benignCreateWarnings — so it must fail the backup, but it is the worst of the candidates
-// to QUOTE when a better-defined one is also present.
+// It is AMBIGUOUS: the path vanished between borg's readdir and its stat, which is a plain
+// delete (the archive still matches the volume) far more often than it is a directory
+// renamed mid-walk (a subtree lost). Nothing borg emits tells those apart — see
+// benignCreateWarnings — so on its own it settles nothing (Create runs the post-create
+// verification when it is the only disqualifying record), and it is the worst of the
+// candidates to QUOTE when a better-defined one is also present.
 var definiteLossCreateMsgIDs = map[string]bool{
 	"BackupPermissionError":    true,
 	"BackupIOError":            true,
@@ -355,6 +401,11 @@ func nonBenignCreateWarning(response string) *LogMessage {
 //     warning benign, which is also exactly the old behavior if --error ever comes back.
 //   - every record benign: see benignCreateWarnings. BackupPermissionError exits with
 //     the same code at the same severity and means a file is missing from the archive.
+//
+// A refusal here is not always the end: a run refused only for BackupFileNotFoundError
+// (beside, at most, benign records) goes to the post-create verification — see
+// verifiableVanishedCreate. This function's answer stays what borg's records alone can
+// prove.
 func wroteCompleteArchive(res ExecResult, decoded bool, archiveID string) bool {
 	if res.DockerFault || res.ExitCode != borgWarningExit {
 		return false
