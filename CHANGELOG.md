@@ -9,9 +9,9 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
 - [CHANGE] Scheduled backups are spread out: each project's backups start at a fixed offset
   after their cron time — up to a quarter of the backup interval, at most 2 hours
   (`backups.schedule_spread_max_sec`, default `7200`; `0` restores exact cron times). All
-  volumes of one project share the offset, so their archives stay close together. Existing
-  schedules move onto their offset automatically after the upgrade, without skipping or
-  repeating a backup.
+  volumes of one project on the same schedule share the offset, so their archives stay close
+  together. Existing schedules move onto their offset automatically after the upgrade,
+  without skipping or repeating a backup.
 - [CHANGE] A volume's first backup no longer logs a `Command failed` warning for its
   missing repository. The check that finds the repository missing now logs at DEBUG, and
   creating the new repository logs `Initialized new repository` at INFO. Every other

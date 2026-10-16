@@ -235,6 +235,24 @@ func (s *Store) PutSchedule(ctx context.Context, volumeName, cronExpr string, ne
 	return nil
 }
 
+// MoveScheduleFire sets a schedule's next_fire_at to `to` only if it is still
+// `from`, and reports whether it did. It is the compare-and-set the scheduler's
+// realignment needs: unlike PutSchedule it never overwrites a move made in
+// between by a fire or by maintenance exit (which may run in another process).
+func (s *Store) MoveScheduleFire(ctx context.Context, volumeName string, from, to int64) (bool, error) {
+	res, err := s.control.ExecContext(ctx,
+		`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ? AND next_fire_at = ?`,
+		to, time.Now().Unix(), volumeName, from)
+	if err != nil {
+		return false, fmt.Errorf("store: move schedule %q: %w", volumeName, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: move schedule %q: %w", volumeName, err)
+	}
+	return n == 1, nil
+}
+
 // GetSchedule returns a volume's schedule. found=false on a miss (not an error).
 func (s *Store) GetSchedule(ctx context.Context, volumeName string) (Schedule, bool, error) {
 	sc, err := scanSchedule(s.control.QueryRowContext(ctx,

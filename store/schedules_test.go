@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -396,5 +397,28 @@ func TestSchedulePhase(t *testing.T) {
 	}
 	if got := SchedulePhase("garbage", base); got != 0 {
 		t.Fatalf("unparseable phase = %d, want 0", got)
+	}
+}
+
+func TestMoveScheduleFire(t *testing.T) {
+	ctx := context.Background()
+	s := open(t, Options{})
+	if err := s.PutSchedule(ctx, "v1", "0 * * * *", 100); err != nil {
+		t.Fatal(err)
+	}
+	if moved, err := s.MoveScheduleFire(ctx, "v1", 999, 200); err != nil || moved {
+		t.Fatalf("stale move: moved=%v err=%v", moved, err)
+	}
+	if sc, _, _ := s.GetSchedule(ctx, "v1"); sc.NextFireAt != 100 {
+		t.Fatalf("stale move changed next_fire_at to %d", sc.NextFireAt)
+	}
+	if moved, err := s.MoveScheduleFire(ctx, "v1", 100, 200); err != nil || !moved {
+		t.Fatalf("move: moved=%v err=%v", moved, err)
+	}
+	if sc, _, _ := s.GetSchedule(ctx, "v1"); sc.NextFireAt != 200 {
+		t.Fatalf("next_fire_at = %d, want 200", sc.NextFireAt)
+	}
+	if moved, _ := s.MoveScheduleFire(ctx, "absent", 0, 1); moved {
+		t.Fatal("moved an absent schedule")
 	}
 }

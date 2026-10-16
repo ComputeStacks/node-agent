@@ -164,7 +164,20 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			_ = s.st.DeleteSchedule(ctx, sc.VolumeName)
 			continue
 		}
-		next := store.NextFireOffset(sc.CronExpr, spreadOffset(sc.CronExpr, vol), now)
+		// The next slot comes after the one that just fired, not merely after now:
+		// a row still on an older offset (not yet realigned) would otherwise get the
+		// same slot back at its new, later offset and fire it twice. A row that has
+		// been due for longer than a slot still skips the backlog, as before.
+		off := spreadOffset(sc.CronExpr, vol)
+		firedBase := sc.NextFireAt
+		if base, ok := store.BaseInstant(sc.CronExpr, sc.NextFireAt); ok {
+			firedBase = base
+		}
+		from := now
+		if after := time.Unix(firedBase, 0).Add(off); after.After(from) {
+			from = after
+		}
+		next := store.NextFireOffset(sc.CronExpr, off, from)
 		if paused {
 			if err := s.st.SkipDueBackup(ctx, sc.VolumeName, next.Unix()); err != nil {
 				backupLogger().Warn("Scheduler: skip due backup", "volume", sc.VolumeName, "error", err.Error())
@@ -351,8 +364,15 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 		// same slot, so nothing is skipped or repeated, and once aligned it stays.
 		aligned := store.AlignNextFire(vol.Freq, off, existing.NextFireAt)
 		if aligned != existing.NextFireAt {
-			if err := s.st.PutSchedule(ctx, vol.Name, vol.Freq, aligned); err != nil {
-				backupLogger().Warn("Scheduler: put schedule", "volume", vol.Name, "error", err.Error())
+			// Conditional on the value read above: maintenance exit (possibly from the
+			// separate CLI process) or a fire may have moved the row since, and its
+			// move wins.
+			moved, err := s.st.MoveScheduleFire(ctx, vol.Name, existing.NextFireAt, aligned)
+			if err != nil {
+				backupLogger().Warn("Scheduler: align schedule", "volume", vol.Name, "error", err.Error())
+				continue
+			}
+			if !moved {
 				continue
 			}
 			backupLogger().Info("Scheduler: aligned backup schedule to its spread offset", "volume", vol.Name,

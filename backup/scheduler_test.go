@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -344,5 +345,43 @@ func TestRunTask_UnknownKind(t *testing.T) {
 	}
 	if m["error"] == nil {
 		t.Fatalf("result missing error field: %s", result)
+	}
+}
+
+// TestScheduler_FireDueUnalignedRowDoesNotRefire covers a row that fires while
+// still on an older (smaller) offset: the next slot must come after the slot
+// that fired, not be that same slot again at the volume's current offset.
+func TestScheduler_FireDueUnalignedRowDoesNotRefire(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+
+	// A daily cron whose instant was one minute ago, so this slot is due now
+	// and its shifted instant (base + offset) is still ahead.
+	base := time.Now().Truncate(time.Minute).Add(-time.Minute)
+	freq := fmt.Sprintf("%d %d * * *", base.Minute(), base.Hour())
+	project, off := 0, time.Duration(0)
+	for id := 1; id < 1000; id++ {
+		if o := store.ScheduleOffset(freq, store.OffsetKey(id, ""), 2*time.Hour); o > 5*time.Minute {
+			project, off = id, o
+			break
+		}
+	}
+	if project == 0 {
+		t.Fatal("no project id with an offset above 5m")
+	}
+	putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: project})
+	if err := st.PutSchedule(ctx, "v1", freq, base.Unix()); err != nil { // unshifted, due
+		t.Fatal(err)
+	}
+	s.fireDue(ctx)
+	if pending, _ := st.ListPendingTasks(ctx); len(pending) != 1 {
+		t.Fatalf("fireDue pending tasks: %+v", pending)
+	}
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	if want := base.AddDate(0, 0, 1).Add(off).Unix(); sc.NextFireAt != want {
+		t.Fatalf("next_fire_at = %s, want tomorrow's slot %s (same-day %s would fire twice)",
+			time.Unix(sc.NextFireAt, 0), time.Unix(want, 0), base.Add(off))
 	}
 }
