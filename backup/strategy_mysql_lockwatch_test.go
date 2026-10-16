@@ -3,6 +3,8 @@ package backup
 import (
 	"reflect"
 	"testing"
+
+	"github.com/coreos/go-semver/semver"
 )
 
 func TestParseMysqlRows(t *testing.T) {
@@ -19,5 +21,13 @@ func TestParseMysqlRows(t *testing.T) {
 func TestWatchBackupLockDisabled(t *testing.T) {
 	if b := watchBackupLock(nil, nil, 0)(); b != nil {
 		t.Errorf("disabled watch returned %+v", b)
+	}
+}
+
+func TestUsesBackupStage(t *testing.T) {
+	for v, want := range map[string]bool{"10.2.0": false, "10.3.39": false, "10.4.0": true, "10.6.0": true, "10.11.0": true, "11.8.9": true} {
+		if got := usesBackupStage(&MysqlInstance{Version: semver.New(v)}); got != want {
+			t.Errorf("%s: got %v, want %v", v, got, want)
+		}
 	}
 }

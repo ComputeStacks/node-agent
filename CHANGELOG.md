@@ -5,7 +5,9 @@
 Minor release. **No migrations (`control.db` stays at schema `v4`), no API changes.** Four
 new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
 `backups.schedule_spread_max_sec`, `backups.maintenance_catchup`,
-`backups.maintenance_catchup_skip_sec`).
+`backups.maintenance_catchup_skip_sec`). `mariadb.lock_wait.timeout` now bounds a MariaDB
+backup's wait for its backup lock; `mariadb.lock_wait.query_type` and `mariadb.long_queries.*`
+are no longer read.
 
 - [CHANGE] Scheduled backups are spread out: each project's backups start at a fixed offset
   after their cron time — up to a quarter of the backup interval, at most 2 hours
@@ -28,17 +30,18 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
   its volume finishes. The exception is a restore requested while another restore of that
   volume is running: it fails immediately with
   `another restore is already in progress on this volume`.
-- [FIX] MariaDB backups no longer fail with `Unable to obtain lock` when a long-running
+- [FIX] MariaDB 10.4+ backups no longer fail with `Unable to obtain lock` when a long-running
   SELECT is in progress. Since MariaDB 10.11.8, `mariadb-backup` ignores the
   `--ftwrl-wait-query-type`, `--ftwrl-wait-threshold` and `--kill-long-queries-timeout`
   options the agent passed, and `--ftwrl-wait-timeout` waits for every running statement,
-  SELECTs included. The agent no longer passes any of these options; MariaDB's backup locks
-  never wait for a SELECT or an InnoDB write.
-- [CHANGE] A MariaDB backup that waits longer than `mariadb.lock_wait.timeout` (default `60`
-  seconds, `0` disables) for its backup lock — which a long-running write to a MyISAM or other
-  non-transactional table holds up — is stopped, and the failure names the longest-running
-  query. Previously such a backup waited until the write finished, while other writes to
-  non-transactional tables queued behind it. `mariadb.lock_wait.query_type` and
+  SELECTs included. The agent no longer passes these options to MariaDB 10.4 and later, whose
+  backup locks never wait for a SELECT or an InnoDB write. MariaDB 10.2 and 10.3 are unchanged.
+- [CHANGE] On MariaDB 10.4 and later, a backup that waits longer than
+  `mariadb.lock_wait.timeout` (default `60` seconds, `0` disables) for its backup lock is
+  stopped, and the failure names the longest-running query. The lock waits for long-running DDL
+  (such as `ALTER TABLE` or `OPTIMIZE TABLE`) and writes to MyISAM or other non-transactional
+  tables; previously the backup waited until they finished, while further DDL and
+  non-transactional writes queued behind it. `mariadb.lock_wait.query_type` and
   `mariadb.long_queries.*` are no longer used.
 - [FIX] `agent.sample.yml` showed the `mariadb:` settings nested under `backups:`; the agent
   reads them at the top level.

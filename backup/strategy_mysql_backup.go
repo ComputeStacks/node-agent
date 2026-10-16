@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/coreos/go-semver/semver"
 	"github.com/docker/docker/client"
 	"github.com/spf13/viper"
 )
@@ -164,20 +165,22 @@ func backupMysql(backupContainer *containermgr.Container, mysqlMaster *MysqlInst
 	backupCmd = append(backupCmd, "--password="+mysqlMaster.Password)
 	backupCmd = append(backupCmd, "--host="+mysqlMaster.IPAddress)
 
-	// No --ftwrl-wait-* / --kill-long-* options: since MariaDB 10.11.8 mariadb-backup ignores
-	// all of them but --ftwrl-wait-timeout, which now waits for every running statement —
-	// SELECTs included — and fails the backup if any outlasts it. The server's own BACKUP
-	// STAGE locking never waits for a SELECT; watchBackupLock bounds the waits it does have.
 	stopWatch := func() *backupLockBlock { return nil }
 	if mysqlMaster.Variant == "mariadb" {
-		stopWatch = watchBackupLock(backupContainer, mysqlMaster, time.Duration(viper.GetInt("mariadb.lock_wait.timeout"))*time.Second)
+		lockWait := viper.GetInt("mariadb.lock_wait.timeout")
+		if usesBackupStage(mysqlMaster) {
+			stopWatch = watchBackupLock(backupContainer, mysqlMaster, time.Duration(lockWait)*time.Second)
+		} else {
+			backupCmd = append(backupCmd, ftwrlOptions(lockWait)...)
+		}
 	}
 
 	exitCode, out, err := backupContainer.Exec(backupCmd)
-	if block := stopWatch(); block != nil {
-		msg := "Backup stopped: it waited " + strconv.Itoa(block.Waited) + " seconds for the database's backup lock, " +
-			"which is held while a write to a non-transactional (e.g. MyISAM) table is running. " +
-			"Converting such tables to InnoDB avoids this."
+	// A backup that exited 0 succeeded, even if the watch killed a connection just as it finished.
+	if block := stopWatch(); block != nil && (err != nil || exitCode != 0) {
+		msg := "Backup stopped: it waited " + strconv.Itoa(block.Waited) + " seconds for the database's backup lock. " +
+			"The lock waits for long-running DDL (such as ALTER TABLE or OPTIMIZE TABLE) and for writes to " +
+			"non-transactional (such as MyISAM) tables to finish."
 		if block.Blocker != "" {
 			msg += "\nLongest-running query: " + block.Blocker
 		}
@@ -198,6 +201,31 @@ func backupMysql(backupContainer *containermgr.Container, mysqlMaster *MysqlInst
 	}
 
 	return true
+}
+
+// usesBackupStage reports whether a mariadb-variant server takes its backup lock with BACKUP
+// STAGE (MariaDB 10.4+) rather than FLUSH TABLES WITH READ LOCK.
+//
+// With BACKUP STAGE the agent passes no --ftwrl-wait-* / --kill-long-* options: since MariaDB
+// 10.11.8 mariadb-backup ignores all of them but --ftwrl-wait-timeout, which now waits for
+// every running statement — SELECTs included — and fails the backup if any outlasts it. BACKUP
+// STAGE itself never waits for a SELECT or an InnoDB write; watchBackupLock bounds the waits it
+// does have.
+func usesBackupStage(mysqlMaster *MysqlInstance) bool {
+	return !mysqlMaster.Version.LessThan(semver.Version{Major: 10, Minor: 4})
+}
+
+// ftwrlOptions keeps a pre-10.4 server's FLUSH TABLES WITH READ LOCK from being requested
+// while a long statement runs. That lock waits for running SELECTs and blocks every write while
+// it waits, so mariabackup first waits up to lockWait seconds for running statements to finish,
+// and fails the backup rather than take it if they don't.
+func ftwrlOptions(lockWait int) []string {
+	return []string{
+		"--ftwrl-wait-query-type=ALL",
+		"--ftwrl-wait-timeout=" + strconv.Itoa(lockWait),
+		"--kill-long-query-type=SELECT",
+		"--kill-long-queries-timeout=20",
+	}
 }
 
 func prepareMysqlBackup(backupContainer *containermgr.Container, mysqlMaster *MysqlInstance, event *progress) bool {

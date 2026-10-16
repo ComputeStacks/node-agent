@@ -163,7 +163,7 @@ backups:
       max_ttl_sec: 86400 # hard cap on a requested TTL (24h)
 mariadb: # MariaDB backups (mariadb-backup)
   lock_wait:
-    timeout: 60 # Seconds a backup may wait for its backup lock (held up by long writes to MyISAM tables) before it is stopped. 0 disables.
+    timeout: 60 # Seconds a backup may wait for its backup lock (held up by long DDL or MyISAM writes) before it is stopped; 0 disables. MariaDB < 10.4: how long to wait for running queries before giving up.
 docker:
   version: "1.41"
 queue:
