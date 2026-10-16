@@ -262,7 +262,7 @@ func catchupDropReasonTx(ctx context.Context, tx *sql.Tx, c Catchup, fireAt, thr
 		return "", fmt.Errorf("store: read schedule %q: %w", c.Volume, err)
 	}
 	if next > c.Next && !sameSlot(expr, next, c.Next) {
-		return "scheduled backup already ran after maintenance", nil
+		return "schedule moved past the slot after maintenance (it ran, or its cron changed)", nil
 	}
 	if threshold > 0 && next-c.Exit <= threshold {
 		return "next scheduled backup is due soon after maintenance", nil

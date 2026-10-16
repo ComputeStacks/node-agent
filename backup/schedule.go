@@ -284,7 +284,7 @@ func (s *Scheduler) processCatchups(ctx context.Context) {
 				"exit", time.Unix(c.Exit, 0).UTC().Format(time.RFC3339),
 				"fire_at", time.Unix(fireAt, 0).UTC().Format(time.RFC3339))
 		case store.CatchupDropped:
-			backupLogger().Info("Scheduler: catch-up backup after maintenance not needed", "volume", c.Volume, "reason", reason)
+			backupLogger().Debug("Scheduler: catch-up backup after maintenance not needed", "volume", c.Volume, "reason", reason)
 		default:
 			backupLogger().Debug("Scheduler: catch-up backup kept", "volume", c.Volume, "reason", reason)
 		}
