@@ -15,6 +15,18 @@ import (
 // It must be one bash never returns itself: 2 is a syntax error, 126/127 a missing command.
 const mysqlAccessDeniedExit = 42
 
+// mysqlReadyScript is the bash script isMysqlReady runs: wait up to ~50s for the server to
+// accept a root login (password from MYSQL_PWD), then clear any stale backups dir. A refused
+// login (ERROR 1045) exits mysqlAccessDeniedExit at once rather than retrying: it will not fix
+// itself. Other failures retry, and the last one's output is echoed.
+func mysqlReadyScript(mysqlBinary, host, dataPath string) string {
+	return "counter=0; while ! out=$(" + mysqlBinary + " -h " + host + " -uroot -e \"STATUS;\" 2>&1); do " +
+		"case \"$out\" in *\"ERROR 1045\"*) echo \"$out\"; exit " + strconv.Itoa(mysqlAccessDeniedExit) + ";; esac; " +
+		"counter=$((counter+1)); if [ $counter == 11 ]; then echo \"$out\"; echo 'Failed to connect'; exit 1; fi; " +
+		"echo \"Connection attempt $counter\"; sleep 5; done; " +
+		"if [ -d " + dataPath + "/backups ]; then rm -rf " + dataPath + "/backups; fi" // Ensure the backups dir does not exist, otherwise backups will fail.
+}
+
 func preBackupMysql(vol *types.Volume, event *progress) bool {
 
 	// First, locate a running container
@@ -90,8 +102,6 @@ func postBackupMysql(event *progress, repo *borg.Repository) bool {
 
 // Determine if MariaDB / MySQL is ready to perform a backup
 func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlInstance, event *progress) bool {
-	var readyCmd []string
-	var execCmd []string
 	mysqlBinary := "mysql"
 
 	if mysqlMaster.Variant == "mariadb" {
@@ -101,12 +111,8 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 	}
 
 	// The root password travels in MYSQL_PWD, never on the command line, so no shell quoting
-	// can mangle it and no error output can echo it. A rejected password (ERROR 1045) exits
-	// mysqlAccessDeniedExit at once rather than retrying: it will not fix itself.
-	readyCmd = append(readyCmd, "counter=0; while ! out=$(", mysqlBinary, "-h", mysqlMaster.IPAddress, "-uroot", "-e \"STATUS;\"", "2>&1); do case \"$out\" in *\"ERROR 1045\"*) echo \"$out\"; exit "+strconv.Itoa(mysqlAccessDeniedExit)+";; esac; counter=$((counter+1)); if [ $counter == 11 ]; then echo \"$out\"; echo 'Failed to connect'; exit 1; fi; echo \"Connection attempt $counter\"; sleep 5; done;")
-	readyCmd = append(readyCmd, "if [ -d "+mysqlMaster.DataPath+"/backups ]; then rm -rf "+mysqlMaster.DataPath+"/backups; fi") // Ensure the backups dir does not exist, otherwise backups will fail.
-
-	execCmd = append(execCmd, "bash", "-c", strings.Join(readyCmd, " "))
+	// can mangle it and no error output can echo it.
+	execCmd := []string{"bash", "-c", mysqlReadyScript(mysqlBinary, mysqlMaster.IPAddress, mysqlMaster.DataPath)}
 
 	exitCode, out, err := backupContainer.ExecEnv(execCmd, []string{"MYSQL_PWD=" + mysqlMaster.RootPassword})
 
@@ -117,8 +123,12 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 	}
 
 	if exitCode == mysqlAccessDeniedExit {
-		backupLogger().Warn("MySQL rejected the root password", "service", mysqlMaster.ServiceID)
-		event.PostEventUpdate("agent-mysql-access-denied", withOutput("Backup failed: the database rejected the root password configured for this service (MYSQL_ROOT_PASSWORD or MARIADB_ROOT_PASSWORD). If the root password was changed inside the database, update the service's setting to match.", out))
+		backupLogger().Warn("MySQL refused the root login", "service", mysqlMaster.ServiceID)
+		msg := "Backup failed: the database refused the root login. If the root password was changed inside the database, update the service's root password setting (MYSQL_ROOT_PASSWORD or MARIADB_ROOT_PASSWORD) to match."
+		if mysqlMaster.RootPassword == "" {
+			msg = "Backup failed: the database refused the root login, and this service has no root password setting (MYSQL_ROOT_PASSWORD or MARIADB_ROOT_PASSWORD). Backups need the database's root password in one of these settings."
+		}
+		event.PostEventUpdate("agent-mysql-access-denied", withOutput(msg, out))
 		return false
 	}
 

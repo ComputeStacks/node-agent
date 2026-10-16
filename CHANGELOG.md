@@ -28,7 +28,7 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
   its volume finishes. The exception is a restore requested while another restore of that
   volume is running: it fails immediately with
   `another restore is already in progress on this volume`.
-- [FIX] A MySQL/MariaDB backup whose root password is rejected by the database now fails
+- [FIX] A MySQL/MariaDB backup whose root login is refused by the database now fails
   immediately with a message saying so, instead of retrying ten times and reporting
   `Failed to connect`. Other connection failures still retry, and now include the client's
   last error.
