@@ -10,6 +10,8 @@ import (
 
 	"cs-agent/store"
 	"cs-agent/types"
+
+	"github.com/spf13/viper"
 )
 
 func testStore(t *testing.T) *store.Store {
@@ -122,6 +124,137 @@ func TestScheduler_FireDue(t *testing.T) {
 	sc, _, _ := st.GetSchedule(ctx, "v1")
 	if sc.NextFireAt <= time.Now().Unix() {
 		t.Fatalf("next_fire_at = %d not advanced past now", sc.NextFireAt)
+	}
+}
+
+// setSpreadCap sets backups.schedule_spread_max_sec for one test (the default
+// lives in config.ConfigureApp; package tests otherwise see 0 = spreading off).
+func setSpreadCap(t *testing.T, sec int) {
+	t.Helper()
+	prev := viper.Get("backups.schedule_spread_max_sec")
+	viper.Set("backups.schedule_spread_max_sec", sec)
+	t.Cleanup(func() { viper.Set("backups.schedule_spread_max_sec", prev) })
+}
+
+// TestScheduler_ReconcileSpread proves a new schedule lands on its project's
+// shifted grid, and that volumes of one project share the slot.
+func TestScheduler_ReconcileSpread(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	const freq = "0 * * * *"
+	off := store.ScheduleOffset(freq, store.OffsetKey(7, ""), 2*time.Hour)
+	if off == 0 {
+		t.Fatal("test needs a non-zero offset for project 7")
+	}
+
+	putVol(t, st, types.Volume{Name: "files", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	putVol(t, st, types.Volume{Name: "db", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	before := time.Now()
+	s.reconcile(ctx)
+	files, _, _ := st.GetSchedule(ctx, "files")
+	db, _, _ := st.GetSchedule(ctx, "db")
+	if files.NextFireAt != db.NextFireAt {
+		t.Fatalf("volumes of one project: next_fire_at %d != %d", files.NextFireAt, db.NextFireAt)
+	}
+	if want := store.NextFireOffset(freq, off, before).Unix(); files.NextFireAt != want {
+		t.Fatalf("next_fire_at = %d, want %d (offset %v)", files.NextFireAt, want, off)
+	}
+	if got := store.SchedulePhase(freq, files.NextFireAt); got != int64(off/time.Second) {
+		t.Fatalf("phase = %ds, want %v", got, off)
+	}
+}
+
+// TestScheduler_ReconcileRealigns proves an existing unshifted row (as written
+// before spreading) is moved onto its offset once — same slot, so nothing is
+// skipped or repeated — and left alone after that; that a smaller cap moves it
+// back earlier within the slot; and that cap 0 restores the bare cron instant.
+func TestScheduler_ReconcileRealigns(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	const freq = "0 2 * * *"
+	off := store.ScheduleOffset(freq, store.OffsetKey(7, ""), 2*time.Hour)
+	if off == 0 {
+		t.Fatal("test needs a non-zero offset for project 7")
+	}
+	putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	base := store.NextFire(freq, time.Now()).Unix()
+	if err := st.PutSchedule(ctx, "v1", freq, base); err != nil {
+		t.Fatal(err)
+	}
+
+	s.reconcile(ctx)
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	if want := base + int64(off/time.Second); sc.NextFireAt != want {
+		t.Fatalf("realigned next_fire_at = %d, want %d", sc.NextFireAt, want)
+	}
+	// Idempotent: a second reconcile leaves the aligned row alone.
+	s.reconcile(ctx)
+	if again, _, _ := st.GetSchedule(ctx, "v1"); again.NextFireAt != sc.NextFireAt {
+		t.Fatalf("second reconcile moved next_fire_at %d -> %d", sc.NextFireAt, again.NextFireAt)
+	}
+
+	// A smaller cap moves the row EARLIER within the same slot.
+	setSpreadCap(t, 60)
+	small := store.ScheduleOffset(freq, store.OffsetKey(7, ""), time.Minute)
+	s.reconcile(ctx)
+	if sc, _, _ := st.GetSchedule(ctx, "v1"); sc.NextFireAt != base+int64(small/time.Second) {
+		t.Fatalf("after cap decrease next_fire_at = %d, want %d", sc.NextFireAt, base+int64(small/time.Second))
+	}
+
+	// Cap 0 restores the bare instant of the same slot (not the next day's).
+	setSpreadCap(t, 0)
+	s.reconcile(ctx)
+	if sc, _, _ := st.GetSchedule(ctx, "v1"); sc.NextFireAt != base {
+		t.Fatalf("after cap 0 next_fire_at = %d, want %d", sc.NextFireAt, base)
+	}
+}
+
+// TestScheduler_SpreadOff proves cap 0 keeps today's behavior: a new schedule
+// gets the exact cron instant and an existing unshifted row is not moved.
+func TestScheduler_SpreadOff(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 0)
+	const freq = "0 2 * * *"
+	putVol(t, st, types.Volume{Name: "new", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	putVol(t, st, types.Volume{Name: "old", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	base := store.NextFire(freq, time.Now()).Unix()
+	if err := st.PutSchedule(ctx, "old", freq, base); err != nil {
+		t.Fatal(err)
+	}
+	s.reconcile(ctx)
+	for _, name := range []string{"new", "old"} {
+		if sc, _, _ := st.GetSchedule(ctx, name); sc.NextFireAt != base {
+			t.Fatalf("%s next_fire_at = %d, want exact instant %d", name, sc.NextFireAt, base)
+		}
+	}
+}
+
+// TestScheduler_FireDueSpread proves firing advances to the next SHIFTED slot.
+func TestScheduler_FireDueSpread(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	const freq = "0 * * * *"
+	off := store.ScheduleOffset(freq, store.OffsetKey(7, ""), 2*time.Hour)
+	putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	if err := st.PutSchedule(ctx, "v1", freq, 1); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now()
+	s.fireDue(ctx)
+	if pending, _ := st.ListPendingTasks(ctx); len(pending) != 1 {
+		t.Fatalf("fireDue pending tasks: %+v", pending)
+	}
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	if want := store.NextFireOffset(freq, off, before).Unix(); sc.NextFireAt != want {
+		t.Fatalf("next_fire_at = %d, want %d (offset %v)", sc.NextFireAt, want, off)
 	}
 }
 

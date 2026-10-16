@@ -424,6 +424,37 @@ func TestMaintenance_SchedulesAdvanceOnExit(t *testing.T) {
 	}
 }
 
+// TestMaintenance_SchedulesKeepPhaseOnExit proves exiting maintenance keeps each
+// schedule's spread offset: rows sharing a phase (one project) land on the same
+// shifted slot, and an unshifted row stays on the bare cron instant.
+func TestMaintenance_SchedulesKeepPhaseOnExit(t *testing.T) {
+	s := open(t, Options{})
+	const expr = "0 * * * *"
+	nowT := time.Now()
+	base := NextFire(expr, nowT.Add(-2*time.Hour)).Unix() // an instant in the past
+	const phase = 7 * 60
+	for vol, next := range map[string]int64{"files": base + phase, "db": base + phase, "solo": base} {
+		if err := s.PutSchedule(ctx, vol, expr, next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := s.PutLocalHold(ctx, "l", "root"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClearLocalHold(ctx); err != nil {
+		t.Fatal(err)
+	}
+	files, _, _ := s.GetSchedule(ctx, "files")
+	db, _, _ := s.GetSchedule(ctx, "db")
+	solo, _, _ := s.GetSchedule(ctx, "solo")
+	if want := NextFireOffset(expr, phase*time.Second, nowT).Unix(); files.NextFireAt != want || db.NextFireAt != want {
+		t.Fatalf("shifted rows = %d/%d, want %d", files.NextFireAt, db.NextFireAt, want)
+	}
+	if want := NextFire(expr, nowT).Unix(); solo.NextFireAt != want {
+		t.Fatalf("unshifted row = %d, want %d", solo.NextFireAt, want)
+	}
+}
+
 func TestMaintenance_SkipDueBackup(t *testing.T) {
 	s := open(t, Options{})
 	if err := s.PutSchedule(ctx, "v1", "0 2 * * *", 10); err != nil {

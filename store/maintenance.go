@@ -388,17 +388,23 @@ func cancelPendingRestoresTx(ctx context.Context, tx *sql.Tx, now int64) error {
 
 // advanceSchedulesTx recomputes every schedule's next_fire_at from now on exit
 // from maintenance, so slots missed during the window are skipped rather than
-// all firing at once. A row whose cron no longer parses is left as is.
+// all firing at once. Each row keeps its phase — how far it sits after its cron
+// instant (the backup spread offset) — so exiting maintenance does not snap
+// every schedule back onto the bare cron instant. A row whose cron no longer
+// parses is left as is.
 func advanceSchedulesTx(ctx context.Context, tx *sql.Tx, now int64) error {
-	rows, err := tx.QueryContext(ctx, `SELECT volume_name, cron_expr FROM schedules`)
+	rows, err := tx.QueryContext(ctx, `SELECT volume_name, cron_expr, next_fire_at FROM schedules`)
 	if err != nil {
 		return fmt.Errorf("store: list schedules: %w", err)
 	}
-	type sched struct{ vol, expr string }
+	type sched struct {
+		vol, expr string
+		next      int64
+	}
 	var all []sched
 	for rows.Next() {
 		var sc sched
-		if err := rows.Scan(&sc.vol, &sc.expr); err != nil {
+		if err := rows.Scan(&sc.vol, &sc.expr, &sc.next); err != nil {
 			rows.Close()
 			return fmt.Errorf("store: scan schedule row: %w", err)
 		}
@@ -410,15 +416,15 @@ func advanceSchedulesTx(ctx context.Context, tx *sql.Tx, now int64) error {
 	}
 	rows.Close()
 
-	from := time.Unix(now, 0)
 	for _, sc := range all {
-		next := NextFire(sc.expr, from)
+		phase := SchedulePhase(sc.expr, sc.next)
+		next := NextFire(sc.expr, time.Unix(now-phase, 0))
 		if next.IsZero() {
 			continue
 		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ?`,
-			next.Unix(), now, sc.vol); err != nil {
+			next.Unix()+phase, now, sc.vol); err != nil {
 			return fmt.Errorf("store: advance schedule %q: %w", sc.vol, err)
 		}
 	}

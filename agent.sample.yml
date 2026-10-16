@@ -75,6 +75,12 @@ backups:
   compact_freq: "45 2 * * *" # Every day at 02:45
   compact_jitter_sec: 1800 # Random 0-N sec delay before a compact sweep, to spread load across nodes
 
+  # Scheduled backups start at a fixed offset after their cron time, so they
+  # don't all hit the backup server in the same minute. The offset is per project
+  # (all volumes of a project share it), at most a quarter of the backup interval
+  # and at most this many seconds. 0 = run backups exactly at their cron time.
+  schedule_spread_max_sec: 7200
+
   key: changeme! # This is the encryption key
   mariadb:
     long_queries: # Kill long queries to unblock backup

@@ -141,8 +141,7 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 	}
 	fired := false
 	for _, sc := range due {
-		next := store.NextFire(sc.CronExpr, now)
-		if next.IsZero() {
+		if store.NextFire(sc.CronExpr, now).IsZero() {
 			// Unparseable/never-firing cron slipped in — drop the schedule so it
 			// doesn't re-evaluate as due every tick.
 			backupLogger().Warn("Scheduler: dropping schedule with unparseable cron", "volume", sc.VolumeName, "cron", sc.CronExpr)
@@ -165,6 +164,7 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			_ = s.st.DeleteSchedule(ctx, sc.VolumeName)
 			continue
 		}
+		next := store.NextFireOffset(sc.CronExpr, spreadOffset(sc.CronExpr, vol), now)
 		if paused {
 			if err := s.st.SkipDueBackup(ctx, sc.VolumeName, next.Unix()); err != nil {
 				backupLogger().Warn("Scheduler: skip due backup", "volume", sc.VolumeName, "error", err.Error())
@@ -197,6 +197,21 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 	if fired && s.dispatch != nil {
 		s.dispatch()
 	}
+}
+
+// maxSpreadSec bounds backups.schedule_spread_max_sec so the conversion to a
+// Duration cannot overflow (one year is far past any real window).
+const maxSpreadSec = 366 * 24 * 3600
+
+// spreadOffset is the fixed delay after each cron instant at which vol's backup
+// schedule fires, shared by every volume of its project (store.ScheduleOffset).
+// backups.schedule_spread_max_sec caps it; <= 0 disables spreading.
+func spreadOffset(expr string, vol types.Volume) time.Duration {
+	sec := viper.GetInt64("backups.schedule_spread_max_sec")
+	if sec > maxSpreadSec {
+		sec = maxSpreadSec
+	}
+	return store.ScheduleOffset(expr, store.OffsetKey(vol.ProjectID, vol.Name), time.Duration(sec)*time.Second)
 }
 
 // runMaintenance runs any node maintenance job whose cron slot has passed
@@ -257,8 +272,9 @@ func (s *Scheduler) runMaintenance(ctx context.Context) {
 // the volumes-populated sentinel so an unpopulated control.db never wipes every
 // schedule. A trashed volume gets a (stable-id, idempotent) volume.trash task and
 // its schedule removed; a backup-disabled or vanished volume just loses its
-// schedule; a new/changed cron gets Next(now) (no catch-up on first schedule, so a
-// fleet backfill can't trigger a backup storm).
+// schedule; a new/changed cron gets the next shifted slot after now (no catch-up on
+// first schedule, so a fleet backfill can't trigger a backup storm). An unchanged
+// schedule is moved onto its spread offset once if it is not already there.
 func (s *Scheduler) reconcile(ctx context.Context) {
 	defer sentry.Recover()
 	populated, err := s.st.IsPopulated(ctx, store.MetaVolumesPopulated)
@@ -318,8 +334,9 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 		}
 
 		existing, found, _ := s.st.GetSchedule(ctx, vol.Name)
+		off := spreadOffset(vol.Freq, vol)
 		if !found || existing.CronExpr != vol.Freq {
-			next := store.NextFire(vol.Freq, now)
+			next := store.NextFireOffset(vol.Freq, off, now)
 			if next.IsZero() {
 				backupLogger().Warn("Scheduler: invalid cron for volume", "volume", vol.Name, "cron", vol.Freq)
 				continue
@@ -327,8 +344,21 @@ func (s *Scheduler) reconcile(ctx context.Context) {
 			if err := s.st.PutSchedule(ctx, vol.Name, vol.Freq, next.Unix()); err != nil {
 				backupLogger().Warn("Scheduler: put schedule", "volume", vol.Name, "error", err.Error())
 			}
+			continue
 		}
-		// Unchanged cron: leave next_fire_at untouched (never push it forward).
+		// Unchanged cron: never push next_fire_at forward from now. Only move it
+		// onto its spread offset (after an upgrade, or a cap/project change) —
+		// same slot, so nothing is skipped or repeated, and once aligned it stays.
+		aligned := store.AlignNextFire(vol.Freq, off, existing.NextFireAt)
+		if aligned != existing.NextFireAt {
+			if err := s.st.PutSchedule(ctx, vol.Name, vol.Freq, aligned); err != nil {
+				backupLogger().Warn("Scheduler: put schedule", "volume", vol.Name, "error", err.Error())
+				continue
+			}
+			backupLogger().Info("Scheduler: aligned backup schedule to its spread offset", "volume", vol.Name,
+				"old", time.Unix(existing.NextFireAt, 0).UTC().Format(time.RFC3339),
+				"new", time.Unix(aligned, 0).UTC().Format(time.RFC3339), "offset", off.String())
+		}
 	}
 
 	// Drop schedules for volumes no longer present/owned here.
