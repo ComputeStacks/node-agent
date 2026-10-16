@@ -2,8 +2,8 @@
 
 ## v3.4.1
 
-Patch release for v3.4.0. **No migrations (`control.db` stays at schema `v4`), no config
-changes, no API changes.**
+Patch release for v3.4.0. **No migrations (`control.db` stays at schema `v4`), no API
+changes.** One new `agent.yml` key with a default (`backups.borg.nfs_version`).
 
 - [CHANGE] A volume's first backup no longer logs a `Command failed` warning for its
   missing repository. The check that finds the repository missing now logs at DEBUG, and
@@ -24,6 +24,13 @@ changes, no API changes.**
   archive, the backup succeeds and the vanished paths are noted in `backup_warning`;
   otherwise — for example a directory renamed during the backup — it fails and names the
   first path missing from the archive.
+- [FIX] NFS-backed backup repositories are mounted as NFS 4.2 (new
+  `backups.borg.nfs_version`, default `4.2`). The previous `nfsvers=4` selected NFS 4.0, which
+  on Linux 6.6–6.16 kernels can fail the mount with `cannot allocate memory` under memory
+  pressure. Existing repository volumes are re-created with the new mount options the next
+  time an operation uses them while they are idle; the backups on the NFS server are not
+  touched. Requires an NFS server that supports 4.1 or later; set `nfs_version: "4"` to keep
+  the previous behavior.
 
 ## v3.4.0
 

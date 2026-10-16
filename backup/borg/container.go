@@ -1,6 +1,7 @@
 package borg
 
 import (
+	"bufio"
 	"context"
 	"cs-agent/containermgr"
 	"cs-agent/sshremote"
@@ -9,6 +10,8 @@ import (
 	"errors"
 	"io"
 	"math/rand"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -19,6 +22,7 @@ import (
 	"github.com/docker/docker/api/types/mount"
 	volumeTypes "github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"github.com/spf13/viper"
 )
 
@@ -39,49 +43,14 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 		return false, clientErr
 	}
 
-	// Check if the borg cache volume exists, and create it if it does not.
-	if _, volErr := r.ensureCacheVolume(cli); volErr != nil {
-		return false, volErr
-	}
-
-	ctx := context.Background()
-
-	// Ensure image exists
-	_, _, missingImage := cli.ImageInspectWithRaw(ctx, viper.GetString("backups.borg.image"))
-	if missingImage != nil {
-		body, pullErr := cli.ImagePull(ctx, viper.GetString("backups.borg.image"), image.PullOptions{})
-		if pullErr != nil {
-			borgLogger().Error("Fatal error pulling image", "error", pullErr.Error())
-			return false, pullErr
-		}
-		if streamErr := drainImagePull(body); streamErr != nil {
-			borgLogger().Error("Fatal error pulling image", "error", streamErr.Error())
-			return false, streamErr
-		}
-	}
-
-	var containerID string
-	for attempt := 1; ; attempt++ {
-		id, startErr := r.createAndStartContainer(ctx, cli, target)
-		if startErr == nil {
-			containerID = id
-			break
-		}
-		if attempt >= mountFailureAttempts || !isTransientMountFailure(startErr) {
-			return false, startErr
-		}
-		// Logged, and at WARN, because a retry that works is otherwise invisible: the
-		// operation completes, nothing is captured, and the condition that needed two
-		// attempts leaves no trace. That matters for a failure the host is expected to
-		// stop producing — without this line "the host was fixed" and "the retry is
-		// absorbing it" cannot be told apart, and neither can a window that has grown
-		// long enough to outlast every attempt.
-		borgLogger().Warn("Retrying the backup container after a transient mount failure",
-			"repository", r.Name, "attempt", attempt, "attempts", mountFailureAttempts, "error", startErr.Error())
-		time.Sleep(mountFailureDelay)
+	containerID, startErr := r.startBackupContainer(cli, target)
+	if startErr != nil {
+		return false, startErr
 	}
 
 	r.Container = &containermgr.Container{ID: containerID}
+
+	ctx := context.Background()
 
 	// time.Sleep(250 * time.Millisecond)
 	isReady := false
@@ -106,6 +75,65 @@ func (r *Repository) InitBackupContainer(target *types.Volume) (bool, error) {
 	}
 
 	return true, nil
+}
+
+// startBackupContainer ensures the b-<r.Name> volume, makes sure the borg image is present,
+// and creates and starts the backup container, returning its id.
+//
+// The whole span runs under the repository's volume lifecycle lock (see
+// volumeLifecycleLocks). ensureCacheVolume may remove and re-create the volume, and until a
+// container that mounts it has STARTED nothing stops another operation of this agent from
+// removing it, or from auto-creating it as a plain local volume inside the gap of a
+// re-create. Once the start succeeds the volume is in use and docker itself refuses to
+// remove it, which is why the lock ends here rather than spanning the readiness wait or the
+// container's lifetime. The image pull sits inside the span only because it always has sat
+// between the volume and the container; it holds up nothing but another operation on the
+// same repository.
+//
+// Callers may already hold AcquireRepoLock(r.Name); that is the documented lock order
+// (repository lock outer, lifecycle lock inner).
+func (r *Repository) startBackupContainer(cli *client.Client, target *types.Volume) (string, error) {
+	defer acquireVolumeLifecycleLock(r.Name)()
+
+	// Check if the borg cache volume exists, and create it if it does not.
+	if _, volErr := r.ensureCacheVolume(cli); volErr != nil {
+		return "", volErr
+	}
+
+	ctx := context.Background()
+
+	// Ensure image exists
+	_, _, missingImage := cli.ImageInspectWithRaw(ctx, viper.GetString("backups.borg.image"))
+	if missingImage != nil {
+		body, pullErr := cli.ImagePull(ctx, viper.GetString("backups.borg.image"), image.PullOptions{})
+		if pullErr != nil {
+			borgLogger().Error("Fatal error pulling image", "error", pullErr.Error())
+			return "", pullErr
+		}
+		if streamErr := drainImagePull(body); streamErr != nil {
+			borgLogger().Error("Fatal error pulling image", "error", streamErr.Error())
+			return "", streamErr
+		}
+	}
+
+	for attempt := 1; ; attempt++ {
+		id, startErr := r.createAndStartContainer(ctx, cli, target)
+		if startErr == nil {
+			return id, nil
+		}
+		if attempt >= mountFailureAttempts || !isTransientMountFailure(startErr) {
+			return "", startErr
+		}
+		// Logged, and at WARN, because a retry that works is otherwise invisible: the
+		// operation completes, nothing is captured, and the condition that needed two
+		// attempts leaves no trace. That matters for a failure the host is expected to
+		// stop producing — without this line "the host was fixed" and "the retry is
+		// absorbing it" cannot be told apart, and neither can a window that has grown
+		// long enough to outlast every attempt.
+		borgLogger().Warn("Retrying the backup container after a transient mount failure",
+			"repository", r.Name, "attempt", attempt, "attempts", mountFailureAttempts, "error", startErr.Error())
+		time.Sleep(mountFailureDelay)
+	}
 }
 
 // mountFailureAttempts is how many times a backup container is created and started before
@@ -323,7 +351,8 @@ func (r *Repository) StopContainer() bool {
 /*
 Volumes
 */
-// ensureCacheVolume creates the docker volume b-<r.Name> if it is not already there.
+// ensureCacheVolume creates the docker volume b-<r.Name> if it is not already there, and on
+// the NFS backend brings an existing one's mount options up to date when that is safe.
 //
 // It takes no volume parameter: the volume is the repository owner's, always, because of
 // what is mounted at /mnt/borg — the repository itself on local/NFS, borg's cache for the
@@ -335,70 +364,417 @@ Volumes
 // volume's driver options point the mount straight at it — so on that backend it belongs to
 // volume creation rather than to repository creation, and it is correctly gated on the
 // volume's own absence.
+//
+// Docker records a volume's driver options when the volume is created and never again, so
+// a change to how the repository is mounted (the NFS version, rsize, async…) would
+// otherwise reach only volumes created after it. That is what refreshStaleNFSVolume is for.
+//
+// Callers must hold the repository's volume lifecycle lock (startBackupContainer does).
 func (r *Repository) ensureCacheVolume(cli *client.Client) (bool, error) {
 	ctx := context.Background()
 
-	_, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+r.Name)
+	existing, existingVolumeErr := cli.VolumeInspect(ctx, "b-"+r.Name)
 
 	if existingVolumeErr != nil {
-		// Container Labels
-		labels := make(map[string]string)
-		labels["com.computestacks.role"] = "backup"
-		labels["com.computestacks.for"] = r.Name
+		return r.createCacheVolume(ctx, cli)
+	}
 
-		// Driver Opts
-		driverOpts := make(map[string]string)
-
-		if viper.GetBool("backups.borg.nfs") {
-			if viper.GetBool("backups.borg.nfs_create_path") {
-				borgLogger().Info("Creating remote volume directory", "volume", "b-"+r.Name, "type", "nfs")
-				sshCmd, ok := nfsRepoPathCommand(r.Name)
-				if !ok {
-					borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "volume", "b-"+r.Name, "type", "nfs")
-					return false, errors.New("refusing to create remote directory: unsafe repository name " + r.Name)
-				}
-				connInfo := sshremote.ServerConnInfo{
-					Server: viper.GetString("backups.borg.nfs_host"),
-					Port:   viper.GetString("backups.borg.nfs_ssh.port"),
-					User:   viper.GetString("backups.borg.nfs_ssh.user"),
-					Key:    viper.GetString("backups.borg.nfs_ssh.keyfile"),
-				}
-
-				createDirSuccess, createDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
-
-				if createDirErr != nil {
-					borgLogger().Error("Fatal error creating directory on remote server", "volume", "b-"+r.Name, "error", createDirErr.Error())
-					return false, createDirErr
-				}
-
-				if !createDirSuccess {
-					borgLogger().Warn("Invalid response while creating remote directory", "volume", "b-"+r.Name)
-					return false, errors.New("invalid response while creating directory")
-				}
-			}
-			driverOpts["type"] = "nfs"
-			driverOpts["o"] = "addr=" + viper.GetString("backups.borg.nfs_host") + ",rw,nfsvers=4" + viper.GetString("backups.borg.nfs_opts")
-			driverOpts["device"] = ":" + viper.GetString("backups.borg.nfs_host_path") + "/b-" + r.Name
-		}
-
-		opts := volumeTypes.CreateOptions{
-			Name:       "b-" + r.Name,
-			Driver:     "local",
-			DriverOpts: driverOpts,
-			Labels:     labels,
-		}
-
-		_, volErr := cli.VolumeCreate(ctx, opts)
-
-		if volErr != nil {
-			borgLogger().Warn("Fatal Error Creating Volume", "volume", "b-"+r.Name, "error", volErr.Error())
-			return false, volErr
-		}
-
-		return true, nil
-
+	if err := r.refreshStaleNFSVolume(ctx, cli, existing); err != nil {
+		return false, err
 	}
 	return true, nil
+}
+
+// createCacheVolume is ensureCacheVolume's absent path: on the NFS backend it creates the
+// repository directory on the server (when nfs_create_path is set) and then declares the
+// docker volume pointing at it; on every other backend it creates a plain local volume.
+func (r *Repository) createCacheVolume(ctx context.Context, cli *client.Client) (bool, error) {
+	driverOpts := make(map[string]string)
+
+	if viper.GetBool("backups.borg.nfs") {
+		if viper.GetBool("backups.borg.nfs_create_path") {
+			borgLogger().Info("Creating remote volume directory", "volume", "b-"+r.Name, "type", "nfs")
+			sshCmd, ok := nfsRepoPathCommand(r.Name)
+			if !ok {
+				borgLogger().Error("Refusing to create remote directory with an unsafe repository name", "volume", "b-"+r.Name, "type", "nfs")
+				return false, errors.New("refusing to create remote directory: unsafe repository name " + r.Name)
+			}
+			connInfo := sshremote.ServerConnInfo{
+				Server: viper.GetString("backups.borg.nfs_host"),
+				Port:   viper.GetString("backups.borg.nfs_ssh.port"),
+				User:   viper.GetString("backups.borg.nfs_ssh.user"),
+				Key:    viper.GetString("backups.borg.nfs_ssh.keyfile"),
+			}
+
+			createDirSuccess, createDirErr := sshremote.SSHCommandBool(sshCmd, connInfo)
+
+			if createDirErr != nil {
+				borgLogger().Error("Fatal error creating directory on remote server", "volume", "b-"+r.Name, "error", createDirErr.Error())
+				return false, createDirErr
+			}
+
+			if !createDirSuccess {
+				borgLogger().Warn("Invalid response while creating remote directory", "volume", "b-"+r.Name)
+				return false, errors.New("invalid response while creating directory")
+			}
+		}
+		driverOpts = nfsVolumeDriverOpts(r.Name)
+	}
+
+	if volErr := r.createVolume(ctx, cli, driverOpts); volErr != nil {
+		return false, volErr
+	}
+	return true, nil
+}
+
+// createVolume is the docker half of creating b-<r.Name>, and nothing else: no remote
+// directory, no inspection. It is shared by the first-time create and the NFS re-create so
+// the two cannot disagree on labels.
+func (r *Repository) createVolume(ctx context.Context, cli *client.Client, driverOpts map[string]string) error {
+	opts := volumeTypes.CreateOptions{
+		Name:       "b-" + r.Name,
+		Driver:     "local",
+		DriverOpts: driverOpts,
+		Labels: map[string]string{
+			"com.computestacks.role": "backup",
+			"com.computestacks.for":  r.Name,
+		},
+	}
+
+	if _, volErr := cli.VolumeCreate(ctx, opts); volErr != nil {
+		borgLogger().Warn("Fatal Error Creating Volume", "volume", "b-"+r.Name, "error", volErr.Error())
+		return volErr
+	}
+	return nil
+}
+
+// defaultNFSVersion is the NFS version a repository volume is mounted with when
+// backups.borg.nfs_version is empty.
+//
+// 4.2 rather than "4" because the kernel reads nfsvers=4 as NFS 4.0 (minor version 0), and
+// a 4.0 client starts a callback service whose buffer allocation on Linux 6.6–6.16 fails
+// outright under memory pressure, refusing the mount with "cannot allocate memory". 4.1 and
+// later carry callbacks over the session instead and never make that allocation.
+const defaultNFSVersion = "4.2"
+
+// nfsVolumeDriverOpts is the docker `local` driver options an NFS repository volume for the
+// repository name is declared with: type, device (the repository directory on the server)
+// and o (the mount options).
+//
+// It is the single definition of "what the volume should look like", used both to create
+// the volume and to judge whether an existing one is out of date, so the two can never
+// disagree about what current means.
+//
+// nfs_version is not validated beyond being non-empty: a value the kernel does not accept
+// is refused at mount time with a message that names it, which is clearer than anything
+// this could say. nfs_opts is appended verbatim and is expected to start with a comma.
+func nfsVolumeDriverOpts(name string) map[string]string {
+	version := strings.TrimSpace(viper.GetString("backups.borg.nfs_version"))
+	if version == "" {
+		version = defaultNFSVersion
+	}
+	return map[string]string{
+		"type":   "nfs",
+		"o":      "addr=" + viper.GetString("backups.borg.nfs_host") + ",rw,nfsvers=" + version + viper.GetString("backups.borg.nfs_opts"),
+		"device": ":" + viper.GetString("backups.borg.nfs_host_path") + "/b-" + name,
+	}
+}
+
+// addrFromMountOpts returns the addr= value from an NFS mount option string, or "" when it
+// has none.
+func addrFromMountOpts(o string) string {
+	for _, opt := range strings.Split(o, ",") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(opt), "addr="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// nfsVolumeState is what classifyNFSVolume concluded about an existing b-<name> volume.
+type nfsVolumeState int
+
+const (
+	// nfsVolumeNotApplicable: the node is not on the NFS backend, so the volume is not an
+	// NFS mount declaration at all — on the local backend it IS the repository — and it is
+	// never touched.
+	nfsVolumeNotApplicable nfsVolumeState = iota
+	// nfsVolumeUpToDate: declared exactly as configuration says it should be.
+	nfsVolumeUpToDate
+	// nfsVolumeStale: same server, same repository directory, only the mount options
+	// differ. Safe to re-create.
+	nfsVolumeStale
+	// nfsVolumeDiffers: differs in a way that is NOT safe to correct in place (another
+	// server, another directory, not an NFS volume at all). Left alone and reported.
+	nfsVolumeDiffers
+)
+
+// classifyNFSVolume decides whether an existing volume may be re-created with the desired
+// driver options (from nfsVolumeDriverOpts).
+//
+// Narrow on purpose. A volume is stale — re-creatable — only when it is a `local` volume of
+// type nfs, its device is exactly the desired device, the addr= in its mount options is
+// exactly the configured nfs_host, and its mount options differ. Only then is the
+// re-created volume guaranteed to point at the very directory, on the very server, that
+// the old one did. Anything else — a changed nfs_host or nfs_host_path, a volume that is
+// not NFS-typed, a different driver — would re-point the repository at a location that
+// from the node's side is empty, and borg would then initialize a fresh repository there
+// and leave the customer's history behind. Those are reported (the returned reason) and
+// left exactly as they are.
+func classifyNFSVolume(existing volumeTypes.Volume, desired map[string]string, nfsBackend bool) (nfsVolumeState, string) {
+	if !nfsBackend {
+		return nfsVolumeNotApplicable, ""
+	}
+	if existing.Driver != "local" {
+		return nfsVolumeDiffers, "volume driver is " + existing.Driver + ", not local"
+	}
+	if existing.Options["type"] != "nfs" {
+		return nfsVolumeDiffers, "volume is not an NFS mount"
+	}
+	if existing.Options["device"] != desired["device"] {
+		return nfsVolumeDiffers, "volume points at a different NFS path"
+	}
+	if addrFromMountOpts(existing.Options["o"]) != addrFromMountOpts(desired["o"]) {
+		return nfsVolumeDiffers, "volume points at a different NFS server"
+	}
+	if existing.Options["o"] == desired["o"] {
+		return nfsVolumeUpToDate, ""
+	}
+	return nfsVolumeStale, ""
+}
+
+// postRemoveAction is what refreshStaleNFSVolume does after its remove attempt, decided by
+// afterRemoveDecision from a fresh inspect of the volume.
+type postRemoveAction int
+
+const (
+	// postRemoveCreate: the volume is gone; declare it with the current options.
+	postRemoveCreate postRemoveAction = iota
+	// postRemoveKeep: the volume is still there, still the same repository on the same
+	// server — docker refused the remove because it is in use. Use it as it is.
+	postRemoveKeep
+	// postRemoveFail: the volume is there but is no longer a declaration of this
+	// repository. Something else created it; no container may start against it.
+	postRemoveFail
+)
+
+// afterRemoveDecision judges the volume as re-inspected after a remove attempt — nil when
+// docker reports it does not exist — rather than trusting the remove call's error. The
+// error cannot be trusted either way: a remove that failed may have failed because the
+// volume vanished under it, and one that succeeded may have been followed by docker
+// auto-creating the name as a plain local volume for a container that mounts it. The state
+// of the volume is the only thing that says which branch is safe.
+func afterRemoveDecision(current *volumeTypes.Volume, desired map[string]string) (postRemoveAction, string) {
+	if current == nil {
+		return postRemoveCreate, ""
+	}
+	if current.Driver == "local" && current.Options["type"] == "nfs" && current.Options["device"] == desired["device"] {
+		return postRemoveKeep, ""
+	}
+	return postRemoveFail, "backup volume " + current.Name + " was replaced by a volume that is not this repository's NFS mount"
+}
+
+// verifyNFSVolume checks that a volume is declared exactly as desired.
+//
+// Needed after every re-create because docker's VolumeCreate on a name that already exists
+// with the same driver returns the EXISTING volume and ignores the options it was given. A
+// create that "succeeded" therefore proves nothing about the options the volume ended up
+// with; if anything raced the create, borg would otherwise run against whatever that was.
+func verifyNFSVolume(v volumeTypes.Volume, desired map[string]string) error {
+	if v.Driver != "local" {
+		return errors.New("backup volume " + v.Name + " has driver " + v.Driver + ", not local")
+	}
+	for _, key := range []string{"type", "device", "o"} {
+		if v.Options[key] != desired[key] {
+			return errors.New("backup volume " + v.Name + " has " + key + "=" + strconv.Quote(v.Options[key]) + ", wanted " + strconv.Quote(desired[key]))
+		}
+	}
+	return nil
+}
+
+// refreshStaleNFSVolume re-creates an existing NFS repository volume whose mount options
+// no longer match configuration, when — and only when — that is safe. The backups are not
+// touched: the volume is only docker's declaration of how to mount the repository
+// directory, and the re-created declaration points at the same directory on the same
+// server (see classifyNFSVolume for exactly what "same" requires).
+//
+// Every way of not re-creating it leaves the existing volume in place and returns nil: it
+// still mounts the repository, just with the old options, and the next operation tries
+// again. The only error returns are a failed create, and a volume that after the remove is
+// not what it must be — in both cases no container is started, so borg never runs against
+// a volume that is missing or is not the repository.
+//
+// The steps, and why each is there:
+//
+//   - The volume's host mountpoint must provably NOT be mounted. Docker refuses to remove a
+//     volume a container references, but a daemon older than v28 then removes the volume's
+//     _data directory with RemoveAll, and through a live NFS mount that deletes the
+//     repository on the server. If that cannot be determined — the agent cannot see
+//     docker's volume directory, say — that counts as mounted.
+//   - VolumeRemove(force=false), never force: docker's refusal is the in-use check.
+//   - Re-inspect, and let afterRemoveDecision say what the remove actually did.
+//   - Create with docker only. The remote mkdir/chown of the first-time create is skipped:
+//     the directory demonstrably exists, since the old volume mounted it, and chown -R over
+//     a whole repository is slow.
+//   - Verify the result with verifyNFSVolume.
+//
+// Callers must hold the repository's volume lifecycle lock: between the remove and the
+// create the volume does not exist, and that gap is what the lock protects.
+func (r *Repository) refreshStaleNFSVolume(ctx context.Context, cli *client.Client, existing volumeTypes.Volume) error {
+	name := "b-" + r.Name
+	desired := nfsVolumeDriverOpts(r.Name)
+
+	state, reason := classifyNFSVolume(existing, desired, viper.GetBool("backups.borg.nfs"))
+	switch state {
+	case nfsVolumeNotApplicable, nfsVolumeUpToDate:
+		return nil
+	case nfsVolumeDiffers:
+		borgLogger().Warn("Backup volume options differ from configuration; leaving it as is",
+			"volume", name, "reason", reason, "o", existing.Options["o"], "device", existing.Options["device"])
+		return nil
+	}
+
+	oldOpts := existing.Options["o"]
+
+	mounted, mountErr := volumeMountpointMounted(existing.Mountpoint)
+	if mountErr != nil || mounted {
+		// WARN rather than INFO: a volume the agent cannot re-create stays on the old mount
+		// options indefinitely, and the usual reason — a stopped container left behind
+		// holding it — is worth someone noticing.
+		args := []any{"volume", name, "o", oldOpts}
+		if mountErr != nil {
+			args = append(args, "error", mountErr.Error())
+		}
+		borgLogger().Warn("Backup volume is in use; it keeps its old mount options until it is idle", args...)
+		return nil
+	}
+
+	removeErr := cli.VolumeRemove(ctx, name, false)
+	if removeErr != nil && !errdefs.IsConflict(removeErr) && !client.IsErrNotFound(removeErr) {
+		borgLogger().Warn("Could not remove backup volume to re-create it", "volume", name, "error", removeErr.Error())
+	}
+
+	var current *volumeTypes.Volume
+	if v, inspectErr := cli.VolumeInspect(ctx, name); inspectErr == nil {
+		current = &v
+	} else if !client.IsErrNotFound(inspectErr) {
+		borgLogger().Error("Could not inspect backup volume after removing it", "volume", name, "error", inspectErr.Error())
+		return inspectErr
+	}
+
+	action, failReason := afterRemoveDecision(current, desired)
+	switch action {
+	case postRemoveKeep:
+		if current.Options["o"] != desired["o"] {
+			args := []any{"volume", name, "o", current.Options["o"]}
+			if removeErr != nil {
+				args = append(args, "error", removeErr.Error())
+			}
+			borgLogger().Warn("Backup volume is in use; it keeps its old mount options until it is idle", args...)
+		}
+		return nil
+	case postRemoveFail:
+		borgLogger().Error("Backup volume changed while being re-created", "volume", name, "reason", failReason)
+		return errors.New(failReason)
+	}
+
+	if err := r.createAndVerifyNFSVolume(ctx, cli, desired); err != nil {
+		return err
+	}
+	borgLogger().Info("Re-created backup volume with current mount options", "volume", name, "old_o", oldOpts, "new_o", desired["o"])
+	return nil
+}
+
+// createAndVerifyNFSVolume declares b-<r.Name> with the desired NFS driver options (docker
+// only, no remote directory) and then confirms, by inspecting it, that the volume docker
+// now has is that declaration — see verifyNFSVolume for why the create's own success is
+// not enough.
+func (r *Repository) createAndVerifyNFSVolume(ctx context.Context, cli *client.Client, desired map[string]string) error {
+	name := "b-" + r.Name
+	if err := r.createVolume(ctx, cli, desired); err != nil {
+		return err
+	}
+	created, inspectErr := cli.VolumeInspect(ctx, name)
+	if inspectErr != nil {
+		borgLogger().Error("Could not inspect re-created backup volume", "volume", name, "error", inspectErr.Error())
+		return inspectErr
+	}
+	if err := verifyNFSVolume(created, desired); err != nil {
+		borgLogger().Error("Re-created backup volume does not have the expected options", "volume", name, "error", err.Error())
+		return err
+	}
+	return nil
+}
+
+// volumeMountpointMounted reports whether a docker volume's host mountpoint (the _data
+// directory VolumeInspect reports) is currently a mount point.
+//
+// It errors — which callers treat as "mounted" — whenever the answer cannot be trusted:
+// no mountpoint reported, or the volume's directory not visible from here (docker running
+// with a data root this process cannot see, in another mount namespace, or the agent not
+// running as root). "Not in mountinfo" only means "not mounted" when the path it would be
+// mounted on is demonstrably one this process can see.
+//
+// The parent directory is resolved through symlinks first because mountinfo records the
+// resolved path, and a data root reached through a symlink would otherwise never match.
+func volumeMountpointMounted(mountpoint string) (bool, error) {
+	if mountpoint == "" {
+		return false, errors.New("volume has no mountpoint")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(filepath.Clean(mountpoint)))
+	if err != nil {
+		return false, err
+	}
+	return isMountpoint(filepath.Join(parent, filepath.Base(mountpoint)))
+}
+
+// isMountpoint reports whether path is a mount point in this process's mount namespace,
+// read from /proc/self/mountinfo. path is compared as given (cleaned), so a caller with a
+// path that may run through a symlink must resolve it first.
+func isMountpoint(path string) (bool, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	return mountinfoHasMountpoint(f, filepath.Clean(path))
+}
+
+// mountinfoHasMountpoint scans mountinfo-formatted text for a mount point equal to path.
+// The mount point is the fifth field; the kernel escapes space, tab, newline and backslash
+// in it as three-digit octal (\040 and so on), which is undone before comparing.
+func mountinfoHasMountpoint(r io.Reader, path string) (bool, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		if unescapeMountinfo(fields[4]) == path {
+			return true, nil
+		}
+	}
+	return false, scanner.Err()
+}
+
+// unescapeMountinfo undoes the kernel's octal escaping of a mountinfo path field.
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+4 <= len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+4], 8, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // ensureRemoteRepoPath creates r's repository directory on the SSH backup server.
@@ -500,11 +876,18 @@ func sshRepoPathCommand(name string) (string, bool) {
 // reached only after the local volume was already gone — so an unsafe name destroyed the
 // local half of the repository and then failed, leaving the remote half behind with nothing
 // left to retry against.
+//
+// The inspect, the remove and the remote delete all run under the repository's volume
+// lifecycle lock, the one InitBackupContainer holds while it may be re-creating the volume.
+// Without it a trash could inspect inside a re-create's remove→create gap, see no volume,
+// skip the remote delete and report success, and the re-create would then bring the volume
+// back pointing at the repository that was supposed to be destroyed.
 func (r *Repository) TrashBackupVolumeExists() (bool, error) {
 	if !safeRepoName(r.Name) {
 		borgLogger().Error("Refusing to destroy repository with an unsafe name", "repository", r.Name)
 		return false, errors.New("refusing to destroy repository: unsafe repository name " + r.Name)
 	}
+	defer acquireVolumeLifecycleLock(r.Name)()
 	ctx := context.Background()
 	cli, clientErr := client.NewClientWithOpts(client.WithVersion(viper.GetString("docker.version")))
 	if clientErr != nil {

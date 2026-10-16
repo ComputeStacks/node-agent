@@ -4,11 +4,13 @@ import (
 	"cs-agent/types"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/docker/docker/api/types/mount"
+	volumeTypes "github.com/docker/docker/api/types/volume"
 	"github.com/spf13/viper"
 )
 
@@ -399,5 +401,209 @@ func TestMountRetryOutlastsTheObservedWindow(t *testing.T) {
 	if spanned <= observedWindow {
 		t.Fatalf("%d attempts %s apart span %s, which does not outlast the observed %s failure window",
 			mountFailureAttempts, mountFailureDelay, spanned, observedWindow)
+	}
+}
+
+// nfsBackendConfig is the NFS backend as a node running it is configured, with the keys
+// nfsVolumeDriverOpts reads. nfs_version is left unset unless a test sets it, so the
+// fallback is what gets exercised by default.
+func nfsBackendConfig() {
+	viper.Reset()
+	viper.Set("backups.borg.nfs", true)
+	viper.Set("backups.borg.nfs_host", "10.1.2.3")
+	viper.Set("backups.borg.nfs_host_path", "/var/nfsshare/volume_backups")
+	viper.Set("backups.borg.nfs_opts", ",async,noatime,rsize=32768,wsize=32768")
+}
+
+// The version default is the point of the change: nfsvers=4 is NFS 4.0, so the rendered
+// option must name 4.2 and must not be the bare "4" it replaces.
+func TestNFSVolumeDriverOpts(t *testing.T) {
+	cases := []struct {
+		name    string
+		version any // nil: unset
+		wantO   string
+	}{
+		{name: "unset falls back to 4.2", version: nil, wantO: "addr=10.1.2.3,rw,nfsvers=4.2,async,noatime,rsize=32768,wsize=32768"},
+		{name: "empty falls back to 4.2", version: "", wantO: "addr=10.1.2.3,rw,nfsvers=4.2,async,noatime,rsize=32768,wsize=32768"},
+		{name: "blank falls back to 4.2", version: "  ", wantO: "addr=10.1.2.3,rw,nfsvers=4.2,async,noatime,rsize=32768,wsize=32768"},
+		{name: "custom version honored", version: "4.1", wantO: "addr=10.1.2.3,rw,nfsvers=4.1,async,noatime,rsize=32768,wsize=32768"},
+		{name: "4.0 can be restored", version: "4", wantO: "addr=10.1.2.3,rw,nfsvers=4,async,noatime,rsize=32768,wsize=32768"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nfsBackendConfig()
+			if tc.version != nil {
+				viper.Set("backups.borg.nfs_version", tc.version)
+			}
+			got := nfsVolumeDriverOpts("vol-a")
+			if got["o"] != tc.wantO {
+				t.Errorf("Received o %q, wanted %q", got["o"], tc.wantO)
+			}
+			if got["type"] != "nfs" {
+				t.Errorf("Received type %q, wanted nfs", got["type"])
+			}
+			if want := ":/var/nfsshare/volume_backups/b-vol-a"; got["device"] != want {
+				t.Errorf("Received device %q, wanted %q", got["device"], want)
+			}
+			if len(got) != 3 {
+				t.Errorf("Received %d driver options, wanted exactly type, o and device: %v", len(got), got)
+			}
+		})
+	}
+
+	nfsBackendConfig()
+	if o := nfsVolumeDriverOpts("vol-a")["o"]; strings.Contains(o, "nfsvers=4,") {
+		t.Errorf("Received default o %q, which still selects NFS 4.0", o)
+	}
+}
+
+func TestAddrFromMountOpts(t *testing.T) {
+	cases := map[string]string{
+		"addr=10.1.2.3,rw,nfsvers=4":          "10.1.2.3",
+		"rw,addr=nfs.example.com,nfsvers=4.2": "nfs.example.com",
+		"rw,nfsvers=4.2,addr=10.0.0.1":        "10.0.0.1",
+		"rw,nfsvers=4.2":                      "",
+		"":                                    "",
+	}
+	for o, want := range cases {
+		if got := addrFromMountOpts(o); got != want {
+			t.Errorf("addrFromMountOpts(%q) = %q, wanted %q", o, got, want)
+		}
+	}
+}
+
+// nfsVolume builds an inspected volume as docker reports one declared with opts.
+func nfsVolume(driver string, opts map[string]string) volumeTypes.Volume {
+	return volumeTypes.Volume{Name: "b-vol-a", Driver: driver, Options: opts}
+}
+
+// classifyNFSVolume may call a volume stale ONLY when re-creating it points at the same
+// directory on the same server. Every other difference must come back as "differs", never
+// as "stale": re-creating those would re-point the repository at an empty location.
+func TestClassifyNFSVolume(t *testing.T) {
+	nfsBackendConfig()
+	desired := nfsVolumeDriverOpts("vol-a")
+	oldO := "addr=10.1.2.3,rw,nfsvers=4,async,noatime,rsize=32768,wsize=32768"
+
+	cases := []struct {
+		name       string
+		volume     volumeTypes.Volume
+		nfsBackend bool
+		want       nfsVolumeState
+	}{
+		{"up to date", nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": desired["o"]}), true, nfsVolumeUpToDate},
+		{"only o differs (nfsvers=4 → 4.2)", nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": oldO}), true, nfsVolumeStale},
+		{"device differs", nfsVolume("local", map[string]string{"type": "nfs", "device": ":/elsewhere/b-vol-a", "o": oldO}), true, nfsVolumeDiffers},
+		{"addr differs", nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": "addr=10.9.9.9,rw,nfsvers=4"}), true, nfsVolumeDiffers},
+		{"addr missing", nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": "rw,nfsvers=4"}), true, nfsVolumeDiffers},
+		{"type missing", nfsVolume("local", map[string]string{"device": desired["device"], "o": oldO}), true, nfsVolumeDiffers},
+		{"type not nfs", nfsVolume("local", map[string]string{"type": "tmpfs", "device": desired["device"], "o": oldO}), true, nfsVolumeDiffers},
+		{"driver not local", nfsVolume("other", map[string]string{"type": "nfs", "device": desired["device"], "o": oldO}), true, nfsVolumeDiffers},
+		{"options nil", nfsVolume("local", nil), true, nfsVolumeDiffers},
+		{"not the nfs backend", nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": oldO}), false, nfsVolumeNotApplicable},
+		{"not the nfs backend, plain volume", nfsVolume("local", nil), false, nfsVolumeNotApplicable},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, reason := classifyNFSVolume(tc.volume, desired, tc.nfsBackend)
+			if got != tc.want {
+				t.Errorf("Received state %d, wanted %d (reason %q)", got, tc.want, reason)
+			}
+			if (got == nfsVolumeDiffers) != (reason != "") {
+				t.Errorf("Received reason %q for state %d; a reason belongs to, and only to, the differs state", reason, got)
+			}
+		})
+	}
+}
+
+func TestAfterRemoveDecision(t *testing.T) {
+	nfsBackendConfig()
+	desired := nfsVolumeDriverOpts("vol-a")
+
+	if got, _ := afterRemoveDecision(nil, desired); got != postRemoveCreate {
+		t.Errorf("absent volume: received %d, wanted create", got)
+	}
+
+	busy := nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": "addr=10.1.2.3,rw,nfsvers=4"})
+	if got, _ := afterRemoveDecision(&busy, desired); got != postRemoveKeep {
+		t.Errorf("same repository still present: received %d, wanted keep", got)
+	}
+
+	for name, v := range map[string]volumeTypes.Volume{
+		"plain local (docker auto-create)": nfsVolume("local", nil),
+		"different device":                 nfsVolume("local", map[string]string{"type": "nfs", "device": ":/elsewhere", "o": desired["o"]}),
+		"different driver":                 nfsVolume("other", map[string]string{"type": "nfs", "device": desired["device"], "o": desired["o"]}),
+	} {
+		v := v
+		got, reason := afterRemoveDecision(&v, desired)
+		if got != postRemoveFail || reason == "" {
+			t.Errorf("%s: received %d (%q), wanted fail with a reason", name, got, reason)
+		}
+	}
+}
+
+func TestVerifyNFSVolume(t *testing.T) {
+	nfsBackendConfig()
+	desired := nfsVolumeDriverOpts("vol-a")
+
+	if err := verifyNFSVolume(nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": desired["o"]}), desired); err != nil {
+		t.Errorf("exact match: received %v, wanted nil", err)
+	}
+	for name, v := range map[string]volumeTypes.Volume{
+		"plain local":      nfsVolume("local", nil),
+		"old o":            nfsVolume("local", map[string]string{"type": "nfs", "device": desired["device"], "o": "addr=10.1.2.3,rw,nfsvers=4"}),
+		"different device": nfsVolume("local", map[string]string{"type": "nfs", "device": ":/elsewhere", "o": desired["o"]}),
+		"different driver": nfsVolume("other", map[string]string{"type": "nfs", "device": desired["device"], "o": desired["o"]}),
+	} {
+		if err := verifyNFSVolume(v, desired); err == nil {
+			t.Errorf("%s: received nil, wanted an error", name)
+		}
+	}
+}
+
+func TestIsMountpoint(t *testing.T) {
+	if got, err := isMountpoint("/"); err != nil || !got {
+		t.Errorf("isMountpoint(/) = %v, %v; wanted true, nil", got, err)
+	}
+	dir := t.TempDir()
+	if got, err := isMountpoint(dir); err != nil || got {
+		t.Errorf("isMountpoint(%s) = %v, %v; wanted false, nil", dir, got, err)
+	}
+}
+
+// The mountinfo mount point field is octal-escaped; a docker data root with a space in it
+// must still be recognized.
+func TestMountinfoHasMountpointUnescapes(t *testing.T) {
+	info := "36 35 98:0 / /mnt/data\\040root/volumes/b-x/_data rw,noatime master:1 - nfs4 10.1.2.3:/b-x rw\n" +
+		"37 35 98:0 / /other rw - ext4 /dev/sda1 rw\n"
+	got, err := mountinfoHasMountpoint(strings.NewReader(info), "/mnt/data root/volumes/b-x/_data")
+	if err != nil || !got {
+		t.Errorf("Received %v, %v; wanted true, nil", got, err)
+	}
+	got, err = mountinfoHasMountpoint(strings.NewReader(info), "/mnt/data root/volumes/b-x")
+	if err != nil || got {
+		t.Errorf("parent of a mount point: received %v, %v; wanted false, nil", got, err)
+	}
+	if u := unescapeMountinfo(`a\134b\040c\04`); u != `a\b c\04` {
+		t.Errorf("unescapeMountinfo received %q", u)
+	}
+}
+
+// When the volume's directory cannot be seen, the answer is "cannot tell", which callers
+// treat as mounted. A missing directory must not read as "not mounted".
+func TestVolumeMountpointMountedFailsSafe(t *testing.T) {
+	if _, err := volumeMountpointMounted(""); err == nil {
+		t.Error("empty mountpoint: received nil error, wanted one")
+	}
+	missing := t.TempDir() + "/gone/_data"
+	if _, err := volumeMountpointMounted(missing); err == nil {
+		t.Error("missing volume directory: received nil error, wanted one")
+	}
+	dir := t.TempDir()
+	if err := os.Mkdir(dir+"/_data", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := volumeMountpointMounted(dir + "/_data"); err != nil || got {
+		t.Errorf("visible, unmounted: received %v, %v; wanted false, nil", got, err)
 	}
 }

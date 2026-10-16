@@ -115,6 +115,10 @@ func ConfigureApp() {
 	viper.SetDefault("backups.borg.nfs", false)
 	viper.SetDefault("backups.borg.nfs_host", "127.0.0.1")
 	viper.SetDefault("backups.borg.nfs_opts", ",async,noatime,rsize=32768,wsize=32768")
+	// NFS version the repository volumes are mounted with (rendered as nfsvers=<value>).
+	// "4" selects NFS 4.0, which some kernels fail to mount under memory pressure; empty
+	// falls back to 4.2.
+	viper.SetDefault("backups.borg.nfs_version", "4.2")
 
 	viper.SetDefault("backups.borg.nfs_host_path", "/var/nfsshare/volume_backups")
 	// Path to the borg binary ON the NFS/backup server. The agent runs

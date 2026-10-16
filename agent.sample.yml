@@ -111,7 +111,8 @@ backups:
     nfs_host: 127.0.0.1
     nfs_host_path: "/var/nfsshare/backups"
     nfs_borg_path: "borg" # Path to the borg binary ON the NFS server (agent runs `borg compact` there over SSH). Use an absolute path if borg isn't on the non-interactive SSH PATH.
-    nfs_opts: ",async,noatime,rsize=32768,wsize=32768" # Ensure you include the `,`! `rw,nfsvers=4` is already included
+    nfs_version: "4.2" # NFS version to mount (`nfsvers=`). Use "4" only if the NFS server does not support 4.1+.
+    nfs_opts: ",async,noatime,rsize=32768,wsize=32768" # Ensure you include the `,`! `rw,nfsvers=<nfs_version>` is already included
     nfs_create_path: true # Create paths on backup server prior to mounting volume.
 
     # Required in order to create the data directly on the NFS Server,
