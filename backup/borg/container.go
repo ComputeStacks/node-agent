@@ -651,7 +651,7 @@ func (r *Repository) refreshStaleNFSVolume(ctx context.Context, cli *client.Clie
 
 	removeErr := cli.VolumeRemove(ctx, name, false)
 	if removeErr != nil && !errdefs.IsConflict(removeErr) && !client.IsErrNotFound(removeErr) {
-		borgLogger().Warn("Could not remove backup volume to re-create it", "volume", name, "error", removeErr.Error())
+		borgLogger().Debug("Could not remove backup volume to re-create it", "volume", name, "error", removeErr.Error())
 	}
 
 	var current *volumeTypes.Volume
