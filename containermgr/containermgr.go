@@ -177,6 +177,12 @@ func (c *Container) Start() bool {
 }
 
 func (c *Container) Exec(jobCommands []string) (exitCode int, response string, err error) {
+	return c.ExecEnv(jobCommands, nil)
+}
+
+// ExecEnv is Exec with extra environment variables (KEY=value) set for the command only.
+// Use it to hand a secret to a command without putting it on the command line.
+func (c *Container) ExecEnv(jobCommands []string, env []string) (exitCode int, response string, err error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.WithVersion(viper.GetString("docker.version")))
 	if err != nil {
@@ -207,6 +213,7 @@ func (c *Container) Exec(jobCommands []string) (exitCode int, response string, e
 
 	execConfig := container.ExecOptions{
 		Cmd:          jobCommands,
+		Env:          env,
 		Tty:          true,
 		AttachStderr: true,
 		AttachStdout: true,

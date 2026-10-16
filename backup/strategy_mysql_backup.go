@@ -11,6 +11,10 @@ import (
 	"github.com/spf13/viper"
 )
 
+// mysqlAccessDeniedExit is the exit code isMysqlReady's script uses for a rejected password.
+// It must be one bash never returns itself: 2 is a syntax error, 126/127 a missing command.
+const mysqlAccessDeniedExit = 42
+
 func preBackupMysql(vol *types.Volume, event *progress) bool {
 
 	// First, locate a running container
@@ -96,13 +100,15 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 		}
 	}
 
-	// A rejected password (ERROR 1045) exits 2 at once rather than retrying: it will not fix itself.
-	readyCmd = append(readyCmd, "counter=0; while ! out=$(", mysqlBinary, " -h", mysqlMaster.IPAddress, "-uroot", "-p"+mysqlMaster.Password, "-e \"STATUS;\"", "2>&1); do case \"$out\" in *\"ERROR 1045\"*) echo \"$out\"; exit 2;; esac; counter=$((counter+1)); if [ $counter == 11 ]; then echo \"$out\"; echo 'Failed to connect'; exit 1; fi; echo \"Connection attempt $counter\"; sleep 5; done;")
+	// The root password travels in MYSQL_PWD, never on the command line, so no shell quoting
+	// can mangle it and no error output can echo it. A rejected password (ERROR 1045) exits
+	// mysqlAccessDeniedExit at once rather than retrying: it will not fix itself.
+	readyCmd = append(readyCmd, "counter=0; while ! out=$(", mysqlBinary, "-h", mysqlMaster.IPAddress, "-uroot", "-e \"STATUS;\"", "2>&1); do case \"$out\" in *\"ERROR 1045\"*) echo \"$out\"; exit "+strconv.Itoa(mysqlAccessDeniedExit)+";; esac; counter=$((counter+1)); if [ $counter == 11 ]; then echo \"$out\"; echo 'Failed to connect'; exit 1; fi; echo \"Connection attempt $counter\"; sleep 5; done;")
 	readyCmd = append(readyCmd, "if [ -d "+mysqlMaster.DataPath+"/backups ]; then rm -rf "+mysqlMaster.DataPath+"/backups; fi") // Ensure the backups dir does not exist, otherwise backups will fail.
 
 	execCmd = append(execCmd, "bash", "-c", strings.Join(readyCmd, " "))
 
-	exitCode, out, err := backupContainer.Exec(execCmd)
+	exitCode, out, err := backupContainer.ExecEnv(execCmd, []string{"MYSQL_PWD=" + mysqlMaster.RootPassword})
 
 	if err != nil {
 		backupLogger().Warn("Failed to create backup container exec", "error", err.Error())
@@ -110,14 +116,14 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 		return false
 	}
 
-	if exitCode == 2 {
+	if exitCode == mysqlAccessDeniedExit {
 		backupLogger().Warn("MySQL rejected the root password", "service", mysqlMaster.ServiceID)
-		event.PostEventUpdate("agent-mysql-access-denied", withOutput("Backup failed: the database rejected the root password configured for this service. The root password was likely changed inside the database after it was created. Update the service's root password setting to match the database, or reset the database's root password to the configured one.", out))
+		event.PostEventUpdate("agent-mysql-access-denied", withOutput("Backup failed: the database rejected the root password configured for this service (MYSQL_ROOT_PASSWORD or MARIADB_ROOT_PASSWORD). If the root password was changed inside the database, update the service's setting to match.", out))
 		return false
 	}
 
 	if exitCode > 0 {
-		backupLogger().Warn("Failed to run isMysqlReady command", "exitCode", exitCode, "commands", strings.Join(readyCmd, " "))
+		backupLogger().Warn("Failed to run isMysqlReady command", "exitCode", exitCode)
 		event.PostEventUpdate("agent-b3dae7aba0783df4", withOutput("Failed to complete preBackupMysql Job. Halted during isMysqlReady.", out))
 		return false
 	}
@@ -165,7 +171,7 @@ func backupMysql(backupContainer *containermgr.Container, mysqlMaster *MysqlInst
 	}
 
 	if exitCode > 0 {
-		backupLogger().Warn("Failed to run backupMysql Job", "exitCode", exitCode, "commands", strings.Join(backupCmd, " "))
+		backupLogger().Warn("Failed to run backupMysql Job", "exitCode", exitCode)
 		event.PostEventUpdate("agent-40840727428848c7", withOutput("Failed to run preBackupMysql Job due to backupMysql error.", out))
 		return false
 	}

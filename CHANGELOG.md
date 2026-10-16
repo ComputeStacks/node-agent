@@ -29,9 +29,14 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
   volume is running: it fails immediately with
   `another restore is already in progress on this volume`.
 - [FIX] A MySQL/MariaDB backup whose root password is rejected by the database now fails
-  immediately with a message explaining that the configured root password no longer matches
-  the database, instead of retrying ten times and reporting `Failed to connect`. Other
-  connection failures still retry, and now include the client's last error.
+  immediately with a message saying so, instead of retrying ten times and reporting
+  `Failed to connect`. Other connection failures still retry, and now include the client's
+  last error.
+- [FIX] The MySQL/MariaDB backup connection check passes the root password to the client in
+  `MYSQL_PWD` instead of on a shell command line, so passwords containing spaces, quotes, `$`
+  or `=` work, and always uses the root password even when `MYSQL_USER`/`MYSQL_PASSWORD` are
+  also set. Database passwords are no longer written to the agent log when a MySQL backup
+  step fails.
 - [FIX] A backup of a volume marked for deletion is skipped instead of re-creating the
   volume's backup repository.
 - [CHANGE] A scheduled backup slot is skipped when a backup of that volume is already

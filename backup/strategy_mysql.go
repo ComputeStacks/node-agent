@@ -25,6 +25,7 @@ type MysqlInstance struct {
 	IPAddress    string
 	Username     string
 	Password     string
+	RootPassword string // From MYSQL_ROOT_PASSWORD / MARIADB_ROOT_PASSWORD only; unlike Password, never the app user's
 	Volume       types.Volume
 	Calico       string // Calico token to enable network access
 	ServiceID    string
@@ -72,11 +73,15 @@ func loadMysqlMaster(cli *client.Client, serviceID string, event *progress, allo
 	versionStage := ""
 
 	for _, c := range mysqlContainer.Config.Env {
-		keys := strings.Split(c, "=")
+		keys := strings.SplitN(c, "=", 2)
+		if len(keys) < 2 {
+			continue
+		}
 		switch keys[0] {
 		case "MYSQL_ROOT_PASSWORD":
 			instance.Username = "root"
 			instance.Password = keys[1]
+			instance.RootPassword = keys[1]
 		case "MYSQL_MAJOR":
 			versionStage = keys[1]
 			instance.Variant = "mysql"
@@ -102,6 +107,7 @@ func loadMysqlMaster(cli *client.Client, serviceID string, event *progress, allo
 		case "MARIADB_ROOT_PASSWORD": // Bitnami
 			instance.Username = "root"
 			instance.Password = keys[1]
+			instance.RootPassword = keys[1]
 		}
 	}
 
