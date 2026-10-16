@@ -6,6 +6,7 @@ import (
 	"cs-agent/types"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/client"
 	"github.com/spf13/viper"
@@ -14,6 +15,15 @@ import (
 // mysqlAccessDeniedExit is the exit code isMysqlReady's script uses for a rejected password.
 // It must be one bash never returns itself: 2 is a syntax error, 126/127 a missing command.
 const mysqlAccessDeniedExit = 42
+
+// mysqlClientBinary is the name of the mysql command-line client in the container that
+// runs the backup: MariaDB 11 dropped the `mysql` name.
+func mysqlClientBinary(mysqlMaster *MysqlInstance) string {
+	if mysqlMaster.Variant == "mariadb" && mysqlMaster.Version.Major > 10 {
+		return "mariadb"
+	}
+	return "mysql"
+}
 
 // mysqlReadyScript is the bash script isMysqlReady runs: wait up to ~50s for the server to
 // accept a root login (password from MYSQL_PWD), then clear any stale backups dir. A refused
@@ -102,13 +112,7 @@ func postBackupMysql(event *progress, repo *borg.Repository) bool {
 
 // Determine if MariaDB / MySQL is ready to perform a backup
 func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlInstance, event *progress) bool {
-	mysqlBinary := "mysql"
-
-	if mysqlMaster.Variant == "mariadb" {
-		if mysqlMaster.Version.Major > 10 {
-			mysqlBinary = "mariadb"
-		}
-	}
+	mysqlBinary := mysqlClientBinary(mysqlMaster)
 
 	// The root password travels in MYSQL_PWD, never on the command line, so no shell quoting
 	// can mangle it and no error output can echo it.
@@ -154,25 +158,32 @@ func backupMysql(backupContainer *containermgr.Container, mysqlMaster *MysqlInst
 		}
 	}
 
-	mariaLongTimeout := viper.GetString("mariadb.long_queries.timeout")
-	mariaLongType := viper.GetString("mariadb.long_queries.query_type")
-	mariaWaitQueryType := viper.GetString("mariadb.lock_wait.query_type")
-	mariaWaitTimeout := viper.GetString("mariadb.lock_wait.timeout")
-
 	backupCmd = append(backupCmd, backupBinary, "--backup", "--datadir="+mysqlMaster.DataPath, "--port=3306")
 	backupCmd = append(backupCmd, "--target-dir="+mysqlMaster.DataPath+"/backups")
 	backupCmd = append(backupCmd, "--user="+mysqlMaster.Username)
 	backupCmd = append(backupCmd, "--password="+mysqlMaster.Password)
 	backupCmd = append(backupCmd, "--host="+mysqlMaster.IPAddress)
 
+	// No --ftwrl-wait-* / --kill-long-* options: since MariaDB 10.11.8 mariadb-backup ignores
+	// all of them but --ftwrl-wait-timeout, which now waits for every running statement —
+	// SELECTs included — and fails the backup if any outlasts it. The server's own BACKUP
+	// STAGE locking never waits for a SELECT; watchBackupLock bounds the waits it does have.
+	stopWatch := func() *backupLockBlock { return nil }
 	if mysqlMaster.Variant == "mariadb" {
-		backupCmd = append(backupCmd, "--ftwrl-wait-query-type="+mariaWaitQueryType)
-		backupCmd = append(backupCmd, "--ftwrl-wait-timeout="+mariaWaitTimeout)
-		backupCmd = append(backupCmd, "--kill-long-query-type="+mariaLongType)
-		backupCmd = append(backupCmd, "--kill-long-queries-timeout="+mariaLongTimeout)
+		stopWatch = watchBackupLock(backupContainer, mysqlMaster, time.Duration(viper.GetInt("mariadb.lock_wait.timeout"))*time.Second)
 	}
 
 	exitCode, out, err := backupContainer.Exec(backupCmd)
+	if block := stopWatch(); block != nil {
+		msg := "Backup stopped: it waited " + strconv.Itoa(block.Waited) + " seconds for the database's backup lock, " +
+			"which is held while a write to a non-transactional (e.g. MyISAM) table is running. " +
+			"Converting such tables to InnoDB avoids this."
+		if block.Blocker != "" {
+			msg += "\nLongest-running query: " + block.Blocker
+		}
+		event.PostEventUpdate("agent-mysql-backup-lock-wait", withOutput(msg, out))
+		return false
+	}
 
 	if err != nil {
 		backupLogger().Warn("Failed to run backupMysql", "error", err.Error())

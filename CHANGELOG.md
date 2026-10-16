@@ -28,6 +28,23 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
   its volume finishes. The exception is a restore requested while another restore of that
   volume is running: it fails immediately with
   `another restore is already in progress on this volume`.
+- [FIX] MariaDB backups no longer fail with `Unable to obtain lock` when a long-running
+  SELECT is in progress. Since MariaDB 10.11.8, `mariadb-backup` ignores the
+  `--ftwrl-wait-query-type`, `--ftwrl-wait-threshold` and `--kill-long-queries-timeout`
+  options the agent passed, and `--ftwrl-wait-timeout` waits for every running statement,
+  SELECTs included. The agent no longer passes any of these options; MariaDB's backup locks
+  never wait for a SELECT or an InnoDB write.
+- [CHANGE] A MariaDB backup that waits longer than `mariadb.lock_wait.timeout` (default `60`
+  seconds, `0` disables) for its backup lock — which a long-running write to a MyISAM or other
+  non-transactional table holds up — is stopped, and the failure names the longest-running
+  query. Previously such a backup waited until the write finished, while other writes to
+  non-transactional tables queued behind it. `mariadb.lock_wait.query_type` and
+  `mariadb.long_queries.*` are no longer used.
+- [FIX] `agent.sample.yml` showed the `mariadb:` settings nested under `backups:`; the agent
+  reads them at the top level.
+- [CHANGE] Command output attached to a failed backup step is easier to read: a run of three or
+  more lines that differ only in their numbers (timestamps, counters, durations) is shortened
+  to its first and last line and a count of the lines left out.
 - [FIX] A MySQL/MariaDB backup whose root login is refused by the database now fails
   immediately with a message saying so, instead of retrying ten times and reporting
   `Failed to connect`. Other connection failures still retry, and now include the client's

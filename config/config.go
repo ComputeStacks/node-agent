@@ -164,10 +164,8 @@ func ConfigureApp() {
 	viper.SetDefault("backups.export.s3.max_ttl_sec", 86400)        // hard cap on a requested TTL (24h)
 
 	// MariaDB Backup Configuration
-	viper.SetDefault("mariadb.lock_wait.query_type", "ALL")
-	viper.SetDefault("mariadb.lock_wait.timeout", "60")
-	viper.SetDefault("mariadb.long_queries.timeout", "20")
-	viper.SetDefault("mariadb.long_queries.query_type", "SELECT")
+	// Seconds a mariadb-backup may wait for its backup lock before the agent stops it.
+	viper.SetDefault("mariadb.lock_wait.timeout", 60)
 
 }
 

@@ -92,13 +92,6 @@ backups:
   maintenance_catchup_skip_sec: 7200
 
   key: changeme! # This is the encryption key
-  mariadb:
-    long_queries: # Kill long queries to unblock backup
-      timeout: 20 # in seconds. Set to 0 to disable
-      query_type: SELECT # Possible values are: ALL, SELECT, UPDATE
-    lock_wait:
-      query_type: ALL # Possible values are: ALL, SELECT, UPDATE
-      timeout: 60 # In seconds, how long to wait while attempting to grab global lock.
   borg:
     compress: "zstd,3"
     image: "ghcr.io/computestacks/cs-docker-borg:1.5"
@@ -168,6 +161,9 @@ backups:
       sse: "AES256" # server-side encryption (the exported tar is unencrypted)
       default_ttl_sec: 43200 # presigned URL lifetime when the request doesn't specify (12h)
       max_ttl_sec: 86400 # hard cap on a requested TTL (24h)
+mariadb: # MariaDB backups (mariadb-backup)
+  lock_wait:
+    timeout: 60 # Seconds a backup may wait for its backup lock (held up by long writes to MyISAM tables) before it is stopped. 0 disables.
 docker:
   version: "1.41"
 queue:

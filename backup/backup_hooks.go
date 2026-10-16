@@ -5,6 +5,7 @@ import (
 	"cs-agent/containermgr"
 	"cs-agent/types"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -14,11 +15,42 @@ import (
 // result_json — the controller no longer receives a live csevent stream, so this
 // is where that detail must land.
 func withOutput(msg, out string) string {
-	out = strings.TrimSpace(out)
+	out = compactOutput(out)
 	if out == "" {
 		return msg
 	}
 	return msg + "\n" + out
+}
+
+// outputDigits masks the numbers in a line, so lines that differ only in a timestamp,
+// counter or duration ("Waiting for query 7 (duration 196 sec)") compare equal.
+var outputDigits = regexp.MustCompile(`[0-9]+`)
+
+// compactOutput makes command output readable in an event: a run of three or more
+// consecutive lines that differ only in their numbers is cut to its first and last
+// line around a count of the lines left out. mariadb-backup, for one, prints the same
+// "Waiting for query" line every second while it waits for a lock.
+func compactOutput(out string) string {
+	out = strings.TrimSpace(strings.ReplaceAll(out, "\r\n", "\n"))
+	if out == "" {
+		return ""
+	}
+	lines := strings.Split(out, "\n")
+	compacted := make([]string, 0, len(lines))
+	for i := 0; i < len(lines); {
+		key := outputDigits.ReplaceAllString(lines[i], "#")
+		j := i + 1
+		for j < len(lines) && outputDigits.ReplaceAllString(lines[j], "#") == key {
+			j++
+		}
+		if n := j - i; n >= 3 {
+			compacted = append(compacted, lines[i], fmt.Sprintf("... (%d similar lines omitted) ...", n-2), lines[j-1])
+		} else {
+			compacted = append(compacted, lines[i:j]...)
+		}
+		i = j
+	}
+	return strings.Join(compacted, "\n")
 }
 
 func preBackup(vol *types.Volume, event *progress) (preBackupSuccess bool) {
