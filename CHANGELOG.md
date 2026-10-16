@@ -2,9 +2,10 @@
 
 ## v3.5.0
 
-Minor release. **No migrations (`control.db` stays at schema `v4`), no API changes.** Two
+Minor release. **No migrations (`control.db` stays at schema `v4`), no API changes.** Four
 new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
-`backups.schedule_spread_max_sec`).
+`backups.schedule_spread_max_sec`, `backups.maintenance_catchup`,
+`backups.maintenance_catchup_skip_sec`).
 
 - [CHANGE] Scheduled backups are spread out: each project's backups start at a fixed offset
   after their cron time — up to a quarter of the backup interval, at most 2 hours
@@ -12,6 +13,12 @@ new `agent.yml` keys with defaults (`backups.borg.nfs_version`,
   volumes of one project on the same schedule share the offset, so their archives stay close
   together. Existing schedules move onto their offset automatically after the upgrade,
   without skipping or repeating a backup.
+- [CHANGE] Backups missed while the node was in maintenance mode are caught up: when
+  maintenance ends, each volume that missed a scheduled backup gets one catch-up backup,
+  started at the end of maintenance plus the project's spread offset. It is skipped when the
+  volume's next scheduled backup is due within `backups.maintenance_catchup_skip_sec`
+  (default `7200`) of the end of maintenance. `backups.maintenance_catchup: false` restores
+  the previous behavior (missed backups are skipped).
 - [CHANGE] A volume's first backup no longer logs a `Command failed` warning for its
   missing repository. The check that finds the repository missing now logs at DEBUG, and
   creating the new repository logs `Initialized new repository` at INFO. Every other

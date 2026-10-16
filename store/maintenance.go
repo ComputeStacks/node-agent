@@ -392,7 +392,17 @@ func cancelPendingRestoresTx(ctx context.Context, tx *sql.Tx, now int64) error {
 // instant (the backup spread offset) — so exiting maintenance does not snap
 // every schedule back onto the bare cron instant. A row whose cron no longer
 // parses is left as is.
+//
+// It also records the catch-ups (see catchup.go): a row qualifies when its
+// volume has a catch-up marker (a slot skipped during the pause, or an earlier
+// exit's catch-up not yet run) or its slot came due during the pause without
+// having been skipped yet. Each qualifying row gets a fresh {exit, phase, next}
+// marker; every other marker is removed.
 func advanceSchedulesTx(ctx context.Context, tx *sql.Tx, now int64) error {
+	marked, err := takeCatchupMarkersTx(ctx, tx)
+	if err != nil {
+		return err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT volume_name, cron_expr, next_fire_at FROM schedules`)
 	if err != nil {
 		return fmt.Errorf("store: list schedules: %w", err)
@@ -426,6 +436,11 @@ func advanceSchedulesTx(ctx context.Context, tx *sql.Tx, now int64) error {
 			`UPDATE schedules SET next_fire_at = ?, updated_at = ? WHERE volume_name = ?`,
 			next.Unix()+phase, now, sc.vol); err != nil {
 			return fmt.Errorf("store: advance schedule %q: %w", sc.vol, err)
+		}
+		if marked[sc.vol] || sc.next <= now {
+			if err := putCatchupTx(ctx, tx, sc.vol, now, phase, next.Unix()+phase); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -614,8 +629,9 @@ func sampleEmitAllowedTx(ctx context.Context, tx *sql.Tx, now time.Time) (bool, 
 }
 
 // SkipDueBackup records a backup slot skipped because the node is paused: in one
-// tx it advances the volume's next_fire_at and increments
-// maintenance.skipped_backups. It appends no changelog entry.
+// tx it advances the volume's next_fire_at, increments
+// maintenance.skipped_backups and marks the volume as having missed a slot (see
+// catchup.go). It appends no changelog entry.
 func (s *Store) SkipDueBackup(ctx context.Context, volumeName string, nextFireAt int64) error {
 	if volumeName == "" {
 		return errors.New("store: SkipDueBackup requires volume_name")
@@ -639,7 +655,7 @@ func skipDueBackupTx(ctx context.Context, tx *sql.Tx, volumeName string, nextFir
 	`, metaMaintSkipped); err != nil {
 		return fmt.Errorf("store: count skipped backup: %w", err)
 	}
-	return nil
+	return markCatchupMissedTx(ctx, tx, volumeName)
 }
 
 // RecordAdvertisedServe notes that a changelog page was served to a reader that

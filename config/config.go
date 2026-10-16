@@ -87,6 +87,10 @@ func ConfigureApp() {
 	// Scheduled backups fire at a fixed per-project offset after their cron time,
 	// up to a quarter of the interval and at most this many seconds; 0 disables.
 	viper.SetDefault("backups.schedule_spread_max_sec", 7200)
+	// One catch-up backup per volume that missed a slot during a maintenance
+	// window, unless its next slot is due within skip_sec of the exit.
+	viper.SetDefault("backups.maintenance_catchup", true)
+	viper.SetDefault("backups.maintenance_catchup_skip_sec", 7200)
 	viper.SetDefault("backups.key", "changeme!")
 
 	viper.SetDefault("backups.borg.image", "ghcr.io/computestacks/cs-docker-borg:latest")

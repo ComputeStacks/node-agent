@@ -38,6 +38,10 @@ type Scheduler struct {
 	reconcileCh chan struct{}
 	maint       []*maintJob
 	maintWg     sync.WaitGroup // tracks in-flight maintenance goroutines
+	// started is when Run began. Catch-ups after a maintenance exit that
+	// happened while the agent was down are spread from here instead of all
+	// firing at once.
+	started time.Time
 }
 
 // maintJob is a node-wide maintenance task on a cron schedule with skip-on-misfire
@@ -87,6 +91,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	// touches the store after main proceeds to store.Close() on shutdown.
 	defer s.maintWg.Wait()
 	now := time.Now()
+	s.started = now
 	for _, m := range s.maint {
 		if m.expr == "" {
 			backupLogger().Warn("Maintenance job has no cron; disabled", "job", m.name)
@@ -112,6 +117,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 			s.reconcile(ctx)
 		case <-ticker.C:
 			s.fireDue(ctx)
+			s.processCatchups(ctx)
 			s.runMaintenance(ctx)
 			s.reconcile(ctx) // periodic backstop
 		}
@@ -206,6 +212,82 @@ func (s *Scheduler) fireDue(ctx context.Context) {
 			continue
 		}
 		fired = true
+	}
+	if fired && s.dispatch != nil {
+		s.dispatch()
+	}
+}
+
+// processCatchups runs the catch-up backups recorded when maintenance ended
+// (see store/catchup.go): at most one per volume that missed a slot during the
+// window. A catch-up is due at the exit plus the schedule's spread offset, so
+// projects keep their spread; when the exit happened while the agent was down,
+// from the scheduler's start instead. The schedule row itself is never moved.
+// The decision and the task insert are one store transaction per volume, which
+// also drops the catch-up when the next regular slot covers it (see
+// store.ConsumeCatchup) and leaves it while the node is paused again.
+func (s *Scheduler) processCatchups(ctx context.Context) {
+	defer sentry.Recover()
+	pending, err := s.st.ListCatchups(ctx)
+	if err != nil {
+		backupLogger().Warn("Scheduler: list catch-up backups", "error", err.Error())
+		return
+	}
+	if len(pending) == 0 {
+		return
+	}
+	now := time.Now().Unix()
+	enabled := viper.GetBool("backups.maintenance_catchup")
+	threshold := viper.GetInt64("backups.maintenance_catchup_skip_sec")
+	if threshold < 0 {
+		threshold = 0
+	}
+	fired := false
+	for _, c := range pending {
+		anchor := c.Exit
+		if !s.started.IsZero() && s.started.Unix() > anchor {
+			anchor = s.started.Unix()
+		}
+		fireAt := anchor + c.Phase
+		if now < fireAt {
+			continue
+		}
+		var task *store.Task
+		if enabled {
+			v, found, err := s.st.GetVolume(ctx, c.Volume)
+			if err != nil {
+				backupLogger().Warn("Scheduler: load volume for catch-up backup", "volume", c.Volume, "error", err.Error())
+				continue
+			}
+			if found {
+				if vol, err := types.LoadVolume(v.Config); err == nil && vol.Backup && !vol.Trash {
+					task = &store.Task{
+						ID:        uuid.New().String(),
+						Name:      "volume.backup",
+						Node:      s.hostname,
+						Volume:    c.Volume,
+						ProjectID: strconv.Itoa(vol.ProjectID),
+						Archive:   "auto",
+					}
+				}
+			}
+		}
+		outcome, reason, err := s.st.ConsumeCatchup(ctx, c, fireAt, threshold, task)
+		if err != nil {
+			backupLogger().Warn("Scheduler: catch-up backup", "volume", c.Volume, "error", err.Error())
+			continue
+		}
+		switch outcome {
+		case store.CatchupFired:
+			fired = true
+			backupLogger().Info("Scheduler: catch-up backup after maintenance", "volume", c.Volume,
+				"exit", time.Unix(c.Exit, 0).UTC().Format(time.RFC3339),
+				"fire_at", time.Unix(fireAt, 0).UTC().Format(time.RFC3339))
+		case store.CatchupDropped:
+			backupLogger().Info("Scheduler: catch-up backup after maintenance not needed", "volume", c.Volume, "reason", reason)
+		default:
+			backupLogger().Debug("Scheduler: catch-up backup kept", "volume", c.Volume, "reason", reason)
+		}
 	}
 	if fired && s.dispatch != nil {
 		s.dispatch()

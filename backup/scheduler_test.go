@@ -385,3 +385,465 @@ func TestScheduler_FireDueUnalignedRowDoesNotRefire(t *testing.T) {
 			time.Unix(sc.NextFireAt, 0), time.Unix(want, 0), base.Add(off))
 	}
 }
+
+// --- Catch-up backups after maintenance ---------------------------------------
+
+// setCatchup sets the maintenance catch-up config for one test (package tests
+// see no config defaults).
+func setCatchup(t *testing.T, enabled bool, skipSec int) {
+	t.Helper()
+	prevOn, prevSkip := viper.Get("backups.maintenance_catchup"), viper.Get("backups.maintenance_catchup_skip_sec")
+	viper.Set("backups.maintenance_catchup", enabled)
+	viper.Set("backups.maintenance_catchup_skip_sec", skipSec)
+	t.Cleanup(func() {
+		viper.Set("backups.maintenance_catchup", prevOn)
+		viper.Set("backups.maintenance_catchup_skip_sec", prevSkip)
+	})
+}
+
+// projectWithOffset finds a project id whose offset for freq (2h cap) is above min.
+func projectWithOffset(t *testing.T, freq string, min time.Duration) (int, time.Duration) {
+	t.Helper()
+	for id := 1; id < 1000; id++ {
+		if o := store.ScheduleOffset(freq, store.OffsetKey(id, ""), 2*time.Hour); o > min {
+			return id, o
+		}
+	}
+	t.Fatalf("no project id with an offset above %v for %q", min, freq)
+	return 0, 0
+}
+
+func pause(t *testing.T, st *store.Store) {
+	t.Helper()
+	if _, _, err := st.PutLocalHold(context.Background(), "test", "root"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func unpause(t *testing.T, st *store.Store) {
+	t.Helper()
+	if _, err := st.ClearLocalHold(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type testMarker struct {
+	Missed bool  `json:"missed"`
+	Exit   int64 `json:"exit"`
+	Phase  int64 `json:"phase"`
+	Next   int64 `json:"next"`
+}
+
+// marker returns vol's stored catch-up marker.
+func marker(t *testing.T, st *store.Store, vol string) (testMarker, bool) {
+	t.Helper()
+	v, found, err := st.GetMeta(context.Background(), "catchup."+vol)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		return testMarker{}, false
+	}
+	var m testMarker
+	if err := json.Unmarshal([]byte(v), &m); err != nil {
+		t.Fatalf("marker %q: %v", v, err)
+	}
+	return m, true
+}
+
+// backdateExit moves vol's recorded exit sec seconds into the past, standing in
+// for the time that passes after maintenance ends.
+func backdateExit(t *testing.T, st *store.Store, vol string, sec int64) {
+	t.Helper()
+	m, ok := marker(t, st, vol)
+	if !ok || m.Exit == 0 {
+		t.Fatalf("%s: no exit marker", vol)
+	}
+	m.Exit -= sec
+	b, _ := json.Marshal(map[string]int64{"exit": m.Exit, "phase": m.Phase, "next": m.Next})
+	if err := st.SetMeta(context.Background(), "catchup."+vol, string(b)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func pendingBackups(t *testing.T, st *store.Store, vol string) int {
+	t.Helper()
+	pending, err := st.ListPendingTasks(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, p := range pending {
+		if p.Name == "volume.backup" && p.Volume == vol {
+			n++
+		}
+	}
+	return n
+}
+
+// dailyMissed sets up a daily volume whose shifted slot came due 3h ago minus its
+// offset, pauses, lets the paused tick skip it, and exits maintenance. It returns
+// the offset.
+func dailyMissed(t *testing.T, st *store.Store, s *Scheduler, vol string, project int) time.Duration {
+	t.Helper()
+	base := time.Now().Truncate(time.Minute).Add(-3 * time.Hour)
+	freq := fmt.Sprintf("%d %d * * *", base.Minute(), base.Hour())
+	off := store.ScheduleOffset(freq, store.OffsetKey(project, ""), 2*time.Hour)
+	putVol(t, st, types.Volume{Name: vol, Node: "test-node", Backup: true, Freq: freq, ProjectID: project})
+	if err := st.PutSchedule(context.Background(), vol, freq, base.Add(off).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pause(t, st)
+	s.fireDue(context.Background())
+	if n := pendingBackups(t, st, vol); n != 0 {
+		t.Fatalf("%s: backup fired while paused", vol)
+	}
+	unpause(t, st)
+	return off
+}
+
+// A daily slot missed during maintenance gets one catch-up at exit + offset;
+// the schedule row is not moved, so its next regular slot still fires once.
+func TestScheduler_CatchupDailyMissed(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	setCatchup(t, true, 7200)
+	project, _ := projectWithOffset(t, "0 3 * * *", 5*time.Minute)
+
+	off := dailyMissed(t, st, s, "v1", project)
+	m, ok := marker(t, st, "v1")
+	if !ok || m.Exit == 0 || m.Phase != int64(off/time.Second) {
+		t.Fatalf("marker = %+v (ok=%v), want phase %v", m, ok, off)
+	}
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	if m.Next != sc.NextFireAt {
+		t.Fatalf("marker next %d != schedule next %d", m.Next, sc.NextFireAt)
+	}
+
+	// Not yet: the catch-up waits for exit + offset.
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 0 {
+		t.Fatalf("catch-up fired at the exit, before its offset (%d tasks)", n)
+	}
+	backdateExit(t, st, "v1", int64(off/time.Second))
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up tasks = %d, want 1", n)
+	}
+	if _, ok := marker(t, st, "v1"); ok {
+		t.Fatal("marker left after the catch-up fired")
+	}
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up fired twice (%d tasks)", n)
+	}
+	if after, _, _ := st.GetSchedule(ctx, "v1"); after.NextFireAt != sc.NextFireAt {
+		t.Fatalf("schedule moved by the catch-up: %d -> %d", sc.NextFireAt, after.NextFireAt)
+	}
+	// Exactly the next regular slot after the exit, which then fires normally.
+	if want := sc.NextFireAt; store.SchedulePhase(sc.CronExpr, want) != int64(off/time.Second) || want <= time.Now().Unix() {
+		t.Fatalf("next regular slot %d is off its grid or in the past", want)
+	}
+}
+
+// A slot due just before the pause, skipped by the paused tick, is caught up
+// (spreading off: the catch-up is due at the exit itself).
+func TestScheduler_CatchupSlotDueBeforePause(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 0)
+	setCatchup(t, true, 7200)
+	base := time.Now().Truncate(time.Minute).Add(-time.Minute)
+	freq := fmt.Sprintf("%d %d * * *", base.Minute(), base.Hour())
+	putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: 7})
+	if err := st.PutSchedule(ctx, "v1", freq, base.Unix()); err != nil {
+		t.Fatal(err)
+	}
+	pause(t, st)
+	s.fireDue(ctx)
+	unpause(t, st)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up tasks = %d, want 1", n)
+	}
+}
+
+// hourlyMissed: a volume whose slot after now-lookback was skipped while paused;
+// the exit is backdated past the offset so the catch-up is due.
+func hourlyMissed(t *testing.T, st *store.Store, s *Scheduler, freq string, project int, lookback time.Duration) {
+	t.Helper()
+	vol := types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: project}
+	off := spreadOffset(freq, vol)
+	putVol(t, st, vol)
+	slot := store.NextFireOffset(freq, off, time.Now().Add(-lookback)).Unix()
+	if err := st.PutSchedule(context.Background(), "v1", freq, slot); err != nil {
+		t.Fatal(err)
+	}
+	pause(t, st)
+	s.fireDue(context.Background())
+	unpause(t, st)
+	backdateExit(t, st, "v1", int64(off/time.Second)+1)
+}
+
+// Hourly: the next slot is within 2h of the exit, so no catch-up.
+func TestScheduler_CatchupHourlySkipped(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	setCatchup(t, true, 7200)
+	hourlyMissed(t, st, s, "0 * * * *", 7, 2*time.Hour)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 0 {
+		t.Fatalf("hourly catch-up fired (%d tasks)", n)
+	}
+	if _, ok := marker(t, st, "v1"); ok {
+		t.Fatal("marker left after the catch-up was dropped")
+	}
+}
+
+// Threshold 0 catches up even when the next slot is near.
+func TestScheduler_CatchupThresholdZero(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 0)
+	setCatchup(t, true, 0)
+	hourlyMissed(t, st, s, "0 * * * *", 7, 2*time.Hour)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up tasks = %d, want 1", n)
+	}
+}
+
+// A 3-hourly schedule whose next slot is 2.5h away is caught up.
+func TestScheduler_CatchupThreeHourly(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 600) // offset < 10m, so the next slot stays > 2h after the exit
+	setCatchup(t, true, 7200)
+	last := time.Now().Truncate(time.Minute).Add(-30 * time.Minute)
+	hours := ""
+	for k := 0; k < 8; k++ {
+		if k > 0 {
+			hours += ","
+		}
+		hours += strconv.Itoa((last.Hour() + 3*k) % 24)
+	}
+	freq := fmt.Sprintf("%d %s * * *", last.Minute(), hours)
+	hourlyMissed(t, st, s, freq, 7, 4*time.Hour)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up tasks = %d, want 1", n)
+	}
+}
+
+// With a small threshold, a catch-up whose time falls after the next regular
+// slot is dropped: exit shortly after a cron instant, before its offset. By the
+// time the catch-up is due the regular slot is due too; whether or not it has
+// fired yet, no extra backup is created.
+func TestScheduler_CatchupRegularSlotFirst(t *testing.T) {
+	for _, fireFirst := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fireDue first=%v", fireFirst), func(t *testing.T) {
+			ctx := context.Background()
+			st := testStore(t)
+			s := newTestScheduler(t, st)
+			setSpreadCap(t, 7200)
+			setCatchup(t, true, 60)
+			last := time.Now().Truncate(time.Minute).Add(-time.Minute)
+			freq := fmt.Sprintf("%d * * * *", last.Minute())
+			project, off := projectWithOffset(t, freq, 5*time.Minute)
+			putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: freq, ProjectID: project})
+			// The previous hour's slot, missed during the pause.
+			if err := st.PutSchedule(ctx, "v1", freq, last.Add(-time.Hour).Add(off).Unix()); err != nil {
+				t.Fatal(err)
+			}
+			pause(t, st)
+			s.fireDue(ctx)
+			unpause(t, st)
+			m, _ := marker(t, st, "v1")
+			if m.Next != last.Add(off).Unix() {
+				t.Fatalf("next = %d, want this hour's slot %d", m.Next, last.Add(off).Unix())
+			}
+			// Let time pass until the catch-up is due: shift the exit and the row
+			// back by the same amount.
+			delta := m.Exit + m.Phase - time.Now().Unix()
+			if moved, err := st.MoveScheduleFire(ctx, "v1", m.Next, m.Next-delta); err != nil || !moved {
+				t.Fatalf("shift row: %v %v", moved, err)
+			}
+			if err := st.SetMeta(ctx, "catchup.v1", fmt.Sprintf(`{"exit":%d,"phase":%d,"next":%d}`,
+				m.Exit-delta, m.Phase, m.Next-delta)); err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			if fireFirst {
+				s.fireDue(ctx)
+				want = 1
+			}
+			s.processCatchups(ctx)
+			if n := pendingBackups(t, st, "v1"); n != want {
+				t.Fatalf("backups pending = %d, want %d", n, want)
+			}
+			if _, ok := marker(t, st, "v1"); ok {
+				t.Fatal("marker left")
+			}
+		})
+	}
+}
+
+// A volume created during maintenance never missed a slot: no catch-up.
+func TestScheduler_CatchupNewVolumeDuringMaintenance(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setCatchup(t, true, 7200)
+	pause(t, st)
+	putVol(t, st, types.Volume{Name: "v1", Node: "test-node", Backup: true, Freq: "0 3 * * *", ProjectID: 7})
+	s.reconcile(ctx)
+	s.fireDue(ctx)
+	unpause(t, st)
+	if _, ok := marker(t, st, "v1"); ok {
+		t.Fatal("catch-up recorded for a volume that missed nothing")
+	}
+}
+
+// Disabled: the catch-up is dropped, nothing fires, the row is not moved.
+func TestScheduler_CatchupDisabled(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 0)
+	setCatchup(t, false, 7200)
+	dailyMissed(t, st, s, "v1", 7)
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 0 {
+		t.Fatalf("catch-up fired while disabled (%d tasks)", n)
+	}
+	if _, ok := marker(t, st, "v1"); ok {
+		t.Fatal("marker left while disabled")
+	}
+	if after, _, _ := st.GetSchedule(ctx, "v1"); after.NextFireAt != sc.NextFireAt {
+		t.Fatal("schedule moved while disabled")
+	}
+}
+
+// A volume trashed or with backups turned off after the exit gets no catch-up.
+func TestScheduler_CatchupVolumeNoLongerBackedUp(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 0)
+	setCatchup(t, true, 7200)
+	dailyMissed(t, st, s, "trashed", 7)
+	dailyMissed(t, st, s, "off", 8)
+	putVol(t, st, types.Volume{Name: "trashed", Node: "test-node", Backup: true, Trash: true, ProjectID: 7})
+	putVol(t, st, types.Volume{Name: "off", Node: "test-node", Backup: false, ProjectID: 8})
+	s.processCatchups(ctx)
+	for _, vol := range []string{"trashed", "off"} {
+		if n := pendingBackups(t, st, vol); n != 0 {
+			t.Fatalf("%s: catch-up fired (%d tasks)", vol, n)
+		}
+		if _, ok := marker(t, st, vol); ok {
+			t.Fatalf("%s: marker left", vol)
+		}
+	}
+}
+
+// Paused again before the catch-up runs: it is kept, and the next exit rewrites
+// it to that exit, so it fires at exit2 + offset — not at once — and only once.
+// A later window that misses a slot while the catch-up is still pending adds no
+// second task.
+func TestScheduler_CatchupRepeatedPause(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	setCatchup(t, true, 7200)
+	project, _ := projectWithOffset(t, "0 3 * * *", 5*time.Minute)
+	off := dailyMissed(t, st, s, "v1", project)
+	backdateExit(t, st, "v1", 86400) // exit1 + offset is long past
+
+	pause(t, st)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 0 {
+		t.Fatal("catch-up fired while paused")
+	}
+	if _, ok := marker(t, st, "v1"); !ok {
+		t.Fatal("catch-up dropped while paused")
+	}
+	before := time.Now().Unix()
+	unpause(t, st)
+	if m, _ := marker(t, st, "v1"); m.Exit < before {
+		t.Fatalf("exit not rewritten: %d < %d", m.Exit, before)
+	}
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 0 {
+		t.Fatal("catch-up fired at exit2 instead of exit2 + offset")
+	}
+	backdateExit(t, st, "v1", int64(off/time.Second))
+	s.processCatchups(ctx)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("catch-up tasks = %d, want 1", n)
+	}
+
+	// Another window misses a slot while that backup is still pending.
+	sc, _, _ := st.GetSchedule(ctx, "v1")
+	if _, err := st.MoveScheduleFire(ctx, "v1", sc.NextFireAt, sc.NextFireAt-86400); err != nil {
+		t.Fatal(err)
+	}
+	pause(t, st)
+	s.fireDue(ctx)
+	unpause(t, st)
+	backdateExit(t, st, "v1", int64(off/time.Second))
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "v1"); n != 1 {
+		t.Fatalf("backups pending = %d, want 1 (no second catch-up)", n)
+	}
+}
+
+// An exit while the agent was down: catch-ups spread from the scheduler's start
+// instead of all firing at boot.
+func TestScheduler_CatchupSpreadFromStart(t *testing.T) {
+	ctx := context.Background()
+	st := testStore(t)
+	s := newTestScheduler(t, st)
+	setSpreadCap(t, 7200)
+	setCatchup(t, true, 7200)
+	// Two projects with clearly different daily offsets.
+	freq := "0 3 * * *"
+	pa, offA := projectWithOffset(t, freq, 0)
+	pb, offB := 0, time.Duration(0)
+	for id := pa + 1; id < 1000; id++ {
+		if o := store.ScheduleOffset(freq, store.OffsetKey(id, ""), 2*time.Hour); o > offA+10*time.Minute {
+			pb, offB = id, o
+			break
+		}
+	}
+	if pb == 0 {
+		t.Fatal("no second project with a larger offset")
+	}
+	dailyMissed(t, st, s, "a", pa)
+	dailyMissed(t, st, s, "b", pb)
+	// Both exits were 10h ago; the daemon started just over offA ago.
+	ma, _ := marker(t, st, "a")
+	mb, _ := marker(t, st, "b")
+	backdateExit(t, st, "a", 10*3600)
+	backdateExit(t, st, "b", 10*3600)
+	if ma.Phase != int64(offA/time.Second) || mb.Phase != int64(offB/time.Second) {
+		t.Fatalf("phases %d/%d, want %v/%v", ma.Phase, mb.Phase, offA, offB)
+	}
+	s.started = time.Now().Add(-offA - time.Second)
+	s.processCatchups(ctx)
+	if n := pendingBackups(t, st, "a"); n != 1 {
+		t.Fatalf("a: catch-up tasks = %d, want 1", n)
+	}
+	if n := pendingBackups(t, st, "b"); n != 0 {
+		t.Fatal("b: catch-up fired at boot instead of start + its offset")
+	}
+}

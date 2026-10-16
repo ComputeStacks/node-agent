@@ -353,13 +353,11 @@ func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) 
 		if paused {
 			return skipDueBackupTx(ctx, tx, task.Volume, nextFireAt, now)
 		}
-		var waiting int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT count(*) FROM tasks WHERE name = 'volume.backup' AND status = ? AND volume = ?`,
-			TaskPending, task.Volume).Scan(&waiting); err != nil {
-			return fmt.Errorf("store: check pending backup %q: %w", task.Volume, err)
+		waiting, err := pendingBackupTx(ctx, tx, task.Volume)
+		if err != nil {
+			return err
 		}
-		if waiting == 0 {
+		if !waiting {
 			created, err = insertTaskTx(ctx, tx, task, snapshot)
 			if err != nil {
 				return err
@@ -376,4 +374,15 @@ func (s *Store) FireDueBackup(ctx context.Context, task Task, nextFireAt int64) 
 		return false, err
 	}
 	return created, nil
+}
+
+// pendingBackupTx reports whether a volume.backup for volumeName is pending.
+func pendingBackupTx(ctx context.Context, tx *sql.Tx, volumeName string) (bool, error) {
+	var waiting int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM tasks WHERE name = 'volume.backup' AND status = ? AND volume = ?`,
+		TaskPending, volumeName).Scan(&waiting); err != nil {
+		return false, fmt.Errorf("store: check pending backup %q: %w", volumeName, err)
+	}
+	return waiting > 0, nil
 }

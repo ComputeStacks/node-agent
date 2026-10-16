@@ -82,6 +82,14 @@ backups:
   # cron time.
   schedule_spread_max_sec: 7200
 
+  # When maintenance mode ends, each volume that missed a scheduled backup during
+  # it gets one catch-up backup, started at the end of maintenance plus the
+  # project's spread offset. It is skipped when the volume's next scheduled backup
+  # is due within maintenance_catchup_skip_sec of the end of maintenance (0 =
+  # always catch up). false = missed backups are skipped.
+  maintenance_catchup: true
+  maintenance_catchup_skip_sec: 7200
+
   key: changeme! # This is the encryption key
   mariadb:
     long_queries: # Kill long queries to unblock backup
