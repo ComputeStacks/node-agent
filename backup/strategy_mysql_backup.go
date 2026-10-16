@@ -96,7 +96,8 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 		}
 	}
 
-	readyCmd = append(readyCmd, "counter=0; while ! ", mysqlBinary, " -h", mysqlMaster.IPAddress, "-uroot", "-p"+mysqlMaster.Password, "-e \"STATUS;\"", "&>/dev/null; do counter=$((counter+1)); if [ $counter == 11 ]; then echo 'Failed to connect'; exit 1; fi; echo \"Connection attempt $counter\"; sleep 5; done;")
+	// A rejected password (ERROR 1045) exits 2 at once rather than retrying: it will not fix itself.
+	readyCmd = append(readyCmd, "counter=0; while ! out=$(", mysqlBinary, " -h", mysqlMaster.IPAddress, "-uroot", "-p"+mysqlMaster.Password, "-e \"STATUS;\"", "2>&1); do case \"$out\" in *\"ERROR 1045\"*) echo \"$out\"; exit 2;; esac; counter=$((counter+1)); if [ $counter == 11 ]; then echo \"$out\"; echo 'Failed to connect'; exit 1; fi; echo \"Connection attempt $counter\"; sleep 5; done;")
 	readyCmd = append(readyCmd, "if [ -d "+mysqlMaster.DataPath+"/backups ]; then rm -rf "+mysqlMaster.DataPath+"/backups; fi") // Ensure the backups dir does not exist, otherwise backups will fail.
 
 	execCmd = append(execCmd, "bash", "-c", strings.Join(readyCmd, " "))
@@ -106,6 +107,12 @@ func isMysqlReady(backupContainer *containermgr.Container, mysqlMaster *MysqlIns
 	if err != nil {
 		backupLogger().Warn("Failed to create backup container exec", "error", err.Error())
 		event.PostEventUpdate("agent-a3171394f4f28d20", withOutput("Failed run isMysqlReady check command: "+err.Error(), out))
+		return false
+	}
+
+	if exitCode == 2 {
+		backupLogger().Warn("MySQL rejected the root password", "service", mysqlMaster.ServiceID)
+		event.PostEventUpdate("agent-mysql-access-denied", withOutput("Backup failed: the database rejected the root password configured for this service. The root password was likely changed inside the database after it was created. Update the service's root password setting to match the database, or reset the database's root password to the configured one.", out))
 		return false
 	}
 
