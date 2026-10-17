@@ -3,13 +3,14 @@ package borg
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"cs-agent/containermgr"
 	"cs-agent/sshremote"
 	"cs-agent/types"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -184,9 +185,7 @@ func isTransientMountFailure(err error) bool {
 //
 // The name is generated per attempt, so two attempts cannot collide on it.
 func (r *Repository) createAndStartContainer(ctx context.Context, cli *client.Client, target *types.Volume) (string, error) {
-	t := time.Now()
-	randNumber := 10 + rand.Intn(1000-10)
-	containerName := "backup-" + strconv.Itoa(randNumber) + t.Format("150405")
+	containerName := NewContainerName()
 
 	labels, borgEnv, mounts := r.containerSpec(target)
 
@@ -221,6 +220,19 @@ func (r *Repository) createAndStartContainer(ctx context.Context, cli *client.Cl
 	}
 
 	return resp.ID, nil
+}
+
+// NewContainerName returns a fresh name for a backup container.
+//
+// Backups are scheduled together, so many start in the same second; the name therefore
+// carries enough randomness that two concurrent backups cannot realistically collide on it.
+func NewContainerName() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		// crypto/rand failure is effectively impossible; fall back to a timestamp.
+		return "backup-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	}
+	return "backup-" + hex.EncodeToString(b)
 }
 
 // drainImagePull consumes an image pull to completion and reports the failure it carried.
@@ -260,8 +272,8 @@ func drainImagePull(body io.ReadCloser) error {
 
 // containerSpec is the decided-by-configuration part of InitBackupContainer: the labels,
 // the borg environment and the mounts. No docker client, no image pull, and deliberately
-// not the random container name — that reads time.Now() and rand, which would make the
-// result unrepeatable and is the one piece of InitBackupContainer that has to stay there.
+// not the random container name — that would make the result unrepeatable and is the one
+// piece of InitBackupContainer that has to stay there.
 //
 // It is a METHOD taking only the target, so the repository owner cannot be handed to it
 // wrongly — there is no argument to get wrong, the same reason InitBackupContainer stopped

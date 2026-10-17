@@ -2,12 +2,11 @@ package backup
 
 import (
 	"context"
+	"cs-agent/backup/borg"
 	"cs-agent/containermgr"
 	"cs-agent/types"
 	"errors"
 	"github.com/coreos/go-semver/semver"
-	"math/rand"
-	"strconv"
 	"strings"
 	"time"
 
@@ -234,8 +233,6 @@ func buildBackupAgent(cli *client.Client, mysqlMaster *MysqlInstance) (*containe
 
 	backupLogger().Debug("Master Params", "calico", mysqlMaster.Calico, "deployment", mysqlMaster.DeploymentID, "service", mysqlMaster.ServiceID)
 
-	t := time.Now()
-
 	if mysqlMaster.Volume.IsEmpty() {
 		backupLogger().Debug("MySQL Master volume is nil")
 		return nil, errors.New("database master has no volume to mount")
@@ -244,9 +241,7 @@ func buildBackupAgent(cli *client.Client, mysqlMaster *MysqlInstance) (*containe
 
 	env := []string{"MYSQL_HOST=" + mysqlMaster.IPAddress, "MYSQL_PASSWORD=" + mysqlMaster.Password} // Used by init script to ensure MySQL is available before attempting a backup
 
-	rand.New(rand.NewSource(time.Now().UnixNano())) // Seed for random container name
-	randNumber := 10 + rand.Intn(1000-10)
-	containerName := "backup-" + strconv.Itoa(randNumber) + string(t.Format("150405"))
+	containerName := borg.NewContainerName()
 
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image:  mysqlMaster.BackupImage,
