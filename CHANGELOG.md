@@ -1,5 +1,14 @@
 # Changelog
 
+## v3.5.1
+
+Patch release for v3.5.0. **No migrations (`control.db` stays at schema `v4`), no config
+changes, no API changes.**
+
+- [FIX] Backups that start in the same second no longer fail with `Conflict. The container
+  name "/backup-..." is already in use`. Backup container names now carry 16 random hex
+  characters instead of a three-digit random number and the time of day.
+
 ## v3.5.0
 
 Minor release. **No migrations (`control.db` stays at schema `v4`), no API changes.** Four
