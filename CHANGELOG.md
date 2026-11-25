@@ -1,5 +1,22 @@
 # Changelog
 
+## v3.8.0
+
+Minor release. **No migrations (`control.db` stays at schema `v4`).** New, optional config under
+`store.backup`; nothing changes unless you enable it.
+
+- [FEATURE] Off-node backup of the embedded SQLite databases. When `store.backup.enabled` is
+  set, the agent snapshots `control.db` and every project database on a schedule
+  (`store.backup.freq`), encrypts each snapshot to your age recipients and uploads it to
+  S3-compatible storage. Unchanged databases are skipped, recent snapshots are kept in full
+  and older ones are thinned to daily and then expired (`keep_all_hours`, `retention_days`).
+  Unset `store.backup.s3.*` keys fall back to `backups.export.s3.*`. **Off by default.**
+- [FEATURE] `cs-agent store-restore` restores the node, `control.db` alone, or a single project
+  from those backups, using an age identity that never needs to live on the node. Existing
+  databases are moved aside to `<data_dir>/pre-restore-<timestamp>/`.
+- [FEATURE] `GET /v1/admin/store-backup` (admin token) reports the last success, last error and
+  upload counts; it returns `{"enabled": false}` when backups are off.
+
 ## v3.7.0
 
 Minor release. **No migrations (`control.db` stays at schema `v4`), no config or API changes.**

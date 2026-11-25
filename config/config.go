@@ -163,6 +163,18 @@ func ConfigureApp() {
 	viper.SetDefault("backups.export.s3.default_ttl_sec", 43200)    // presigned URL TTL when unspecified (12h)
 	viper.SetDefault("backups.export.s3.max_ttl_sec", 86400)        // hard cap on a requested TTL (24h)
 
+	// Off-node SQLite backup. Deliberately NO defaults for the other
+	// store.backup.s3.* keys (endpoint, region, bucket, credentials, ...): an
+	// unset key falls back to backups.export.s3.* via viper.IsSet, and a
+	// default would make every key look set.
+	viper.SetDefault("store.backup.enabled", false)
+	viper.SetDefault("store.backup.freq", "*/15 * * * *")
+	viper.SetDefault("store.backup.recipients", []string{})
+	viper.SetDefault("store.backup.node_name", "")
+	viper.SetDefault("store.backup.keep_all_hours", 48)
+	viper.SetDefault("store.backup.retention_days", 30)
+	viper.SetDefault("store.backup.s3.prefix", "sqlite/")
+
 	// MariaDB Backup Configuration
 	// Seconds a mariadb-backup may wait for its backup lock before the agent stops it
 	// (MariaDB < 10.4: mariabackup's --ftwrl-wait-timeout).

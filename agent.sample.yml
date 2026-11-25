@@ -12,6 +12,29 @@ store:
   # Embedded SQLite data plane: control.db (node tenant/auth map) plus one
   # metadata DB per project live under this directory.
   data_dir: /var/lib/cs-agent
+  # Off-node backup of control.db and every project DB: encrypted snapshots are
+  # uploaded to S3-compatible storage on a schedule. Off by default.
+  backup:
+    enabled: false
+    freq: "*/15 * * * *" # cron schedule for a backup pass
+    # age public keys (age1...) the snapshots are encrypted to; REQUIRED when
+    # enabled. Keep the matching private identity OFF this node: it is only
+    # needed on the machine where you run `cs-agent store-restore --identity`.
+    recipients: []
+    node_name: "" # name used in object keys; empty = this host's name
+    keep_all_hours: 48 # keep every snapshot this recent
+    retention_days: 30 # thinned to one per day until this age, then deleted
+    # Any s3 key left unset here falls back to the same key under
+    # backups.export.s3 (except prefix, which never falls back). The credentials
+    # need Put, Get, List and Delete on the prefix.
+    s3:
+      # endpoint: ""        # empty = AWS; otherwise an https:// URL
+      # region: ""
+      # bucket: ""          # REQUIRED (here or under backups.export.s3)
+      # access_key: ""
+      # secret_key: ""
+      # force_path_style: false
+      prefix: "sqlite/"
 metadata:
   # Customer-metadata HTTP front door. The port MUST stay 8500 — it
   # is baked into customer containers via metadata.internal:8500. The provisioner

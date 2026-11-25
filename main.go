@@ -4,6 +4,7 @@ import (
 	"context"
 	"cs-agent/backup"
 	"cs-agent/config"
+	"cs-agent/dbbackup"
 	"cs-agent/firewall"
 	"cs-agent/httpapi"
 	"cs-agent/job"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -139,6 +141,9 @@ func main() {
 		scheduler = backup.NewScheduler(st, dispatcher.Signal)
 	}
 
+	// Off-node SQLite backups. Any setup error leaves them off; never fatal.
+	storeBackup := buildStoreBackup(st)
+
 	// Customer-metadata + admin HTTP front door. Reconcile hooks wake the
 	// in-process consumers after a controller DOWN write (all non-blocking).
 	srv := httpapi.New(httpapi.Config{
@@ -147,6 +152,7 @@ func main() {
 		MaxBodyBytes:      viper.GetInt64("metadata.max_body_bytes"),
 		OnTaskCreated:     dispatcher.Signal,
 		OnFirewallChanged: fwReconciler.Signal,
+		StoreBackup:       storeBackup.status(),
 		OnVolumesChanged: func() {
 			if scheduler != nil {
 				scheduler.ReconcileSignal()
@@ -172,6 +178,10 @@ func main() {
 	if scheduler != nil {
 		wg.Add(1)
 		go func() { defer wg.Done(); scheduler.Run(ctx) }()
+	}
+	if storeBackup.runner != nil {
+		wg.Add(1)
+		go func() { defer wg.Done(); storeBackup.runner.Run(ctx) }()
 	}
 	staleHold := time.Duration(viper.GetInt("maintenance.stale_hold_hours")) * time.Hour
 	wg.Add(1)
@@ -296,4 +306,63 @@ func configureSentry(v string) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+// storeBackupHandle holds the backup runner, which is nil when backups are off.
+type storeBackupHandle struct{ runner *dbbackup.Runner }
+
+// status returns the runner as the HTTP status source, or a true nil interface
+// when backups are off (a nil *Runner in an interface would not compare nil).
+func (h storeBackupHandle) status() httpapi.StoreBackupStatus {
+	if h.runner == nil {
+		return nil
+	}
+	return h.runner
+}
+
+// buildStoreBackup builds the off-node backup runner when store.backup.enabled.
+// Misconfiguration is logged and reported, and the agent carries on with
+// backups off.
+func buildStoreBackup(st *store.Store) storeBackupHandle {
+	if !viper.GetBool("store.backup.enabled") {
+		return storeBackupHandle{}
+	}
+	fail := func(err error) storeBackupHandle {
+		log.New().Error("Off-node SQLite backup disabled", "error", err.Error())
+		sentry.CaptureException(err)
+		return storeBackupHandle{}
+	}
+	cfg, err := dbbackup.ConfigFromViper()
+	if err != nil {
+		return fail(err)
+	}
+	cfg.IsProjectGone = func(err error) bool { return errors.Is(err, store.ErrProjectNotFound) }
+	s3cfg := s3upload.ConfigFromViperKey("store.backup.s3", "backups.export.s3")
+	if err := validateStoreBackupS3(s3cfg); err != nil {
+		return fail(err)
+	}
+	up, err := s3upload.New(s3cfg)
+	if err != nil {
+		return fail(err)
+	}
+	runner, err := dbbackup.NewRunner(cfg, st, up)
+	if err != nil {
+		return fail(err)
+	}
+	return storeBackupHandle{runner: runner}
+}
+
+// validateStoreBackupS3 checks the effective store.backup.s3 settings. Messages
+// name the store.backup.s3.* keys (unset keys fall back to backups.export.s3.*).
+func validateStoreBackupS3(c s3upload.Config) error {
+	if c.Bucket == "" {
+		return errors.New("store.backup.s3.bucket is required")
+	}
+	if c.Endpoint != "" && !strings.HasPrefix(c.Endpoint, "https://") {
+		return errors.New("store.backup.s3.endpoint must be an https:// URL")
+	}
+	if c.AccessKey == "" || c.SecretKey == "" {
+		return errors.New("store.backup.s3.access_key and store.backup.s3.secret_key must both be set")
+	}
+	return nil
 }

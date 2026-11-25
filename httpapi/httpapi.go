@@ -117,6 +117,10 @@ type Config struct {
 	// ContainerLister lists running backup containers for the maintenance status
 	// view. nil uses the local docker daemon (maintenance.DockerLister).
 	ContainerLister maintenance.ContainerLister
+
+	// StoreBackup reports the off-node SQLite backup runner's status. nil
+	// (backups not running) reports {"enabled": false}.
+	StoreBackup StoreBackupStatus
 }
 
 // fireHook invokes an optional reconcile hook if set.
@@ -258,6 +262,7 @@ func (s *Server) routes() {
 
 	// --- Node maintenance hold (per-node admin Bearer) ---
 	s.mux.HandleFunc("GET /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenanceGet))
+	s.mux.HandleFunc("GET /v1/admin/store-backup", s.requireAdmin(s.handleAdminStoreBackupGet))
 	s.mux.HandleFunc("PUT /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenancePut))
 	s.mux.HandleFunc("DELETE /v1/admin/maintenance", s.requireAdmin(s.handleAdminMaintenanceDelete))
 }

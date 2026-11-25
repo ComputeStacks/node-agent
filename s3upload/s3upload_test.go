@@ -259,3 +259,15 @@ func TestDeleteFallsBackToSingleDeletes(t *testing.T) {
 		t.Fatalf("single deletes = %q", got)
 	}
 }
+
+func TestFallbackWithSiblingPrefixDefault(t *testing.T) {
+	viper.Reset()
+	defer viper.Reset()
+	viper.SetDefault("store.backup.s3.prefix", "sqlite/")
+	viper.SetDefault("backups.export.s3.region", "us-east-1")
+	viper.Set("backups.export.s3.bucket", "exp")
+	c := ConfigFromViperKey("store.backup.s3", "backups.export.s3")
+	if c.Bucket != "exp" || c.Prefix != "sqlite/" || c.Region != "us-east-1" {
+		t.Fatalf("%+v", c)
+	}
+}

@@ -161,6 +161,26 @@ race-free. Two pieces keep it that way as the repo grows:
 Updates are just `apt-get update && apt-get upgrade` (per node today; fleet-wide
 via Ansible later).
 
+## Restoring the node databases
+
+If `store.backup` is enabled, restore from a machine that holds the age private
+identity (it is never kept on the node). Stop the agent first; the restore takes
+the data directory lock and refuses to run while the agent is up.
+
+```sh
+sudo systemctl stop cs-agent
+cs-agent store-restore list
+sudo cs-agent store-restore node --identity /path/to/identity.txt     # control.db + all projects
+sudo cs-agent store-restore control --identity /path/to/identity.txt  # control.db only
+sudo cs-agent store-restore project --identity /path/to/identity.txt --project <id>
+sudo systemctl start cs-agent
+```
+
+The existing databases are moved to `<data_dir>/pre-restore-<timestamp>/` rather
+than deleted. A restore rotates the `instance_id`, so anything following the
+changelog resets its cursor. `cs-agent store-restore help` lists all flags
+(`--node`, `--at`, `--lineage`, `--yes`).
+
 ## Rollback
 
 Every version stays in the pool:
