@@ -1,10 +1,14 @@
 # Changelog
 
-## v3.5.1
+## v3.6.0
 
-Patch release for v3.5.0. **No migrations (`control.db` stays at schema `v4`), no config
-changes, no API changes.**
+Minor release. **No migrations (`control.db` stays at schema `v4`), no config changes.** One
+additive API field.
 
+- [FEATURE] `GET /v1/admin/changelog` responses carry `instance_id`, the id of the node's
+  `control.db`. A reader that sees it change knows the database was replaced and its `seq`
+  restarted, so it can reset its cursor instead of skipping new entries. Readers that ignore
+  the field are unaffected.
 - [FIX] Backups that start in the same second no longer fail with `Conflict. The container
   name "/backup-..." is already in use`. Backup container names now carry 16 random hex
   characters instead of a three-digit random number and the time of day.
