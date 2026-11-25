@@ -198,3 +198,11 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	c.n += int64(n)
 	return n, err
 }
+
+// Object is one entry of a List. Key is relative to the configured Prefix,
+// the same form Upload takes.
+type Object struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
