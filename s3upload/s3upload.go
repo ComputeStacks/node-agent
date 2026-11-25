@@ -47,19 +47,32 @@ type Config struct {
 
 // ConfigFromViper reads the backups.export.s3.* keys.
 func ConfigFromViper() Config {
+	return ConfigFromViperKey("backups.export.s3", "")
+}
+
+// ConfigFromViperKey reads <base>.<key> for each setting. For every key except
+// prefix, a key unset under base falls back to <fallback>.<key> when fallback
+// is non-empty. prefix never falls back.
+func ConfigFromViperKey(base, fallback string) Config {
+	k := func(key string) string {
+		if fallback != "" && key != "prefix" && !viper.IsSet(base+"."+key) {
+			return fallback + "." + key
+		}
+		return base + "." + key
+	}
 	return Config{
-		Endpoint:       viper.GetString("backups.export.s3.endpoint"),
-		Region:         viper.GetString("backups.export.s3.region"),
-		Bucket:         viper.GetString("backups.export.s3.bucket"),
-		Prefix:         viper.GetString("backups.export.s3.prefix"),
-		AccessKey:      viper.GetString("backups.export.s3.access_key"),
-		SecretKey:      viper.GetString("backups.export.s3.secret_key"),
-		ForcePathStyle: viper.GetBool("backups.export.s3.force_path_style"),
-		PartSizeMB:     viper.GetInt("backups.export.s3.part_size_mb"),
-		Concurrency:    viper.GetInt("backups.export.s3.concurrency"),
-		SSE:            viper.GetString("backups.export.s3.sse"),
-		DefaultTTL:     time.Duration(viper.GetInt("backups.export.s3.default_ttl_sec")) * time.Second,
-		MaxTTL:         time.Duration(viper.GetInt("backups.export.s3.max_ttl_sec")) * time.Second,
+		Endpoint:       viper.GetString(k("endpoint")),
+		Region:         viper.GetString(k("region")),
+		Bucket:         viper.GetString(k("bucket")),
+		Prefix:         viper.GetString(k("prefix")),
+		AccessKey:      viper.GetString(k("access_key")),
+		SecretKey:      viper.GetString(k("secret_key")),
+		ForcePathStyle: viper.GetBool(k("force_path_style")),
+		PartSizeMB:     viper.GetInt(k("part_size_mb")),
+		Concurrency:    viper.GetInt(k("concurrency")),
+		SSE:            viper.GetString(k("sse")),
+		DefaultTTL:     time.Duration(viper.GetInt(k("default_ttl_sec"))) * time.Second,
+		MaxTTL:         time.Duration(viper.GetInt(k("max_ttl_sec"))) * time.Second,
 	}
 }
 
@@ -185,6 +198,87 @@ func (u *Uploader) PresignGet(ctx context.Context, key string, ttl time.Duration
 		return "", time.Time{}, err
 	}
 	return req.URL, time.Now().Add(ttl), nil
+}
+
+// Get returns the body of <prefix><key>. The caller must close it.
+func (u *Uploader) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	out, err := u.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(u.cfg.Bucket),
+		Key:    aws.String(u.objectKey(key)),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Body, nil
+}
+
+// List returns every object under <cfg.Prefix><prefix>, following pagination.
+// Returned keys have cfg.Prefix stripped.
+func (u *Uploader) List(ctx context.Context, prefix string) ([]Object, error) {
+	var objs []Object
+	p := s3.NewListObjectsV2Paginator(u.client, &s3.ListObjectsV2Input{
+		Bucket: aws.String(u.cfg.Bucket),
+		Prefix: aws.String(u.objectKey(prefix)),
+	})
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, o := range page.Contents {
+			obj := Object{Key: strings.TrimPrefix(aws.ToString(o.Key), u.cfg.Prefix), Size: aws.ToInt64(o.Size)}
+			if o.LastModified != nil {
+				obj.LastModified = *o.LastModified
+			}
+			objs = append(objs, obj)
+		}
+	}
+	return objs, nil
+}
+
+// deleteBatchSize is S3's DeleteObjects per-request key limit.
+const deleteBatchSize = 1000
+
+// Delete removes the given keys (relative to cfg.Prefix) in batches of up to
+// 1000. Per-key failures are aggregated into one error naming the keys. If a
+// batch request is rejected outright, that batch is retried one key at a time.
+func (u *Uploader) Delete(ctx context.Context, keys []string) error {
+	var errs []error
+	for start := 0; start < len(keys); start += deleteBatchSize {
+		end := min(start+deleteBatchSize, len(keys))
+		ids := make([]s3types.ObjectIdentifier, 0, end-start)
+		for _, k := range keys[start:end] {
+			ids = append(ids, s3types.ObjectIdentifier{Key: aws.String(u.objectKey(k))})
+		}
+		out, err := u.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(u.cfg.Bucket),
+			Delete: &s3types.Delete{Objects: ids, Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return errors.Join(append(errs, err)...)
+			}
+			// Some S3-compatible stores reject DeleteObjects without a
+			// Content-MD5 header, which the SDK no longer sends. Fall back to
+			// one DeleteObject per key for this batch.
+			for _, k := range keys[start:end] {
+				if _, derr := u.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+					Bucket: aws.String(u.cfg.Bucket),
+					Key:    aws.String(u.objectKey(k)),
+				}); derr != nil {
+					if ctx.Err() != nil {
+						return errors.Join(append(errs, derr)...)
+					}
+					errs = append(errs, fmt.Errorf("delete %s: %w", k, derr))
+				}
+			}
+			continue
+		}
+		for _, e := range out.Errors {
+			errs = append(errs, fmt.Errorf("delete %s: %s: %s", strings.TrimPrefix(aws.ToString(e.Key), u.cfg.Prefix), aws.ToString(e.Code), aws.ToString(e.Message)))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // countingReader counts bytes read so the caller can record the uploaded size.

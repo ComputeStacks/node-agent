@@ -2,7 +2,14 @@ package s3upload
 
 import (
 	"context"
+	"fmt"
+	"github.com/spf13/viper"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -94,5 +101,161 @@ func TestPresignGet(t *testing.T) {
 	}
 	if expiry.IsZero() {
 		t.Error("expected a non-zero expiry time")
+	}
+}
+
+func TestConfigFromViperKeyFallback(t *testing.T) {
+	viper.Reset()
+	t.Cleanup(viper.Reset)
+	viper.Set("backups.export.s3.endpoint", "https://e")
+	viper.Set("backups.export.s3.bucket", "exp")
+	viper.Set("backups.export.s3.prefix", "exp/")
+	viper.Set("backups.export.s3.force_path_style", true)
+	viper.Set("backups.export.s3.part_size_mb", 64)
+	viper.Set("store.backup.s3.bucket", "own")
+	viper.Set("store.backup.s3.force_path_style", false)
+
+	c := ConfigFromViperKey("store.backup.s3", "backups.export.s3")
+	if c.Bucket != "own" {
+		t.Errorf("set key overridden: %q", c.Bucket)
+	}
+	if c.Endpoint != "https://e" || c.PartSizeMB != 64 {
+		t.Errorf("unset keys did not fall back: %+v", c)
+	}
+	if c.ForcePathStyle {
+		t.Error("explicit false force_path_style was overridden by fallback")
+	}
+	if c.Prefix != "" {
+		t.Errorf("prefix fell back: %q", c.Prefix)
+	}
+
+	e := ConfigFromViper()
+	if e.Bucket != "exp" || e.Prefix != "exp/" || !e.ForcePathStyle || e.Endpoint != "https://e" {
+		t.Errorf("ConfigFromViper changed: %+v", e)
+	}
+}
+
+type fakeS3 struct {
+	mu          sync.Mutex
+	gotKeys     []string
+	listQ       []url.Values
+	delBodies   []string
+	delHdrs     []http.Header
+	rejectMulti bool
+	singleDel   []string
+}
+
+func (f *fakeS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	q := r.URL.Query()
+	switch {
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/bkt/") && !q.Has("list-type"):
+		f.gotKeys = append(f.gotKeys, strings.TrimPrefix(r.URL.Path, "/bkt/"))
+		_, _ = w.Write([]byte("hello"))
+	case r.Method == http.MethodGet && q.Get("list-type") == "2":
+		f.listQ = append(f.listQ, q)
+		w.Header().Set("Content-Type", "application/xml")
+		if q.Get("continuation-token") == "" {
+			_, _ = w.Write([]byte(`<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>tok2</NextContinuationToken>` +
+				`<Contents><Key>pfx/a/1</Key><Size>3</Size></Contents></ListBucketResult>`))
+		} else {
+			_, _ = w.Write([]byte(`<ListBucketResult><IsTruncated>false</IsTruncated>` +
+				`<Contents><Key>pfx/a/2</Key><Size>5</Size></Contents></ListBucketResult>`))
+		}
+	case r.Method == http.MethodPost && q.Has("delete") && f.rejectMulti:
+		http.Error(w, "<Error><Code>InvalidRequest</Code><Message>Missing required header: Content-MD5</Message></Error>", 400)
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/bkt/"):
+		f.singleDel = append(f.singleDel, strings.TrimPrefix(r.URL.Path, "/bkt/"))
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == http.MethodPost && q.Has("delete"):
+		b, _ := io.ReadAll(r.Body)
+		f.delBodies = append(f.delBodies, string(b))
+		f.delHdrs = append(f.delHdrs, r.Header.Clone())
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = w.Write([]byte(`<DeleteResult></DeleteResult>`))
+	default:
+		http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), 400)
+	}
+}
+
+func newFake(t *testing.T) (*Uploader, *fakeS3) {
+	t.Helper()
+	f := &fakeS3{}
+	srv := httptest.NewServer(f)
+	t.Cleanup(srv.Close)
+	u, err := New(Config{Endpoint: srv.URL, Region: "us-east-1", Bucket: "bkt", Prefix: "pfx/", AccessKey: "a", SecretKey: "s", ForcePathStyle: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u, f
+}
+
+func TestGet(t *testing.T) {
+	u, f := newFake(t)
+	rc, err := u.Get(context.Background(), "x/y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	b, _ := io.ReadAll(rc)
+	if string(b) != "hello" || len(f.gotKeys) != 1 || f.gotKeys[0] != "pfx/x/y" {
+		t.Errorf("body=%q keys=%v", b, f.gotKeys)
+	}
+}
+
+func TestListPaginationAndStrip(t *testing.T) {
+	u, f := newFake(t)
+	objs, err := u.List(context.Background(), "a/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != 2 || objs[0].Key != "a/1" || objs[1].Key != "a/2" || objs[1].Size != 5 {
+		t.Errorf("objs=%+v", objs)
+	}
+	if len(f.listQ) != 2 || f.listQ[0].Get("prefix") != "pfx/a/" || f.listQ[1].Get("continuation-token") != "tok2" {
+		t.Errorf("queries=%v", f.listQ)
+	}
+}
+
+func TestDeleteBatching(t *testing.T) {
+	u, f := newFake(t)
+	keys := make([]string, 2500)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("k/%d", i)
+	}
+	if err := u.Delete(context.Background(), keys); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.delBodies) != 3 {
+		t.Fatalf("batches=%d", len(f.delBodies))
+	}
+	if n := strings.Count(f.delBodies[0], "<Key>"); n != 1000 {
+		t.Errorf("first batch %d keys", n)
+	}
+	if n := strings.Count(f.delBodies[2], "<Key>"); n != 500 {
+		t.Errorf("last batch %d keys", n)
+	}
+	if !strings.Contains(f.delBodies[0], "<Key>pfx/k/0</Key>") {
+		t.Error("key not prefixed")
+	}
+	h := f.delHdrs[0]
+	t.Logf("delete checksum headers: md5=%q crc32=%q sha256=%q", h.Get("Content-Md5"), h.Get("X-Amz-Checksum-Crc32"), h.Get("X-Amz-Checksum-Sha256"))
+	if h.Get("Content-Md5") == "" && h.Get("X-Amz-Checksum-Crc32") == "" {
+		t.Error("DeleteObjects sent no checksum")
+	}
+	if err := u.Delete(context.Background(), nil); err != nil || len(f.delBodies) != 3 {
+		t.Error("empty delete should be a no-op")
+	}
+}
+
+func TestDeleteFallsBackToSingleDeletes(t *testing.T) {
+	u, f := newFake(t)
+	f.rejectMulti = true
+	if err := u.Delete(context.Background(), []string{"a/1", "a/2"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(f.singleDel, ","); got != "pfx/a/1,pfx/a/2" {
+		t.Fatalf("single deletes = %q", got)
 	}
 }
