@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -59,5 +60,20 @@ func TestStoreBackup_RequiresAdmin(t *testing.T) {
 		resp := e.do("GET", "/v1/admin/store-backup", tok, nil)
 		mustStatus(t, resp, http.StatusUnauthorized)
 		resp.Body.Close()
+	}
+}
+
+func TestStoreBackup_ConfigErrorReportsEnabled(t *testing.T) {
+	at := time.Date(2026, 11, 25, 10, 0, 0, 0, time.UTC)
+	e := newStoreBackupEnv(t, StoreBackupConfigError(errors.New("store.backup.s3.bucket is required"), at))
+	resp := e.do("GET", "/v1/admin/store-backup", e.adminTok, nil)
+	mustStatus(t, resp, http.StatusOK)
+	var got dbbackup.Status
+	if err := json.Unmarshal(readBody(t, resp), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Enabled || got.LastError != "config: store.backup.s3.bucket is required" ||
+		got.LastErrorAt == nil || !got.LastErrorAt.Equal(at) || got.LastSuccessAt != nil {
+		t.Fatalf("unexpected status: %+v", got)
 	}
 }

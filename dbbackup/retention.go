@@ -10,8 +10,11 @@ import (
 // Keep returns the keys to delete from objs, all the snapshots of ONE database
 // (any lineages). Per lineage: everything newer than keepAll is kept, beyond
 // that the newest object per UTC day within `days`, and the newest object of the
-// lineage is always kept while the database exists. Keys that do not parse are
-// never deleted.
+// lineage is always kept while the database exists. A lineage that still has
+// an object within `days` also keeps its newest object older than that: it is
+// the database's state at the start of the window, so a point-in-time restore
+// anywhere inside the window has something to restore for a rarely-changing
+// database. Keys that do not parse are never deleted.
 func Keep(objs []s3upload.Object, now time.Time, keepAll time.Duration, days int, dbExists bool) (del []string) {
 	type item struct {
 		key string
@@ -40,6 +43,9 @@ func Keep(objs []s3upload.Object, now time.Time, keepAll time.Duration, days int
 	}
 	for lin, items := range byLineage {
 		sort.Slice(items, func(i, j int) bool { return items[i].ts.After(items[j].ts) })
+		// items is newest first, so items[0] is within the horizon exactly
+		// when the lineage has any object within it.
+		anchorKept := len(items) == 0 || now.Sub(items[0].ts) > horizon
 		seenDay := map[string]bool{}
 		for i, it := range items {
 			if i == 0 && dbExists && lin == current {
@@ -50,6 +56,10 @@ func Keep(objs []s3upload.Object, now time.Time, keepAll time.Duration, days int
 				continue
 			}
 			if age > horizon {
+				if !anchorKept {
+					anchorKept = true // newest object older than the horizon
+					continue
+				}
 				del = append(del, it.key)
 				continue
 			}

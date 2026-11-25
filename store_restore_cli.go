@@ -6,6 +6,7 @@ import (
 	"cs-agent/config"
 	"cs-agent/dbbackup"
 	"cs-agent/s3upload"
+	"cs-agent/store"
 	"errors"
 	"flag"
 	"fmt"
@@ -230,6 +231,7 @@ func storeRestoreCLI(ctx context.Context, args []string, stdin io.Reader, stdout
 		Lineage:      f.lineage,
 		AllowMissing: f.allowMissing,
 		Identities:   ids,
+		HoldBy:       invokingUser(),
 		Now:          restoreNow,
 	}
 	in := bufio.NewReader(stdin)
@@ -273,6 +275,9 @@ func storeRestoreCLI(ctx context.Context, args []string, stdin io.Reader, stdout
 		fmt.Fprintf(stdout, "New instance_id: %s\n", res.Plan.NewInstanceID)
 	}
 	fmt.Fprintln(stdout, "Start the agent with: systemctl start cs-agent")
+	if res.Plan.MaintenanceHold {
+		fmt.Fprint(stdout, maintenanceHoldNotice)
+	}
 	return restoreExitOK
 }
 
@@ -344,7 +349,41 @@ func printRestorePlan(w io.Writer, p *dbbackup.RestorePlan) {
 	if p.Mode == dbbackup.ModeControl {
 		fmt.Fprintln(w, "Project databases are left as they are.")
 	}
+	if p.MaintenanceHold {
+		fmt.Fprintln(w, "The restored control.db is left in local maintenance mode: no task runs until you run `cs-agent maintenance off`.")
+		if len(p.CanceledTasks) > 0 {
+			fmt.Fprintln(w, "  pending volume.restore tasks canceled by entering maintenance:")
+			printTasks(w, p.CanceledTasks)
+		}
+		if len(p.OpenTasks) == 0 {
+			fmt.Fprintln(w, "  the restored control.db has no pending or running tasks.")
+		} else {
+			fmt.Fprintln(w, "  pending or running tasks in the restored control.db (some may already have run after the snapshot was taken):")
+			printTasks(w, p.OpenTasks)
+			fmt.Fprintln(w, "  running tasks are marked failed when the agent starts; pending tasks run once maintenance is turned off.")
+		}
+	}
 	for _, warn := range p.Warnings {
 		fmt.Fprintf(w, "WARNING: %s\n", warn)
+	}
+}
+
+// maintenanceHoldNotice is printed after a control or node restore.
+const maintenanceHoldNotice = `The node is in local maintenance mode: the agent serves its API but runs no
+tasks or scheduled work. Review the pending tasks listed above (they may
+already have run after the snapshot was taken), then resume work with:
+  sudo cs-agent maintenance off
+The hold does not expire on its own; after maintenance.stale_hold_hours the
+agent only logs and reports that it is still in place.
+`
+
+func printTasks(w io.Writer, ts []store.Task) {
+	for _, t := range ts {
+		target := t.Volume
+		if target == "" {
+			target = t.ProjectID
+		}
+		fmt.Fprintf(w, "    %s %s %s %s (created %s)\n", t.ID, t.Status, t.Name, target,
+			time.Unix(t.CreatedAt, 0).UTC().Format(time.RFC3339))
 	}
 }

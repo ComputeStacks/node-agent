@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/spf13/viper"
 )
 
 type srObj struct{ objs map[string][]byte }
@@ -169,6 +170,18 @@ func TestStoreRestoreCLI_ControlYes(t *testing.T) {
 	if code != 0 || !strings.Contains(out, "Restore complete") || strings.Contains(out, "Proceed?") {
 		t.Fatalf("exit %d out %q err %q", code, out, errOut)
 	}
+	if !strings.Contains(out, "local maintenance mode") || !strings.Contains(out, "sudo cs-agent maintenance off") {
+		t.Fatalf("no maintenance hold notice: %q", out)
+	}
+	st, err := store.OpenExistingControl(e.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := st.GetMaintenance(context.Background())
+	st.Close()
+	if err != nil || m.Local == nil {
+		t.Fatalf("no local hold after restore: %+v %v", m, err)
+	}
 	if _, err := os.Stat(filepath.Join(e.dir, "pre-restore-20261125T000000Z", "control.db")); err != nil {
 		t.Fatal(err)
 	}
@@ -188,5 +201,24 @@ func TestStoreRestoreCLI_RefusesWhileAgentRuns(t *testing.T) {
 	code, _, errOut := runSR("", "control", "--identity", e.idFile, "--yes")
 	if code != restoreExitErr || !strings.Contains(errOut, "systemctl stop cs-agent") {
 		t.Fatalf("exit %d err %q", code, errOut)
+	}
+}
+
+// The daemon's backup wiring: off is a true nil status source; enabled but
+// misconfigured reports enabled with the setup error.
+func TestBuildStoreBackupStatus(t *testing.T) {
+	t.Cleanup(viper.Reset)
+	viper.Set("store.backup.enabled", false)
+	if sb := buildStoreBackup(nil).status(); sb != nil {
+		t.Fatalf("disabled: got %#v, want nil interface", sb)
+	}
+	viper.Set("store.backup.enabled", true)
+	h := buildStoreBackup(nil)
+	if h.runner != nil || h.configErr == nil {
+		t.Fatalf("misconfigured: %+v", h)
+	}
+	st := h.status().Status()
+	if !st.Enabled || !strings.HasPrefix(st.LastError, "config: ") || st.LastErrorAt == nil {
+		t.Fatalf("misconfigured status %+v", st)
 	}
 }

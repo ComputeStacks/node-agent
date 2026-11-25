@@ -255,3 +255,67 @@ func ProjectsInControlDB(path string) ([]string, error) {
 	sort.Strings(ids)
 	return ids, nil
 }
+
+// OpenTasksInControlDB reads, read-only, the tasks in the control.db file at
+// path that are not in a terminal state (pending or running), oldest first.
+// The restore tool shows them before installing a restored control.db.
+func OpenTasksInControlDB(path string) ([]Task, error) {
+	db, err := openReadOnly(path)
+	if err != nil {
+		return nil, fmt.Errorf("store: read tasks from %s: %w", path, err)
+	}
+	defer db.Close()
+	rows, err := db.Query(`SELECT `+taskColumns+` FROM tasks WHERE status IN (?, ?) ORDER BY created_at, id`,
+		TaskPending, TaskRunning)
+	if err != nil {
+		return nil, fmt.Errorf("store: read tasks from %s: %w", path, err)
+	}
+	defer rows.Close()
+	var out []Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// PutLocalHoldAt places the local maintenance hold (as `cs-agent maintenance
+// on` does) in the control.db file at path, which no agent may have open. The
+// file is first migrated to this binary's schema, as the agent would on start.
+// Entering maintenance cancels pending volume.restore tasks, exactly as it does
+// on a live node.
+func PutLocalHoldAt(ctx context.Context, path, reason, by string) (MaintenanceState, error) {
+	db, err := openSQLiteMode(path, true, true)
+	if err != nil {
+		return MaintenanceState{}, err
+	}
+	s := &Store{dataDir: filepath.Dir(path), control: db}
+	defer s.Close()
+	if err := runMigrations(db, "control.db", controlMigrations); err != nil {
+		return MaintenanceState{}, err
+	}
+	m, _, err := s.PutLocalHold(ctx, reason, by)
+	return m, err
+}
+
+// InstanceIDInControlDB reads, read-only, the instance_id recorded in the
+// control.db file at path ("" if none is recorded).
+func InstanceIDInControlDB(path string) (string, error) {
+	db, err := openReadOnly(path)
+	if err != nil {
+		return "", fmt.Errorf("store: read instance id from %s: %w", path, err)
+	}
+	defer db.Close()
+	var id string
+	err = db.QueryRow(`SELECT value FROM control_meta WHERE key = ?`, MetaInstanceID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("store: read instance id from %s: %w", path, err)
+	}
+	return id, nil
+}

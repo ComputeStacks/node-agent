@@ -9,13 +9,20 @@ Minor release. **No migrations (`control.db` stays at schema `v4`).** New, optio
   set, the agent snapshots `control.db` and every project database on a schedule
   (`store.backup.freq`), encrypts each snapshot to your age recipients and uploads it to
   S3-compatible storage. Unchanged databases are skipped, recent snapshots are kept in full
-  and older ones are thinned to daily and then expired (`keep_all_hours`, `retention_days`).
+  and older ones are thinned to daily and then expired (`keep_all_hours`, `retention_days`); the
+  snapshot in effect at the start of the retention window is kept, so any point inside it can be
+  restored.
   Unset `store.backup.s3.*` keys fall back to `backups.export.s3.*`. **Off by default.**
 - [FEATURE] `cs-agent store-restore` restores the node, `control.db` alone, or a single project
   from those backups, using an age identity that never needs to live on the node. Existing
-  databases are moved aside to `<data_dir>/pre-restore-<timestamp>/`.
+  databases are moved aside to `<data_dir>/pre-restore-<timestamp>/`. A `node` or `control`
+  restore lists the restored pending and running tasks and leaves the node in local maintenance
+  mode, so nothing runs until an operator reviews them and runs `cs-agent maintenance off`.
 - [FEATURE] `GET /v1/admin/store-backup` (admin token) reports the last success, last error and
-  upload counts; it returns `{"enabled": false}` when backups are off.
+  upload counts; it returns `{"enabled": false}` when backups are off, and `enabled: true` with a
+  `config: ...` `last_error` when they are enabled but misconfigured.
+- [CHANGE] The agent now holds `<data_dir>/agent.lock` while it runs, and exits non-zero at
+  startup if another process (a running `store-restore`) holds it.
 
 ## v3.7.0
 

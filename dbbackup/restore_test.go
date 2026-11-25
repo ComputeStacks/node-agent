@@ -609,3 +609,113 @@ func TestRestoreMidSwapFailureReports(t *testing.T) {
 	}
 	noTmp(t, dir)
 }
+
+func TestRestoreControlHoldsMaintenance(t *testing.T) {
+	obj, id, w := setupR(t)
+	w.tenant("p1")
+	for _, tk := range []store.Task{
+		{ID: "t-restore", Name: "volume.restore", Node: rnode, Volume: "v1", Status: store.TaskPending},
+		{ID: "t-trash", Name: "volume.trash", Node: rnode, Volume: "v2", Status: store.TaskPending},
+		{ID: "t-run", Name: "volume.backup", Node: rnode, Volume: "v3", Status: store.TaskPending},
+		{ID: "t-done", Name: "volume.backup", Node: rnode, Volume: "v4", Status: store.TaskPending},
+	} {
+		if _, err := w.st.CreateTask(rctx, tk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if ok, err := w.st.ClaimTask(rctx, "t-run"); err != nil || !ok {
+		t.Fatalf("claim: %v %v", ok, err)
+	}
+	if err := w.st.UpdateTaskStatus(rctx, "t-done", store.TaskCompleted, nil); err != nil {
+		t.Fatal(err)
+	}
+	w.upload("control", w.lineage(), t0)
+	dir := newTarget(t, nil, nil)
+
+	o := opts(dir, ModeControl, id, rnow)
+	o.HoldBy = "alice"
+	var plan *RestorePlan
+	o.Confirm = func(p *RestorePlan) bool { plan = p; return true }
+	if _, err := Restore(rctx, obj, o); err != nil {
+		t.Fatal(err)
+	}
+	ids := func(ts []store.Task) string {
+		var s []string
+		for _, t := range ts {
+			s = append(s, t.ID+":"+t.Status)
+		}
+		return strings.Join(s, ",")
+	}
+	if !plan.MaintenanceHold {
+		t.Fatal("plan has no maintenance hold")
+	}
+	if got := ids(plan.OpenTasks); got != "t-run:running,t-trash:pending" {
+		t.Fatalf("open tasks %s", got)
+	}
+	if got := ids(plan.CanceledTasks); got != "t-restore:pending" {
+		t.Fatalf("canceled tasks %s", got)
+	}
+
+	st, err := store.Open(dir, store.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	m, err := st.GetMaintenance(rctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Local == nil || m.Local.Reason != MaintenanceReason || m.Local.By != "alice" || m.Controller != nil {
+		t.Fatalf("maintenance %+v", m)
+	}
+	if m.InstanceID != plan.NewInstanceID {
+		t.Fatalf("hold recorded under instance %q want %q", m.InstanceID, plan.NewInstanceID)
+	}
+	// The dispatcher's claim is refused while held.
+	if ok, err := st.ClaimTask(rctx, "t-trash"); err != nil || ok {
+		t.Fatalf("claim under hold: %v %v", ok, err)
+	}
+	if tk, ok, err := st.GetTask(rctx, "t-restore"); err != nil || !ok || tk.Status != store.TaskCancelled {
+		t.Fatalf("restore task %+v %v %v", tk, ok, err)
+	}
+}
+
+func TestRestoreProjectDefaultsToCurrentLineage(t *testing.T) {
+	obj, id, w := setupR(t)
+	dir := newTarget(t, []string{"p1"}, map[string]string{"p1": "current"})
+	cur, err := store.InstanceIDInControlDB(store.ControlPath(dir))
+	if err != nil || cur == "" {
+		t.Fatalf("instance id %q %v", cur, err)
+	}
+	w.project("p1", "from-current")
+	w.upload("projects/p1", cur, t0)
+	w.project("p1", "from-other")
+	w.upload("projects/p1", "otherLineage", t0.Add(time.Hour))
+
+	var plan *RestorePlan
+	o := opts(dir, ModeProject, id, rnow)
+	o.ProjectID = "p1"
+	o.Confirm = func(p *RestorePlan) bool { plan = p; return true }
+	if _, err := Restore(rctx, obj, o); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Lineage != cur || readKV(t, dir, "p1") != "from-current" {
+		t.Fatalf("lineage %q value %q", plan.Lineage, readKV(t, dir, "p1"))
+	}
+
+	// The current lineage has nothing at or before --at: the ambiguity rule
+	// applies to the others (here only one, so it is chosen).
+	o.At = t0.Add(-time.Minute)
+	w.upload("projects/p1", "olderLineage", t0.Add(-time.Hour))
+	if _, err := Restore(rctx, obj, o); err != nil {
+		t.Fatal(err)
+	}
+	if plan.Lineage != "olderLineage" {
+		t.Fatalf("fallback lineage %q", plan.Lineage)
+	}
+	w.upload("projects/p1", "olderLineage2", t0.Add(-2*time.Hour))
+	var amb *AmbiguousLineageError
+	if _, err := Restore(rctx, obj, o); !errors.As(err, &amb) {
+		t.Fatalf("got %v", err)
+	}
+}

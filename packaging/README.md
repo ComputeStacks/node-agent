@@ -164,12 +164,14 @@ via Ansible later).
 ## Restoring the node databases
 
 If `store.backup` is enabled, restore from a machine that holds the age private
-identity (it is never kept on the node). Stop the agent first; the restore takes
-the data directory lock and refuses to run while the agent is up.
+identity (it is never kept on the node). Run it with `sudo`: it reads
+`/etc/computestacks/agent.yml`. Stop the agent first; the restore takes the data
+directory lock (`<data_dir>/agent.lock`) and refuses to run while the agent is up,
+and the agent refuses to start while a restore holds it.
 
 ```sh
 sudo systemctl stop cs-agent
-cs-agent store-restore list
+sudo cs-agent store-restore list
 sudo cs-agent store-restore node --identity /path/to/identity.txt     # control.db + all projects
 sudo cs-agent store-restore control --identity /path/to/identity.txt  # control.db only
 sudo cs-agent store-restore project --identity /path/to/identity.txt --project <id>
@@ -177,9 +179,27 @@ sudo systemctl start cs-agent
 ```
 
 The existing databases are moved to `<data_dir>/pre-restore-<timestamp>/` rather
-than deleted. A restore rotates the `instance_id`, so anything following the
-changelog resets its cursor. `cs-agent store-restore help` lists all flags
-(`--node`, `--at`, `--lineage`, `--yes`).
+than deleted. A `node` or `control` restore rotates the `instance_id`, so
+anything following the changelog resets its cursor; a `project` restore leaves
+`control.db` alone. Without `--lineage`, a `project` restore uses the lineage of
+the `control.db` in place when it has a snapshot of that project, and otherwise
+needs the lineage to be unambiguous. `cs-agent store-restore help` lists all
+flags (`--node`, `--at`, `--lineage`, `--yes`).
+
+A `node` or `control` restore leaves the node in local maintenance mode, as
+`cs-agent maintenance on` does. The restored `control.db` can hold tasks that
+already ran after the snapshot was taken (a volume restore or trash, say), so the
+plan lists its pending and running tasks, and the agent runs none of them until
+you have reviewed them and run:
+
+```sh
+sudo cs-agent maintenance off
+```
+
+Entering maintenance cancels pending volume restores, as it does on a live node,
+and the agent marks tasks left running as failed when it starts. The hold does
+not expire on its own: after `maintenance.stale_hold_hours` the agent only logs
+and reports that it is still in place.
 
 ## Rollback
 

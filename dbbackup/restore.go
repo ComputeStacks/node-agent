@@ -221,6 +221,7 @@ type RestoreOptions struct {
 	Lineage      string    // empty: must be unambiguous
 	AllowMissing bool      // ModeNode: tolerate tenants with no project snapshot
 	Identities   []age.Identity
+	HoldBy       string           // control/node: recorded as the maintenance hold's "by"
 	Now          func() time.Time // defaults to time.Now
 	// Confirm is called once every selected DB has been downloaded and
 	// validated, before anything on disk is changed. Returning false aborts
@@ -254,8 +255,16 @@ type RestorePlan struct {
 	Orphans        []string // ModeNode: on-disk project files not in the restored tenants, moved aside
 	MissingTenants []string // ModeNode with AllowMissing: tenants left as they are on disk
 	NewInstanceID  string   // control restores: the rotated instance_id
-	RemovesState   bool
-	Warnings       []string
+	// Control restores install the control.db with a local maintenance hold
+	// (MaintenanceReason), so nothing it holds runs until an operator runs
+	// `cs-agent maintenance off`. OpenTasks are its pending and running
+	// tasks as installed; CanceledTasks are the pending volume.restore tasks
+	// that placing the hold canceled.
+	MaintenanceHold bool
+	OpenTasks       []store.Task
+	CanceledTasks   []store.Task
+	RemovesState    bool
+	Warnings        []string
 }
 
 // RestoreResult reports a completed restore.
@@ -373,9 +382,23 @@ func (r *restorer) prepare(at time.Time) error {
 	switch r.opts.Mode {
 	case ModeProject:
 		db := projectsPrefix + r.opts.ProjectID
-		lineage, err := pickLineage(r.snaps, db, r.opts.Lineage, at)
-		if err != nil {
-			return err
+		lineage := ""
+		if r.opts.Lineage == "" {
+			// Default to the lineage of the control.db in place, when it has
+			// a snapshot of this project in the window: after a control
+			// restore or a reimage, older lineages would otherwise make
+			// every project restore ambiguous.
+			if cur, err := store.InstanceIDInControlDB(store.ControlPath(dataDir)); err == nil && cur != "" &&
+				newest(r.snaps, db, cur, at) != nil {
+				lineage = cur
+			}
+		}
+		if lineage == "" {
+			var err error
+			lineage, err = pickLineage(r.snaps, db, r.opts.Lineage, at)
+			if err != nil {
+				return err
+			}
 		}
 		r.plan.Lineage = lineage
 		if err := r.fetch(db, lineage, at); err != nil {
@@ -452,6 +475,9 @@ func (r *restorer) prepare(at time.Time) error {
 			return fmt.Errorf("rotate instance_id: got %q", id)
 		}
 		r.plan.NewInstanceID = id
+		if err := r.holdMaintenance(ctlTmp); err != nil {
+			return err
+		}
 		if err := finalizeTmp(ctlTmp, store.DBControl); err != nil {
 			return fmt.Errorf("control.db after rotation: %w", err)
 		}
@@ -462,6 +488,41 @@ func (r *restorer) prepare(at time.Time) error {
 		return nil
 	}
 	return fmt.Errorf("unknown restore mode %q", r.opts.Mode)
+}
+
+// MaintenanceReason is the reason recorded on the local maintenance hold a
+// control restore leaves in place.
+const MaintenanceReason = "store-restore: review restored tasks, then run cs-agent maintenance off"
+
+// holdMaintenance places the local maintenance hold in the restored control.db
+// at path and records its open tasks in the plan. The restored file can hold
+// tasks that already ran after the snapshot was taken (a volume.restore or
+// volume.trash, say); the hold keeps the dispatcher from running them until an
+// operator has looked.
+func (r *restorer) holdMaintenance(path string) error {
+	before, err := store.OpenTasksInControlDB(path)
+	if err != nil {
+		return fmt.Errorf("read tasks from restored control.db: %w", err)
+	}
+	if _, err := store.PutLocalHoldAt(r.ctx, path, MaintenanceReason, r.opts.HoldBy); err != nil {
+		return fmt.Errorf("place maintenance hold in restored control.db: %w", err)
+	}
+	after, err := store.OpenTasksInControlDB(path)
+	if err != nil {
+		return fmt.Errorf("read tasks from restored control.db: %w", err)
+	}
+	still := map[string]bool{}
+	for _, t := range after {
+		still[t.ID] = true
+	}
+	for _, t := range before {
+		if !still[t.ID] {
+			r.plan.CanceledTasks = append(r.plan.CanceledTasks, t)
+		}
+	}
+	r.plan.OpenTasks = after
+	r.plan.MaintenanceHold = true
+	return nil
 }
 
 // fetch downloads, decrypts and validates the newest snapshot of db in lineage

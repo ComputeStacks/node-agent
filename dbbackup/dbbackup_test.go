@@ -299,7 +299,10 @@ func TestLineageChangeForcesUpload(t *testing.T) {
 
 func TestRetentionRunsOncePerDay(t *testing.T) {
 	e := setup(t)
-	old := KeyFor("n1", "control", "inst1", e.now.Add(-40*24*time.Hour))
+	// The newest object beyond the horizon is kept as the window-start
+	// state; the one before it is deleted.
+	e.ob.objs[KeyFor("n1", "control", "inst1", e.now.Add(-40*24*time.Hour))] = []byte("x")
+	old := KeyFor("n1", "control", "inst1", e.now.Add(-45*24*time.Hour))
 	e.ob.objs[old] = []byte("x")
 	e.run()
 	if len(e.ob.deleted) != 1 || e.ob.deleted[0] != old {
@@ -411,11 +414,15 @@ func TestKeep(t *testing.T) {
 		{"day bucketing keeps newest per UTC day", []s3upload.Object{mk("A", day(20, 23)), mk("A", day(20, 1)), mk("A", day(19, 23)), mk("A", day(19, 0)), a1},
 			true, 30, keys(mk("A", day(20, 1)), mk("A", day(19, 0)))},
 		{"older than days deleted, newest of lineage kept", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*50))}, true, 30, keys(mk("A", h(24*50)))},
-		{"old lineage ages out, current keeps newest", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*41)), mk("B", h(1)), mk("B", h(24*35))}, true, 30,
-			keys(mk("A", h(24*40)), mk("A", h(24*41)), mk("B", h(24*35)))},
+		{"old lineage ages out, current keeps window-start anchor", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*41)), mk("B", h(1)), mk("B", h(24*35)), mk("B", h(24*36))}, true, 30,
+			keys(mk("A", h(24*40)), mk("A", h(24*41)), mk("B", h(24*36)))},
+		{"rarely-changing database keeps the object live at window start", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*1))}, true, 30, nil},
+		{"dead old lineage fully beyond horizon is all deleted", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*45)), mk("A", h(24*50)), mk("B", h(1)), mk("B", h(24*5))}, true, 30,
+			keys(mk("A", h(24*40)), mk("A", h(24*45)), mk("A", h(24*50)))},
 		{"old lineage within days keeps its daily objects", []s3upload.Object{mk("A", h(24*10)), mk("A", h(24*10+1)), mk("B", h(1))}, true, 30,
 			keys(mk("A", h(24*10+1)))},
-		{"deleted project ages out", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*5))}, false, 30, keys(mk("A", h(24*40)))},
+		{"deleted project keeps window-start anchor", []s3upload.Object{mk("A", h(24*50)), mk("A", h(24*40)), mk("A", h(24*5))}, false, 30, keys(mk("A", h(24*50)))},
+		{"deleted project fully beyond horizon ages out", []s3upload.Object{mk("A", h(24*40)), mk("A", h(24*50))}, false, 30, keys(mk("A", h(24*40)), mk("A", h(24*50)))},
 		{"deleted project newest recent still kept", []s3upload.Object{mk("A", h(1))}, false, 30, nil},
 		{"junk keys untouched", []s3upload.Object{{Key: "nodes/n/control/readme.txt"}, a1}, true, 30, nil},
 	}

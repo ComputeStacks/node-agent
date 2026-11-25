@@ -308,16 +308,27 @@ func configureSentry(v string) {
 	}
 }
 
-// storeBackupHandle holds the backup runner, which is nil when backups are off.
-type storeBackupHandle struct{ runner *dbbackup.Runner }
+// storeBackupHandle holds the backup runner, which is nil when backups are off
+// or failed to set up. configErr is the setup failure when backups are enabled
+// but misconfigured.
+type storeBackupHandle struct {
+	runner      *dbbackup.Runner
+	configErr   error
+	configErrAt time.Time
+}
 
-// status returns the runner as the HTTP status source, or a true nil interface
-// when backups are off (a nil *Runner in an interface would not compare nil).
+// status returns the runner as the HTTP status source; for enabled backups
+// that failed to set up, a fixed status carrying the error; or a true nil
+// interface when backups are off (a nil *Runner in an interface would not
+// compare nil).
 func (h storeBackupHandle) status() httpapi.StoreBackupStatus {
-	if h.runner == nil {
-		return nil
+	switch {
+	case h.runner != nil:
+		return h.runner
+	case h.configErr != nil:
+		return httpapi.StoreBackupConfigError(h.configErr, h.configErrAt)
 	}
-	return h.runner
+	return nil
 }
 
 // buildStoreBackup builds the off-node backup runner when store.backup.enabled.
@@ -330,7 +341,7 @@ func buildStoreBackup(st *store.Store) storeBackupHandle {
 	fail := func(err error) storeBackupHandle {
 		log.New().Error("Off-node SQLite backup disabled", "error", err.Error())
 		sentry.CaptureException(err)
-		return storeBackupHandle{}
+		return storeBackupHandle{configErr: err, configErrAt: time.Now()}
 	}
 	cfg, err := dbbackup.ConfigFromViper()
 	if err != nil {
