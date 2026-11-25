@@ -64,6 +64,7 @@ type Store interface {
 
 	CreateActionRequest(ctx context.Context, id, projectID, actionType string, params json.RawMessage) (store.ActionRequest, error)
 	ChangelogPage(ctx context.Context, since int64, entityType string, limit int, showMaintenance bool) ([]store.ChangelogEntry, int64, error)
+	InstanceID(ctx context.Context) (string, error)
 	RecordAdvertisedServe(ctx context.Context, highWater, now int64) error
 	SetChangelogAcked(ctx context.Context, seq int64) error
 	GetChangelogAcked(ctx context.Context) (int64, error)

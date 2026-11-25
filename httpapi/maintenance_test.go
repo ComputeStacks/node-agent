@@ -247,8 +247,9 @@ func TestMaintenance_UnknownQuiesce(t *testing.T) {
 
 // changelogPage is the decoded GET /v1/admin/changelog body.
 type changelogPage struct {
-	Entries   []store.ChangelogEntry `json:"entries"`
-	HighWater int64                  `json:"high_water"`
+	Entries    []store.ChangelogEntry `json:"entries"`
+	HighWater  int64                  `json:"high_water"`
+	InstanceID string                 `json:"instance_id"`
 }
 
 func (e *testEnv) changelog(path, types string) changelogPage {
@@ -271,6 +272,17 @@ func (e *testEnv) changelog(path, types string) changelogPage {
 		e.t.Fatal(err)
 	}
 	return p
+}
+
+func TestChangelog_InstanceID(t *testing.T) {
+	e, _ := newMaintEnv(t, &fakeLister{})
+	want, err := e.st.InstanceID(ctxBG)
+	if err != nil || want == "" {
+		t.Fatalf("InstanceID = %q, %v", want, err)
+	}
+	if p := e.changelog("/v1/admin/changelog", ""); p.InstanceID != want {
+		t.Fatalf("instance_id = %q, want %q", p.InstanceID, want)
+	}
 }
 
 func TestChangelog_MaintenanceHeaderGating(t *testing.T) {

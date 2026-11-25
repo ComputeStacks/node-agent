@@ -270,6 +270,9 @@ type changelogListResponse struct {
 	// scanned). Rows hidden from this reader count as scanned, so a reader should
 	// advance its cursor to HighWater, not to the last entry it received.
 	HighWater int64 `json:"high_water"`
+	// InstanceID identifies this control.db. A reader that sees it change must
+	// reset its cursor: a replaced control.db restarts seq near zero.
+	InstanceID string `json:"instance_id"`
 }
 
 // changelogTypesHeader lists (comma-separated) the optional changelog entity
@@ -363,6 +366,12 @@ func (s *Server) handleAdminChangelogList(w http.ResponseWriter, r *http.Request
 		limit = n
 	}
 
+	instanceID, err := s.store.InstanceID(r.Context())
+	if err != nil {
+		s.storeError(w, err, "changelog instance id")
+		return
+	}
+
 	entityType := q.Get("entity_type")
 	showMaint := advertisesType(r, store.EntityNodeMaintenance)
 	entries, highWater, err := s.store.ChangelogPage(r.Context(), since, entityType, limit, showMaint)
@@ -383,7 +392,7 @@ func (s *Server) handleAdminChangelogList(w http.ResponseWriter, r *http.Request
 	if entries == nil {
 		entries = []store.ChangelogEntry{} // encode [] not null
 	}
-	writeJSON(w, http.StatusOK, changelogListResponse{Entries: entries, HighWater: highWater})
+	writeJSON(w, http.StatusOK, changelogListResponse{Entries: entries, HighWater: highWater, InstanceID: instanceID})
 }
 
 // advertisesType reports whether the request's X-CS-Changelog-Types header
