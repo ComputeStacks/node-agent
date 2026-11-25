@@ -385,12 +385,24 @@ func (r *restorer) prepare(at time.Time) error {
 		lineage := ""
 		if r.opts.Lineage == "" {
 			// Default to the lineage of the control.db in place, when it has
-			// a snapshot of this project in the window: after a control
-			// restore or a reimage, older lineages would otherwise make
-			// every project restore ambiguous.
+			// a snapshot of this project in the window, so routine project
+			// restores aren't ambiguous once an older lineage exists. (Right
+			// after a control or node restore the new lineage has no
+			// snapshots yet, and the ambiguity rule below applies.)
 			if cur, err := store.InstanceIDInControlDB(store.ControlPath(dataDir)); err == nil && cur != "" &&
 				newest(r.snaps, db, cur, at) != nil {
 				lineage = cur
+				var others []string
+				for _, li := range summarize(filterSnaps(r.snaps, func(s snapObj) bool { return s.db == db && !s.ts.After(at) })) {
+					if li.ID != cur {
+						others = append(others, li.ID)
+					}
+				}
+				if len(others) > 0 {
+					r.plan.Warnings = append(r.plan.Warnings, fmt.Sprintf(
+						"using the current control.db lineage %s; other lineages also have snapshots of this project (%s), pass --lineage to pick one",
+						cur, strings.Join(others, ", ")))
+				}
 			}
 		}
 		if lineage == "" {

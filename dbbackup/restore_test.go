@@ -702,6 +702,9 @@ func TestRestoreProjectDefaultsToCurrentLineage(t *testing.T) {
 	if plan.Lineage != cur || readKV(t, dir, "p1") != "from-current" {
 		t.Fatalf("lineage %q value %q", plan.Lineage, readKV(t, dir, "p1"))
 	}
+	if !strings.Contains(strings.Join(plan.Warnings, "\n"), "otherLineage") {
+		t.Fatalf("expected a warning naming the other lineage, got %q", plan.Warnings)
+	}
 
 	// The current lineage has nothing at or before --at: the ambiguity rule
 	// applies to the others (here only one, so it is chosen).
