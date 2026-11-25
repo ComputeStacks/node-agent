@@ -4,6 +4,7 @@ import (
 	"context"
 	"cs-agent/log"
 	"cs-agent/store"
+	"cs-agent/watchdog"
 	"encoding/json"
 	"sync"
 	"time"
@@ -55,6 +56,10 @@ type Dispatcher struct {
 	// before drain marks it.
 	busyMu sync.Mutex
 	busy   map[string]string
+	// Heartbeat, when set, is beaten by the dispatch goroutine on every loop
+	// iteration and while it waits for a backup slot, so a wedged dispatcher
+	// withholds the systemd watchdog keepalive.
+	Heartbeat *watchdog.Heartbeat
 }
 
 // NewDispatcher builds the dispatcher (worker pools sized by config). The backup
@@ -163,6 +168,7 @@ func (d *Dispatcher) loop(ctx context.Context, wg *sync.WaitGroup) {
 	defer func() { jobEvent().Info("Dispatcher stopping") }()
 
 	d.drain(ctx) // drain whatever is already pending at boot
+	d.Heartbeat.Beat()
 	backstop := time.NewTicker(backstopInterval)
 	defer backstop.Stop()
 	for {
@@ -174,6 +180,7 @@ func (d *Dispatcher) loop(ctx context.Context, wg *sync.WaitGroup) {
 		case <-backstop.C:
 			d.drain(ctx)
 		}
+		d.Heartbeat.Beat()
 	}
 }
 
@@ -299,6 +306,8 @@ func (d *Dispatcher) acquireBackupSlot(ctx context.Context) bool {
 		case <-ctx.Done():
 			return false
 		case <-recheck.C:
+			// Waiting on busy workers is progress; a wedged store below is not.
+			d.Heartbeat.Beat()
 			paused, err := d.st.IsPaused(ctx)
 			if err != nil {
 				jobEvent().Warn("dispatch: check maintenance", "error", err.Error())

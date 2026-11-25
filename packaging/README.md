@@ -178,8 +178,10 @@ sudo apt-mark hold cs-agent                   # pin so `upgrade` won't move it b
 
 ## Status / caveats
 
-- The systemd unit ships with `Type=simple`. `Type=notify` + `WatchdogSec` are
-  commented out until the agent implements `sd_notify`.
+- The systemd unit is `Type=notify` with `WatchdogSec=30s`. The agent withholds
+  the keepalive when its dispatcher or firewall loop has not made progress for 5
+  minutes, so a hung agent is killed (SIGABRT, goroutine dump in the journal) and
+  restarted. `StartLimitIntervalSec=0` keeps a crash-looping agent retrying.
 - **`push` has an inconsistency window on every push, not just a failed one.**
   Uploads are ordered `Packages` → pool → `Release`/`InRelease`, so for the
   duration of the push the *new* `Packages` is live while the *old* `InRelease`

@@ -1,5 +1,18 @@
 # Changelog
 
+## v3.7.0
+
+Minor release. **No migrations (`control.db` stays at schema `v4`), no config or API changes.**
+The packaged systemd unit changes; the package upgrade reloads it.
+
+- [FEATURE] systemd watchdog. The unit is now `Type=notify` with `WatchdogSec=30s`: the agent
+  reports ready once its loops are running and sends a keepalive only while the task
+  dispatcher and firewall reconciler keep making progress. If either stalls for 5 minutes,
+  systemd kills the agent with `SIGABRT` (the goroutine dump lands in the journal) and
+  restarts it, so a hung agent recovers like a crashed one.
+- [CHANGE] A crash-looping agent no longer ends up `failed` after 10 restarts in 5 minutes; it
+  keeps retrying every 5 seconds (`StartLimitIntervalSec=0`, `RestartSec=5`).
+
 ## v3.6.0
 
 Minor release. **No migrations (`control.db` stays at schema `v4`), no config changes.** One

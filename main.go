@@ -11,6 +11,7 @@ import (
 	"cs-agent/maintenance"
 	"cs-agent/s3upload"
 	"cs-agent/store"
+	"cs-agent/watchdog"
 	"errors"
 	"flag"
 	"fmt"
@@ -109,6 +110,13 @@ func main() {
 	// In-process coordination components (all read/write control.db).
 	dispatcher := job.NewDispatcher(st)
 	fwReconciler := firewall.NewReconciler(st)
+
+	// systemd watchdog: the keepalive is only sent while these loops keep beating.
+	// Their backstops are 30s/60s; the generous limit avoids killing in-flight
+	// backups over a slow-but-alive reconcile.
+	wd := watchdog.New()
+	dispatcher.Heartbeat = wd.Register("dispatcher", loopStallLimit)
+	fwReconciler.Heartbeat = wd.Register("firewall", loopStallLimit)
 	// control.db retention runs unconditionally (independent of backups.enabled).
 	housekeeper := backup.NewHousekeeper(st)
 	var scheduler *backup.Scheduler
@@ -161,6 +169,12 @@ func main() {
 		}
 	}()
 
+	// Not tied to ctx: the keepalive continues through the bounded shutdown drain.
+	go wd.Run(context.Background())
+	if err := watchdog.Notify("READY=1"); err != nil {
+		log.New().Warn("systemd notify READY", "error", err.Error())
+	}
+
 	log.New().Info("Agent Configuration", "environment", config.ReleaseEnvironment())
 	log.New().Info("Agent Configuration", "backupWorkers", viper.GetInt("queue.numworkers")+1)
 	log.New().Info("Agent Configuration", "backingFS", currentBackupMethod())
@@ -176,6 +190,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 	<-sig
 	log.New().Info("Shutdown signal received, draining")
+	_ = watchdog.Notify("STOPPING=1")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -196,6 +211,10 @@ func main() {
 // dispatcher/scheduler/firewall loops all observe ctx cancel, so wg normally
 // drains promptly; the bound is a safety net so a worker stuck in a long-running
 // borg job can't hold shutdown open forever.
+// loopStallLimit is how long a watched loop may go without a heartbeat before the
+// systemd watchdog keepalive is withheld.
+const loopStallLimit = 5 * time.Minute
+
 func waitWorkers(wg *sync.WaitGroup, timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {

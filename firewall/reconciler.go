@@ -3,6 +3,7 @@ package firewall
 import (
 	"context"
 	"cs-agent/store"
+	"cs-agent/watchdog"
 	"time"
 )
 
@@ -16,6 +17,9 @@ const firewallBackstop = 60 * time.Second
 type Reconciler struct {
 	st     *store.Store
 	signal chan struct{}
+	// Heartbeat, when set, is beaten after every reconcile so a wedged
+	// reconcile withholds the systemd watchdog keepalive.
+	Heartbeat *watchdog.Heartbeat
 }
 
 func NewReconciler(st *store.Store) *Reconciler {
@@ -34,6 +38,7 @@ func (r *Reconciler) Signal() {
 // Run reconciles until ctx is cancelled. Call in its own goroutine.
 func (r *Reconciler) Run(ctx context.Context) {
 	Reconcile(ctx, r.st) // boot
+	r.Heartbeat.Beat()
 	t := time.NewTicker(firewallBackstop)
 	defer t.Stop()
 	for {
@@ -45,5 +50,6 @@ func (r *Reconciler) Run(ctx context.Context) {
 		case <-t.C:
 			Reconcile(ctx, r.st)
 		}
+		r.Heartbeat.Beat()
 	}
 }
