@@ -63,6 +63,16 @@ type connPool struct {
 	lru      *list.List      // *projectConn, front = most recently used
 	deleting map[string]bool // projects currently being deleted (tombstone)
 
+	// offPool counts in-flight out-of-pool snapshot connections per project.
+	// remove() waits on offPoolCond (bound to mu) until a project's count drains
+	// before unlinking files.
+	offPool     map[string]int
+	offPoolCond *sync.Cond
+
+	// snapshotHook is a test seam: called after an out-of-pool snapshot has
+	// registered itself and before it opens the file.
+	snapshotHook func(projectID string)
+
 	// migrate is injected so the pool stays decoupled from the per-project
 	// schema; Store wires it to runMigrations(db, name, projectMigrations).
 	migrate func(db *sql.DB, name string) error
@@ -80,8 +90,10 @@ func newConnPool(dir string, maxOpen int, idleTimeout time.Duration, migrate fun
 		conns:       make(map[string]*projectConn),
 		lru:         list.New(),
 		deleting:    make(map[string]bool),
+		offPool:     make(map[string]int),
 		migrate:     migrate,
 	}
+	p.offPoolCond = sync.NewCond(&p.mu)
 	if idleTimeout > 0 {
 		p.stopSweep = make(chan struct{})
 		p.sweepWG.Add(1)
@@ -237,6 +249,14 @@ func (p *connPool) remove(projectID string) error {
 	if wait != nil {
 		<-wait
 	}
+
+	// Likewise wait for any out-of-pool snapshot connection on this project
+	// (new ones are refused by the tombstone).
+	p.mu.Lock()
+	for p.offPool[projectID] > 0 {
+		p.offPoolCond.Wait()
+	}
+	p.mu.Unlock()
 
 	base := p.dbPath(projectID)
 	var firstErr error
