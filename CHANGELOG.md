@@ -1,10 +1,18 @@
 # Changelog
 
-## v3.8.0
+## v3.7.0
 
 Minor release. **No migrations (`control.db` stays at schema `v4`).** New, optional config under
-`store.backup`; nothing changes unless you enable it.
+`store.backup`; nothing changes unless you enable it. The packaged systemd unit changes; the
+package upgrade reloads it.
 
+- [FEATURE] systemd watchdog. The unit is now `Type=notify` with `WatchdogSec=30s`: the agent
+  reports ready once its loops are running and sends a keepalive only while the task
+  dispatcher and firewall reconciler keep making progress. If either stalls for 5 minutes,
+  systemd kills the agent with `SIGABRT` (the goroutine dump lands in the journal) and
+  restarts it, so a hung agent recovers like a crashed one.
+- [CHANGE] A crash-looping agent no longer ends up `failed` after 10 restarts in 5 minutes; it
+  keeps retrying every 5 seconds (`StartLimitIntervalSec=0`, `RestartSec=5`).
 - [FEATURE] Off-node backup of the embedded SQLite databases. When `store.backup.enabled` is
   set, the agent snapshots `control.db` and every project database on a schedule
   (`store.backup.freq`), encrypts each snapshot to your age recipients and uploads it to
@@ -23,19 +31,6 @@ Minor release. **No migrations (`control.db` stays at schema `v4`).** New, optio
   `config: ...` `last_error` when they are enabled but misconfigured.
 - [CHANGE] The agent now holds `<data_dir>/agent.lock` while it runs, and exits non-zero at
   startup if another process (a running `store-restore`) holds it.
-
-## v3.7.0
-
-Minor release. **No migrations (`control.db` stays at schema `v4`), no config or API changes.**
-The packaged systemd unit changes; the package upgrade reloads it.
-
-- [FEATURE] systemd watchdog. The unit is now `Type=notify` with `WatchdogSec=30s`: the agent
-  reports ready once its loops are running and sends a keepalive only while the task
-  dispatcher and firewall reconciler keep making progress. If either stalls for 5 minutes,
-  systemd kills the agent with `SIGABRT` (the goroutine dump lands in the journal) and
-  restarts it, so a hung agent recovers like a crashed one.
-- [CHANGE] A crash-looping agent no longer ends up `failed` after 10 restarts in 5 minutes; it
-  keeps retrying every 5 seconds (`StartLimitIntervalSec=0`, `RestartSec=5`).
 
 ## v3.6.0
 
