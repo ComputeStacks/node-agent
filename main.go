@@ -44,6 +44,9 @@ const agentUsage = `Usage:
   cs-agent maintenance <on|off|status> [flags]
         Local maintenance mode: pause backups, restores and other agent work
         on this node. Run "cs-agent maintenance help" for its flags.
+  cs-agent store-restore <list|control|project|node> [flags]
+        Restore the agent's databases from off-node backups. The agent must
+        be stopped. Run "cs-agent store-restore help" for its flags.
   cs-agent help
         Show this help.
 
@@ -57,7 +60,8 @@ The daemon reads agent.yml from /etc/computestacks, then the working directory.
 // agentCommands are the subcommands; anything else runs the daemon. Each is
 // dispatched before flag parsing so its own flags are not seen by the daemon.
 var agentCommands = map[string]func(args []string) int{
-	"maintenance": runMaintenanceCLI,
+	"maintenance":   runMaintenanceCLI,
+	"store-restore": runStoreRestoreCLI,
 	"help": func([]string) int {
 		fmt.Fprint(os.Stdout, agentUsage)
 		return 0
@@ -94,6 +98,17 @@ func main() {
 	configureSentry(version)
 	log.New().Info("Starting CS-Agent", "version", version, "commit", commit, "date", date)
 	validateExportConfig()
+
+	// Hold the data dir lock for the life of the process, before store.Open
+	// migrates or writes anything, so `cs-agent store-restore` can never swap
+	// databases underneath a running agent. Exit non-zero if it is held;
+	// systemd restarts the agent once the restore has finished.
+	releaseLock, err := store.LockDataDir(viper.GetString("store.data_dir"))
+	if err != nil {
+		log.New().Error("Cannot lock the data dir; is a store-restore running?", "error", err.Error())
+		os.Exit(1)
+	}
+	defer releaseLock()
 
 	// Open the embedded data plane. control.db is the sole source of truth for
 	// coordination state now (no Consul); opening it also runs migrations.
