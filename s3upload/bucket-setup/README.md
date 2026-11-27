@@ -77,6 +77,25 @@ backups:
       max_ttl_sec: 86400
 ```
 
+## `setup-store-backup-bucket.sh`
+
+Provisions the bucket for the off-node SQLite backups (`store.backup`). Idempotent.
+Creates the bucket (with **no lifecycle rule**: the agent prunes its own snapshots),
+a group with a policy for that bucket, and a user in the group, then prints a
+`store.backup` block for `agent.yml`.
+
+```bash
+BUCKET=cs-store-backups GROUP=cs-store-backup USER=cs-store-backup-agent \
+  RECIPIENT=age1... CREATE_KEY=1 ENDPOINT=https://s3.example.com \
+  ./setup-store-backup-bucket.sh
+```
+
+Access granted: `PutObject`/`GetObject`/`DeleteObject`/`AbortMultipartUpload`/
+`ListMultipartUploadParts` on `<bucket>/<prefix>*`, and `ListBucket`/
+`ListBucketMultipartUploads` on `<bucket>`. `PREFIX` defaults to `sqlite/`. An
+existing policy is left unchanged. Generate the age key pair with `age-keygen` on a
+machine other than the node, and keep the identity file off the node.
+
 ## `setup-apt-bucket.sh`
 
 Provisions the **public apt repository** bucket — the read-OPEN counterpart to the export
